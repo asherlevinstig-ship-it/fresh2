@@ -1,27 +1,26 @@
-
 import { resolve } from 'path'
 import { defineConfig } from 'vite'
-
-
-
 
 export default defineConfig(({ command, mode, ssrBuild }) => {
 
     if (mode === 'production') {
-        // can change config thusly..
+        // production-specific config hooks can go here
     }
 
     return {
 
+        // Vite serves from src/
         root: './src',
+
+        // relative paths for assets
         base: './',
 
         resolve: {
             extensions: ['.js'],
             alias: {},
             dedupe: [
-                // This is needed if importing noa-engine from the local filesystem,
-                // but doesn't hurt anything if you're importing normally.
+                // Needed if importing noa-engine from local filesystem
+                // Safe even when importing normally
                 '@babylonjs/core',
             ],
         },
@@ -33,16 +32,25 @@ export default defineConfig(({ command, mode, ssrBuild }) => {
             host: '0.0.0.0',
         },
 
-        // production build stuff
+        // Production build configuration
         build: {
             target: 'es2020',
-            outDir: `../docs`,          // relative to root, not this file!
-            emptyOutDir: true,          // since build is outside root dir
-            chunkSizeWarningLimit: 1200, // babylon chunk for these demos is ~1.1MB
+
+            // IMPORTANT:
+            // Output directory MUST be inside project root for Vercel
+            // This resolves the "No Output Directory named dist" error
+            outDir: 'dist',
+
+            // Clean output directory before build
+            emptyOutDir: true,
+
+            // Babylon.js chunks are large
+            chunkSizeWarningLimit: 1200,
+
             minify: true,
 
             rollupOptions: {
-                // safe to remove all these if you only have one entry point
+                // Multiple entry points for demos
                 input: {
                     index: resolve(__dirname, 'src/index.html'),
                     test: resolve(__dirname, 'src/test/index.html'),
@@ -50,19 +58,17 @@ export default defineConfig(({ command, mode, ssrBuild }) => {
                     helloWorld: resolve(__dirname, 'src/hello-world/index.html'),
                 },
 
-                // remove this if you don't want babylon in its own chunk
+                // Split Babylon into its own chunk
                 manualChunks: (id) => {
-                    if (id.includes('@babylon')) return 'babylon'
+                    if (id.includes('@babylon')) {
+                        return 'babylon'
+                    }
                 },
             },
-
         },
 
-
-        // misc
+        // Misc
         clearScreen: false,
         logLevel: 'info',
     }
 })
-
-
