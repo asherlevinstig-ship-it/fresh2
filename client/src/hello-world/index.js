@@ -1,5 +1,3 @@
-
-
 /* 
  * 
  *          noa hello-world example
@@ -10,10 +8,25 @@
 */
 
 
-
 // Engine options object, and engine instantiation.
 import { Engine } from 'noa-engine'
 
+// Colyseus browser client SDK (multiplayer)
+import { Client } from 'colyseus.js'
+
+// Babylon box builder (used to create the player's mesh)
+import { CreateBox } from '@babylonjs/core/Meshes/Builders/boxBuilder'
+
+
+
+/*
+ *
+ *      Engine options
+ *
+ *  Options are passed into the engine at construction time.
+ *  (See `test` example, or noa docs/source, for more options.)
+ *
+*/
 
 var opts = {
     debug: true,
@@ -21,9 +34,74 @@ var opts = {
     chunkSize: 32,
     chunkAddDistance: 2.5,
     chunkRemoveDistance: 3.5,
-    // See `test` example, or noa docs/source, for more options
 }
+
 var noa = new Engine(opts)
+
+
+
+/*
+ *
+ *      Colyseus Multiplayer Hook
+ *
+ *  This connects the client (browser) to a Colyseus server.
+ *  - In local dev, it falls back to ws://localhost:2567
+ *  - On Vercel, you set VITE_COLYSEUS_ENDPOINT to your cloud endpoint:
+ *      wss://us-mia-ea26ba04.colyseus.cloud
+ *
+ *  IMPORTANT:
+ *  The room name used here is "my_room". Your server must expose a room
+ *  with this identifier in app.config.ts (rooms: { my_room: ... }).
+ *
+*/
+
+const COLYSEUS_ENDPOINT =
+    import.meta.env.VITE_COLYSEUS_ENDPOINT ?? 'ws://localhost:2567'
+
+const colyseusClient = new Client(COLYSEUS_ENDPOINT)
+
+// store connection references on the noa instance so other parts of the game can use them later
+noa.colyseus = {
+    endpoint: COLYSEUS_ENDPOINT,
+    client: colyseusClient,
+    room: null,
+}
+
+async function connectColyseus() {
+    try {
+        // Join an existing room or create one if none exist
+        const room = await colyseusClient.joinOrCreate('my_room')
+
+        // Keep reference
+        noa.colyseus.room = room
+
+        console.log('[Colyseus] connected')
+        console.log('[Colyseus] endpoint:', COLYSEUS_ENDPOINT)
+        console.log('[Colyseus] roomId:', room.id)
+        console.log('[Colyseus] sessionId:', room.sessionId)
+
+        // Example: listen for any messages (wildcard)
+        // Later, you can use specific message types instead of "*"
+        room.onMessage('*', (type, message) => {
+            console.log('[Colyseus] message:', type, message)
+        })
+
+        // Example: detect leave / disconnect
+        room.onLeave((code) => {
+            console.warn('[Colyseus] left room. code:', code)
+            noa.colyseus.room = null
+        })
+
+        // OPTIONAL: send a simple "hello" ping to the server (only if your server expects it)
+        // room.send('hello', { time: Date.now() })
+
+    } catch (err) {
+        console.error('[Colyseus] connection failed:', err)
+    }
+}
+
+// kick off connection immediately
+connectColyseus()
 
 
 
@@ -36,6 +114,7 @@ var noa = new Engine(opts)
  *  block, which specifies the materials for a given block type.
  * 
 */
+
 
 // block materials (just colors for this demo)
 var brownish = [0.45, 0.36, 0.22]
@@ -63,6 +142,7 @@ var grassID = noa.registry.registerBlock(2, { material: 'grass' })
  * 
 */
 
+
 // simple height map worldgen function
 function getVoxelID(x, y, z) {
     if (y < -3) return dirtID
@@ -71,11 +151,13 @@ function getVoxelID(x, y, z) {
     return 0 // signifying empty space
 }
 
+
 // register for world events
 noa.world.on('worldDataNeeded', function (id, data, x, y, z) {
     // `id` - a unique string id for the chunk
     // `data` - an `ndarray` of voxel ID data (see: https://github.com/scijs/ndarray)
     // `x, y, z` - world coords of the corner of the chunk
+
     for (var i = 0; i < data.shape[0]; i++) {
         for (var j = 0; j < data.shape[1]; j++) {
             for (var k = 0; k < data.shape[2]; k++) {
@@ -84,6 +166,7 @@ noa.world.on('worldDataNeeded', function (id, data, x, y, z) {
             }
         }
     }
+
     // tell noa the chunk's terrain data is now set
     noa.world.setChunkData(id, data)
 })
@@ -97,20 +180,21 @@ noa.world.on('worldDataNeeded', function (id, data, x, y, z) {
  * 
 */
 
+
 // get the player entity's ID and other info (position, size, ..)
 var player = noa.playerEntity
 var dat = noa.entities.getPositionData(player)
 var w = dat.width
 var h = dat.height
 
-// add a mesh to represent the player, and scale it, etc.
-import { CreateBox } from '@babylonjs/core/Meshes/Builders/boxBuilder'
 
+// add a mesh to represent the player, and scale it, etc.
 var scene = noa.rendering.getScene()
 var mesh = CreateBox('player-mesh', {}, scene)
 mesh.scaling.x = w
 mesh.scaling.z = w
 mesh.scaling.y = h
+
 
 // this adds a default flat material, without specularity
 mesh.material = noa.rendering.makeStandardMaterial()
@@ -120,11 +204,14 @@ mesh.material = noa.rendering.makeStandardMaterial()
 // this causes the mesh to move around in sync with the player entity
 noa.entities.addComponent(player, noa.entities.names.mesh, {
     mesh: mesh,
+
     // offset vector is needed because noa positions are always the 
     // bottom-center of the entity, and Babylon's CreateBox gives a 
     // mesh registered at the center of the box
     offset: [0, h / 2, 0],
 })
+
+
 
 
 /*
@@ -133,13 +220,15 @@ noa.entities.addComponent(player, noa.entities.names.mesh, {
  * 
 */
 
-// clear targeted block on on left click
+
+// clear targeted block on left click
 noa.inputs.down.on('fire', function () {
     if (noa.targetedBlock) {
         var pos = noa.targetedBlock.position
         noa.setBlock(0, pos[0], pos[1], pos[2])
     }
 })
+
 
 // place some grass on right click
 noa.inputs.down.on('alt-fire', function () {
@@ -148,6 +237,7 @@ noa.inputs.down.on('alt-fire', function () {
         noa.setBlock(grassID, pos[0], pos[1], pos[2])
     }
 })
+
 
 // add a key binding for "E" to do the same as alt-fire
 noa.inputs.bind('alt-fire', 'KeyE')
