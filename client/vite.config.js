@@ -15,15 +15,28 @@ export default defineConfig(({ command, mode, ssrBuild }) => {
         // relative paths for assets
         base: './',
 
-        resolve: {
-            extensions: ['.js'],
-            alias: {},
-            dedupe: [
-                // Needed if importing noa-engine from local filesystem
-                // Safe even when importing normally
-                '@babylonjs/core',
-            ],
-        },
+       resolve: {
+    extensions: ['.js'],
+    alias: {
+        // Force Vite/Rollup to NOT pick the Node build of httpie
+        '@colyseus/httpie/node': '@colyseus/httpie',
+
+        // (Optional but harmless) Sometimes packages import with explicit file paths
+        '@colyseus/httpie/node/index.mjs': '@colyseus/httpie',
+    },
+    dedupe: [
+        // This is needed if importing noa-engine from the local filesystem,
+        // but doesn't hurt anything if you're importing normally.
+        '@babylonjs/core',
+    ],
+
+    // Prefer browser entry points when bundling for the web
+    mainFields: ['browser', 'module', 'jsnext:main', 'jsnext'],
+
+    // Prefer browser export conditions (prevents selecting "node" condition)
+    conditions: ['browser', 'module', 'import', 'default'],
+},
+
 
         plugins: [],
 
