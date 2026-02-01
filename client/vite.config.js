@@ -33,39 +33,25 @@ export default defineConfig(({ command, mode, ssrBuild }) => {
         },
 
         // Production build configuration
-        build: {
-            target: 'es2020',
+      build: {
+  target: 'es2020',
+  outDir: '../dist',          // <-- IMPORTANT (goes to client/dist)
+  emptyOutDir: true,          // ok because it's outside root
+  chunkSizeWarningLimit: 1200,
+  minify: true,
+  rollupOptions: {
+    input: {
+      index: resolve(__dirname, 'src/index.html'),
+      test: resolve(__dirname, 'src/test/index.html'),
+      stress: resolve(__dirname, 'src/stress/index.html'),
+      helloWorld: resolve(__dirname, 'src/hello-world/index.html'),
+    },
+    manualChunks: (id) => {
+      if (id.includes('@babylon')) return 'babylon'
+    },
+  },
+},
 
-            // IMPORTANT:
-            // Output directory MUST be inside project root for Vercel
-            // This resolves the "No Output Directory named dist" error
-            outDir: 'dist',
-
-            // Clean output directory before build
-            emptyOutDir: true,
-
-            // Babylon.js chunks are large
-            chunkSizeWarningLimit: 1200,
-
-            minify: true,
-
-            rollupOptions: {
-                // Multiple entry points for demos
-                input: {
-                    index: resolve(__dirname, 'src/index.html'),
-                    test: resolve(__dirname, 'src/test/index.html'),
-                    stress: resolve(__dirname, 'src/stress/index.html'),
-                    helloWorld: resolve(__dirname, 'src/hello-world/index.html'),
-                },
-
-                // Split Babylon into its own chunk
-                manualChunks: (id) => {
-                    if (id.includes('@babylon')) {
-                        return 'babylon'
-                    }
-                },
-            },
-        },
 
         // Misc
         clearScreen: false,
