@@ -1,11 +1,7 @@
-/* 
- * 
- *          noa hello-world example
- * 
- *  This is a bare-minimum example world, intended to be a 
- *  starting point for hacking on noa game world content.
- * 
-*/
+/* * * noa hello-world example
+ * * This is a bare-minimum example world, intended to be a 
+ * starting point for hacking on noa game world content.
+ * */
 
 
 // Engine options object, and engine instantiation.
@@ -21,10 +17,10 @@ import { CreateBox } from '@babylonjs/core/Meshes/Builders/boxBuilder'
 
 /*
  *
- *      Engine options
+ * Engine options
  *
- *  Options are passed into the engine at construction time.
- *  (See `test` example, or noa docs/source, for more options.)
+ * Options are passed into the engine at construction time.
+ * (See `test` example, or noa docs/source, for more options.)
  *
 */
 
@@ -39,19 +35,90 @@ var opts = {
 var noa = new Engine(opts)
 
 
+/*
+ *
+ * UI: Minecraft-style Crosshair
+ *
+ * Inserted here to overlay on top of the canvas.
+ *
+*/
+function createCrosshair(noaEngine) {
+    // 1. Create the main container div
+    const crosshair = document.createElement('div');
+    crosshair.id = 'noa-crosshair';
+    
+    // 2. Apply CSS to center it and make it transparent to clicks
+    Object.assign(crosshair.style, {
+        position: 'absolute',
+        top: '50%',
+        left: '50%',
+        width: '14px',
+        height: '14px',
+        transform: 'translate(-50%, -50%)',
+        pointerEvents: 'none', // Helper: clicks pass through to the game
+        zIndex: '1000',
+        display: 'none', // Hidden by default until pointer locks
+        alignItems: 'center',
+        justifyContent: 'center'
+    });
+
+    // Shared style for the crosshair lines
+    const lineStyle = {
+        position: 'absolute',
+        backgroundColor: 'rgba(255, 255, 255, 0.8)',
+        boxShadow: '0px 0px 2px rgba(0, 0, 0, 0.8)', // Dark outline
+    };
+
+    // Horizontal line
+    const hLine = document.createElement('div');
+    Object.assign(hLine.style, lineStyle, {
+        width: '100%',
+        height: '2px',
+        top: '6px' // Vertically centered in the 14px box
+    });
+
+    // Vertical line
+    const vLine = document.createElement('div');
+    Object.assign(vLine.style, lineStyle, {
+        width: '2px',
+        height: '100%',
+        left: '6px' // Horizontally centered in the 14px box
+    });
+
+    crosshair.appendChild(hLine);
+    crosshair.appendChild(vLine);
+    document.body.appendChild(crosshair);
+
+    // 3. Toggle visibility based on Pointer Lock status
+    if (noaEngine && noaEngine.container) {
+        const canvas = noaEngine.container.canvas;
+        document.addEventListener('pointerlockchange', () => {
+            if (document.pointerLockElement === canvas) {
+                crosshair.style.display = 'block';
+            } else {
+                crosshair.style.display = 'none';
+            }
+        });
+    }
+}
+
+// Initialize the crosshair
+createCrosshair(noa);
+
+
 
 /*
  *
- *      Colyseus Multiplayer Hook
+ * Colyseus Multiplayer Hook
  *
- *  This connects the client (browser) to a Colyseus server.
- *  - In local dev, it falls back to ws://localhost:2567
- *  - On Vercel, you set VITE_COLYSEUS_ENDPOINT to your cloud endpoint:
- *      wss://us-mia-ea26ba04.colyseus.cloud
+ * This connects the client (browser) to a Colyseus server.
+ * - In local dev, it falls back to ws://localhost:2567
+ * - On Vercel, you set VITE_COLYSEUS_ENDPOINT to your cloud endpoint:
+ * wss://us-mia-ea26ba04.colyseus.cloud
  *
- *  IMPORTANT:
- *  The room name used here is "my_room". Your server must expose a room
- *  with this identifier in app.config.ts (rooms: { my_room: ... }).
+ * IMPORTANT:
+ * The room name used here is "my_room". Your server must expose a room
+ * with this identifier in app.config.ts (rooms: { my_room: ... }).
  *
 */
 
@@ -107,13 +174,11 @@ connectColyseus()
 
 /*
  *
- *      Registering voxel types
- * 
- *  Two step process. First you register a material, specifying the 
- *  color/texture/etc. of a given block face, then you register a 
- *  block, which specifies the materials for a given block type.
- * 
-*/
+ * Registering voxel types
+ * * Two step process. First you register a material, specifying the 
+ * color/texture/etc. of a given block face, then you register a 
+ * block, which specifies the materials for a given block type.
+ * */
 
 
 // block materials (just colors for this demo)
@@ -131,16 +196,13 @@ var grassID = noa.registry.registerBlock(2, { material: 'grass' })
 
 
 /*
- * 
- *      World generation
- * 
- *  The world is divided into chunks, and `noa` will emit an 
- *  `worldDataNeeded` event for each chunk of data it needs.
- *  The game client should catch this, and call 
- *  `noa.world.setChunkData` whenever the world data is ready.
- *  (The latter can be done asynchronously.)
- * 
-*/
+ * * World generation
+ * * The world is divided into chunks, and `noa` will emit an 
+ * `worldDataNeeded` event for each chunk of data it needs.
+ * The game client should catch this, and call 
+ * `noa.world.setChunkData` whenever the world data is ready.
+ * (The latter can be done asynchronously.)
+ * */
 
 
 // simple height map worldgen function
@@ -175,10 +237,8 @@ noa.world.on('worldDataNeeded', function (id, data, x, y, z) {
 
 
 /*
- * 
- *      Create a mesh to represent the player:
- * 
-*/
+ * * Create a mesh to represent the player:
+ * */
 
 
 // get the player entity's ID and other info (position, size, ..)
@@ -215,10 +275,8 @@ noa.entities.addComponent(player, noa.entities.names.mesh, {
 
 
 /*
- * 
- *      Minimal interactivity 
- * 
-*/
+ * * Minimal interactivity 
+ * */
 
 
 // clear targeted block on left click
@@ -251,4 +309,80 @@ noa.on('tick', function (dt) {
         if (noa.camera.zoomDistance < 0) noa.camera.zoomDistance = 0
         if (noa.camera.zoomDistance > 10) noa.camera.zoomDistance = 10
     }
+})
+
+
+/**
+ * Webpack config  -  this is not currently used, but is here as 
+ * a reference if you want it. It's not maintained and may need tweaks.
+ * * Note that to use this config, you'll need to put a suitable `index.html` file
+ * in the build directory, with <script> tags for `bundle.js` and `babylon.js`.
+ *
+ * * Then to build:
+ * npm i webpack webpack-cli
+ * cd src/hello-world
+ * webpack --env prod
+ * */
+
+
+
+
+var path = require('path')
+var buildPath = path.resolve('../../docs/hello-world')
+var entryPath = path.resolve('./index.js')
+var babylonPath = path.resolve('../../node_modules/@babylonjs')
+
+
+
+module.exports = (env) => ({
+
+    mode: (env && env.prod) ? 'production' : 'development',
+
+    entry: entryPath,
+    output: {
+        path: buildPath,
+        filename: 'bundle.js',
+    },
+
+    resolve: {
+        alias: {
+            /* This resolve is necessary when importing noa-engine from the 
+             * local filesystem in order to hack on it. 
+             * (but it shouldn't break anything when importing noa normally)
+             */
+            '@babylonjs': babylonPath,
+        },
+    },
+
+    performance: {
+        // change the default size warnings
+        maxEntrypointSize: 1.5e6,
+        maxAssetSize: 1.5e6,
+    },
+
+    stats: "minimal",
+
+    devtool: 'source-map',
+    devServer: {
+        static: buildPath,
+    },
+
+    // make the dev server's polling use less CPU :/
+    watchOptions: {
+        aggregateTimeout: 500,
+        poll: 1000,
+        ignored: ["node_modules"],
+    },
+    // split out babylon to a separate bundle (since it rarely changes)
+    optimization: {
+        splitChunks: {
+            cacheGroups: {
+                babylon: {
+                    chunks: 'initial',
+                    test: /babylonjs/,
+                    filename: 'babylon.js',
+                },
+            },
+        },
+    },
 })
