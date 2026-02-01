@@ -1,0 +1,33 @@
+{
+  "name": "noa-examples",
+  "version": "0.33.0",
+  "description": "Starter examples of game worlds using the noa voxel engine",
+  "scripts": {
+    "start": "vite serve --mode production",
+    "test": "vite serve",
+    "build": "vite build"
+  },
+  "keywords": [
+    "noa-engine",
+    "noa",
+    "voxel",
+    "game",
+    "engine",
+    "example"
+  ],
+  "author": "Andy Hall",
+  "license": "ISC",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/fenomas/noa-examples.git"
+  },
+  "dependencies": {
+    "@babylonjs/core": "^6.1.0",
+    "babylonjs-inspector": "^5.14.1",
+    "noa-engine": "^0.33.0",
+    "voxel-crunch": "^0.2.1"
+  },
+  "devDependencies": {
+    "vite": "^3.1.1"
+  }
+}
