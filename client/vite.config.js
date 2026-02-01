@@ -61,12 +61,7 @@ export default defineConfig(({ command, mode, ssrBuild }) => {
             minify: true,
 
             rollupOptions: {
-                input: {
-                    index: resolve(__dirname, 'src/index.html'),
-                    test: resolve(__dirname, 'src/test/index.html'),
-                    stress: resolve(__dirname, 'src/stress/index.html'),
-                    helloWorld: resolve(__dirname, 'src/hello-world/index.html'),
-                },
+                 input: resolve(__dirname, 'src/index.html'),
 
                 // keep babylon in its own chunk
                 manualChunks: (id) => {
