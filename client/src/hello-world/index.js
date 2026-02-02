@@ -137,7 +137,7 @@ createCrosshair(noa)
 const DEFAULT_LOCAL_ENDPOINT = 'http://localhost:2567'
 
 // Prefer env var if present, else fall back to local
-let COLYSEUS_ENDPOINT = import.meta.env.VITE_COLYSEUS_ENDPOINT ?? DEFAULT_LOCAL_ENDPOINT
+let COLYSEUS_ENDPOINT = import.meta.env.VITE_COLYSEUS_ENDPOINT ?? DEFAULT_LOCAL_ENDPOINT;
 
 // If the page is HTTPS but endpoint is http://, upgrade to https:// automatically
 if (typeof window !== 'undefined') {
@@ -147,10 +147,10 @@ if (typeof window !== 'undefined') {
 }
 
 // Create Colyseus client
-const colyseusClient = new Client(COLYSEUS_ENDPOINT)
+const colyseusClient = new Client(COLYSEUS_ENDPOINT);
 
 // Store connection references on the noa instance so other parts of the game can use them later
-noa.colyseus = {
+/** @type {any} */ (noa).colyseus = {
     endpoint: COLYSEUS_ENDPOINT,
     client: colyseusClient,
     room: null,
@@ -204,13 +204,13 @@ async function connectColyseus() {
 
     try {
         // Join an existing room or create one if none exist
-        const room = await colyseusClient.joinOrCreate('my_room')
+        const room = await colyseusClient.joinOrCreate('my_room');
 
         // Keep reference
-        noa.colyseus.room = room
+        /** @type {any} */ (noa).colyseus.room = room
 
         console.log('[Colyseus] connected OK')
-        console.log('[Colyseus] roomId:', room.id)
+        console.log('[Colyseus] roomId:', room.roomId)
         console.log('[Colyseus] sessionId:', room.sessionId)
 
         // Listen for any messages (wildcard)
@@ -220,8 +220,8 @@ async function connectColyseus() {
 
         // Detect leave / disconnect
         room.onLeave((code) => {
-            console.warn('[Colyseus] left room. code:', code)
-            noa.colyseus.room = null
+            console.warn('[Colyseus] left room. code:', code);
+            /** @type {any} */ (noa).colyseus.room = null
         })
 
         // OPTIONAL:
@@ -313,12 +313,12 @@ mesh.scaling.x = w
 mesh.scaling.z = w
 mesh.scaling.y = h
 
-mesh.material = noa.rendering.makeStandardMaterial()
+mesh.material = noa.rendering.makeStandardMaterial();
 
-noa.entities.addComponent(player, noa.entities.names.mesh, {
-    mesh: mesh,
-    offset: [0, h / 2, 0],
-})
+/** @type {any} */ (noa.entities).addComponent(player, noa.entities.names.mesh, {
+  mesh: mesh,
+  offset: [0, h / 2, 0],
+});
 
 
 

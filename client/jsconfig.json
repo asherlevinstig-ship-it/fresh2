@@ -1,29 +1,45 @@
 {
-    "include": [
-        "./**/*.js",
-        "./src/global.d.ts",
+  "include": [
+    "./src/**/*.js",
+    "./src/**/*.d.ts"
+  ],
+
+  "exclude": [
+    "node_modules",
+    "dist"
+  ],
+
+  "compilerOptions": {
+    "checkJs": true,
+    "allowJs": true,
+    "noEmit": true,
+
+    "target": "ES2020",
+    "module": "ESNext",
+    "moduleResolution": "Bundler",
+
+    "lib": [
+      "ES2020",
+      "DOM",
+      "DOM.Iterable"
     ],
-    "exclude": [
-        "node_modules",
+
+    "types": [
+      "vite/client"
     ],
-    "compilerOptions": {
-        "checkJs": true,
-        "resolveJsonModule": true,
-        "noEmit": true,
-        "target": "es5",
-        "lib": [
-            "es5",
-            "DOM",
-            "DOM.Iterable",
-            "ES2018"
-        ],
-        "typeRoots": [
-            "./types", // without this vscode will prefer auto-acquired types
-        ],
-        "paths": {
-            "SRC/*": [
-                "./src/*"
-            ],
-        }
-    },
+
+    "resolveJsonModule": true,
+
+    "typeRoots": [
+      "./types",
+      "./node_modules/@types"
+    ],
+
+    "baseUrl": ".",
+    "paths": {
+      "SRC/*": [
+        "./src/*"
+      ]
+    }
+  }
 }
