@@ -1,36 +1,32 @@
 /* 
- * 
- *          noa hello-world example
- * 
- *  This is a bare-minimum example world, intended to be a 
- *  starting point for hacking on noa game world content.
- * 
-*/
-
-
-/*
  *
- *      Imports
+ *          noa hello-world (full game entry)
+ *
+ *  Includes:
+ *   - noa-engine setup
+ *   - crosshair UI
+ *   - Colyseus multiplayer client
+ *   - biome-based terrain (fast-noise-lite)
+ *   - caves
+ *   - player mesh
+ *   - block interaction
  *
  */
 
+/* ===========================
+ * Imports
+ * ===========================
+ */
+
 import { Engine } from "noa-engine";
-
-// Colyseus (modern browser SDK - matches Colyseus Cloud reservation shape)
 import { Client } from "@colyseus/sdk";
+import FastNoiseLite from "fastnoise-lite";
 
-// Babylon box builder (used to create the player's mesh)
 import { CreateBox } from "@babylonjs/core/Meshes/Builders/boxBuilder";
 
-
-
-/*
- *
- *      Engine options
- *
- *  Options are passed into the engine at construction time.
- *  (See `test` example, or noa docs/source, for more options.)
- *
+/* ===========================
+ * Engine options
+ * ===========================
  */
 
 var opts = {
@@ -43,28 +39,15 @@ var opts = {
 
 var noa = new Engine(opts);
 
-
-
-/*
- *
- *      UI: Minecraft-style Crosshair
- *
- *  Inserted here to overlay on top of the canvas.
- *
- *  This version is robust:
- *   - Uses position: fixed and a very high z-index
- *   - Shows crosshair when ANY pointer lock is active
- *   - Requests pointer lock on click (required by browsers)
- *   - Tries to bind to noa's canvas, with fallbacks if it isn't ready yet
- *
+/* ===========================
+ * Crosshair UI
+ * ===========================
  */
 
 function createCrosshair(noaEngine) {
-    // Create the main container div
     const crosshair = document.createElement("div");
     crosshair.id = "noa-crosshair";
 
-    // Apply CSS to center it and make it transparent to clicks
     Object.assign(crosshair.style, {
         position: "fixed",
         top: "50%",
@@ -77,271 +60,213 @@ function createCrosshair(noaEngine) {
         display: "none",
     });
 
-    // Shared style for the crosshair lines
     const lineStyle = {
         position: "absolute",
-        backgroundColor: "rgba(255, 255, 255, 0.9)",
-        boxShadow: "0px 0px 2px rgba(0, 0, 0, 0.9)",
+        backgroundColor: "rgba(255,255,255,0.9)",
+        boxShadow: "0 0 2px rgba(0,0,0,0.9)",
     };
 
-    // Horizontal line
-    const hLine = document.createElement("div");
-    Object.assign(hLine.style, lineStyle, {
+    const h = document.createElement("div");
+    Object.assign(h.style, lineStyle, {
         width: "100%",
         height: "2px",
         top: "6px",
-        left: "0px",
     });
 
-    // Vertical line
-    const vLine = document.createElement("div");
-    Object.assign(vLine.style, lineStyle, {
+    const v = document.createElement("div");
+    Object.assign(v.style, lineStyle, {
         width: "2px",
         height: "100%",
-        top: "0px",
         left: "6px",
     });
 
-    crosshair.appendChild(hLine);
-    crosshair.appendChild(vLine);
+    crosshair.appendChild(h);
+    crosshair.appendChild(v);
     document.body.appendChild(crosshair);
 
-    // Helper: update visibility based on pointer lock status
-    const update = () => {
-        // If ANY element is pointer-locked, show crosshair
+    function update() {
         crosshair.style.display = document.pointerLockElement ? "block" : "none";
-    };
+    }
 
     document.addEventListener("pointerlockchange", update);
-    document.addEventListener("pointerlockerror", () => {
-        console.warn("[Crosshair] pointer lock error");
-        update();
-    });
 
-    // Try to request pointer lock on click
-    const tryBind = () => {
+    function bindCanvas() {
         const canvas =
-            (noaEngine && noaEngine.container && noaEngine.container.canvas) ||
-            document.querySelector("canvas");
+            noaEngine?.container?.canvas || document.querySelector("canvas");
 
         if (!canvas) return;
 
         canvas.addEventListener("click", () => {
-            // Some browsers require user gesture to lock pointer
             if (!document.pointerLockElement && canvas.requestPointerLock) {
                 canvas.requestPointerLock();
             }
         });
 
-        // Run once in case it's already locked
         update();
-    };
+    }
 
-    // noa creates canvas very early, but be safe
-    tryBind();
-    setTimeout(tryBind, 250);
-    setTimeout(tryBind, 1000);
-
-    return crosshair;
+    bindCanvas();
+    setTimeout(bindCanvas, 300);
+    setTimeout(bindCanvas, 1000);
 }
 
-// Initialize the crosshair
 createCrosshair(noa);
 
-
-
-/*
- *
- *      Colyseus Multiplayer Hook + Debug Preflight
- *
- *  IMPORTANT:
- *  Using @colyseus/sdk expects an HTTP(S) endpoint here, not ws://.
- *  The SDK negotiates ws/wss internally.
- *
- *  Local dev:  http://localhost:2567
- *  Production: https://us-mia-ea26ba04.colyseus.cloud
- *
- *  Room name used here is "my_room" which must exist in server config:
- *    rooms: { my_room: defineRoom(MyRoom) }
- *
+/* ===========================
+ * Colyseus connection
+ * ===========================
  */
 
-const DEFAULT_LOCAL_ENDPOINT = "http://localhost:2567";
+const DEFAULT_ENDPOINT = "ws://localhost:2567";
 
-// Prefer env var if present, else fall back to local
 let COLYSEUS_ENDPOINT =
-    import.meta.env.VITE_COLYSEUS_ENDPOINT ?? DEFAULT_LOCAL_ENDPOINT;
+    (import.meta.env && import.meta.env.VITE_COLYSEUS_ENDPOINT) ||
+    DEFAULT_ENDPOINT;
 
-// If the page is HTTPS but endpoint is http://, upgrade to https:// automatically
 if (typeof window !== "undefined") {
-    if (
-        window.location &&
-        window.location.protocol === "https:" &&
-        COLYSEUS_ENDPOINT.startsWith("http://")
-    ) {
-        COLYSEUS_ENDPOINT = COLYSEUS_ENDPOINT.replace("http://", "https://");
+    if (window.location.protocol === "https:" && COLYSEUS_ENDPOINT.startsWith("ws://")) {
+        COLYSEUS_ENDPOINT = COLYSEUS_ENDPOINT.replace("ws://", "wss://");
     }
 }
 
-// Create Colyseus client
+console.log("[Fresh2] build stamp: SDK 0.17 path @colyseus/sdk", Date.now());
+
 const colyseusClient = new Client(COLYSEUS_ENDPOINT);
 
-// Store connection references on the noa instance so other parts of the game can use them later
-/** @type {any} */ (noa).colyseus = {
+noa.colyseus = {
     endpoint: COLYSEUS_ENDPOINT,
     client: colyseusClient,
     room: null,
 };
 
-// Convert ws/wss endpoints to http/https for fetch debugging
-function toHttpEndpoint(endpoint) {
-    if (endpoint.startsWith("wss://")) return endpoint.replace("wss://", "https://");
-    if (endpoint.startsWith("ws://")) return endpoint.replace("ws://", "http://");
-    return endpoint;
-}
-
-// Debug helper to probe server endpoints before joining
-async function debugMatchmake(endpoint) {
-    const httpEndpoint = toHttpEndpoint(endpoint);
-
-    console.log("[Colyseus][debug] endpoint:", endpoint);
-    console.log("[Colyseus][debug] http endpoint:", httpEndpoint);
-
-    // 1) Test your express route (should return text)
-    try {
-        const r1 = await fetch(`${httpEndpoint}/hi`, { method: "GET" });
-        const t1 = await r1.text();
-        console.log("[Colyseus][debug] GET /hi status:", r1.status);
-        console.log("[Colyseus][debug] GET /hi body:", t1.slice(0, 200));
-    } catch (e) {
-        console.error("[Colyseus][debug] GET /hi failed:", e);
-    }
-
-    // 2) Test matchmaker joinOrCreate (should return JSON reservation)
-    try {
-        const r2 = await fetch(`${httpEndpoint}/matchmake/joinOrCreate/my_room`, {
-            method: "POST",
-            headers: { "Content-Type": "application/json" },
-            body: "{}",
-        });
-
-        const t2 = await r2.text();
-        console.log(
-            "[Colyseus][debug] POST /matchmake/joinOrCreate/my_room status:",
-            r2.status
-        );
-        console.log("[Colyseus][debug] raw body:", t2.slice(0, 400));
-
-        try {
-            const j = JSON.parse(t2);
-            console.log("[Colyseus][debug] parsed JSON:", j);
-        } catch {
-            console.warn("[Colyseus][debug] response was not JSON");
-        }
-    } catch (e) {
-        console.error("[Colyseus][debug] matchmake POST failed:", e);
-    }
-}
-
 async function connectColyseus() {
-    console.log("[Fresh2] build stamp: SDK 0.17 path @colyseus/sdk", Date.now());
     console.log("[Colyseus] attempting connection...");
-    console.log(
-        "[Colyseus] page protocol:",
-        typeof window !== "undefined" && window.location ? window.location.protocol : "(unknown)"
-    );
+    console.log("[Colyseus] page protocol:", window.location.protocol);
     console.log("[Colyseus] endpoint:", COLYSEUS_ENDPOINT);
     console.log("[Colyseus] room name:", "my_room");
 
-    // Preflight debug checks
-    await debugMatchmake(COLYSEUS_ENDPOINT);
-
     try {
-        // Join an existing room or create one if none exist
         const room = await colyseusClient.joinOrCreate("my_room");
 
-        // Keep reference
-        /** @type {any} */ (noa).colyseus.room = room;
+        noa.colyseus.room = room;
 
         console.log("[Colyseus] connected OK");
         console.log("[Colyseus] roomId:", room.roomId);
         console.log("[Colyseus] sessionId:", room.sessionId);
 
-        // Listen for any messages (wildcard)
         room.onMessage("*", (type, message) => {
             console.log("[Colyseus] message:", type, message);
         });
 
-        // Detect leave / disconnect
         room.onLeave((code) => {
             console.warn("[Colyseus] left room. code:", code);
-            /** @type {any} */ (noa).colyseus.room = null;
+            noa.colyseus.room = null;
         });
-
-        // OPTIONAL:
-        // room.send("yourMessageType", { hello: "world", time: Date.now() });
-
     } catch (err) {
         console.error("[Colyseus] connection failed:", err);
-        console.error("[Colyseus] endpoint used:", COLYSEUS_ENDPOINT);
-        console.error(
-            "[Colyseus] isSecurePage:",
-            typeof window !== "undefined" && window.location ? window.location.protocol === "https:" : "(unknown)"
-        );
     }
 }
 
-// Kick off connection immediately
 connectColyseus();
 
-
-
-/*
- *
- *      Registering voxel types
- * 
- *  Two step process. First you register a material, specifying the 
- *  color/texture/etc. of a given block face, then you register a 
- *  block, which specifies the materials for a given block type.
- * 
+/* ===========================
+ * World seed + noise
+ * ===========================
  */
 
-var brownish = [0.45, 0.36, 0.22];
-var greenish = [0.1, 0.8, 0.2];
+const WORLD_SEED = 1337;
 
-noa.registry.registerMaterial("dirt", { color: brownish });
-noa.registry.registerMaterial("grass", { color: greenish });
+const heightNoise = new FastNoiseLite(WORLD_SEED);
+heightNoise.SetNoiseType(FastNoiseLite.NoiseType.OpenSimplex2);
+heightNoise.SetFrequency(0.005);
+
+const tempNoise = new FastNoiseLite(WORLD_SEED + 1);
+tempNoise.SetNoiseType(FastNoiseLite.NoiseType.OpenSimplex2);
+tempNoise.SetFrequency(0.001);
+
+const moistureNoise = new FastNoiseLite(WORLD_SEED + 2);
+moistureNoise.SetNoiseType(FastNoiseLite.NoiseType.OpenSimplex2);
+moistureNoise.SetFrequency(0.001);
+
+const caveNoise = new FastNoiseLite(WORLD_SEED + 3);
+caveNoise.SetNoiseType(FastNoiseLite.NoiseType.OpenSimplex2);
+caveNoise.SetFrequency(0.03);
+
+/* ===========================
+ * Materials & blocks
+ * ===========================
+ */
+
+noa.registry.registerMaterial("dirt", { color: [0.45, 0.36, 0.22] });
+noa.registry.registerMaterial("grass", { color: [0.1, 0.8, 0.2] });
+noa.registry.registerMaterial("sand", { color: [0.9, 0.85, 0.55] });
+noa.registry.registerMaterial("snow", { color: [0.95, 0.95, 0.95] });
 
 var dirtID = noa.registry.registerBlock(1, { material: "dirt" });
 var grassID = noa.registry.registerBlock(2, { material: "grass" });
+var sandID = noa.registry.registerBlock(3, { material: "sand" });
+var snowID = noa.registry.registerBlock(4, { material: "snow" });
 
+/* ===========================
+ * Biomes
+ * ===========================
+ */
 
+function getBiome(x, z) {
+    const t = tempNoise.GetNoise(x, z);
+    const m = moistureNoise.GetNoise(x, z);
 
-/*
- * 
- *      World generation
- * 
- *  The world is divided into chunks, and `noa` will emit an 
- *  `worldDataNeeded` event for each chunk of data it needs.
- *  The game client should catch this, and call 
- *  `noa.world.setChunkData` whenever the world data is ready.
- *  (The latter can be done asynchronously.)
- * 
+    if (t > 0.4 && m < 0.0) return "desert";
+    if (t < -0.3) return "snow";
+    if (t > 0.2 && m > 0.2) return "mountains";
+    return "plains";
+}
+
+/* ===========================
+ * Terrain voxel logic
+ * ===========================
  */
 
 function getVoxelID(x, y, z) {
-    if (y < -3) return dirtID;
-    var height = 2 * Math.sin(x / 10) + 3 * Math.cos(z / 20);
-    if (y < height) return grassID;
+    const biome = getBiome(x, z);
+    const base = heightNoise.GetNoise(x, z);
+
+    let height = 0;
+
+    if (biome === "desert") height = base * 4 + 5;
+    if (biome === "plains") height = base * 8 + 8;
+    if (biome === "mountains") height = base * 20 + 12;
+    if (biome === "snow") height = base * 10 + 10;
+
+    height = Math.floor(height);
+
+    if (y < height - 2 && caveNoise.GetNoise(x, y, z) > 0.5) {
+        return 0;
+    }
+
+    if (y === height) {
+        if (biome === "desert") return sandID;
+        if (biome === "snow") return snowID;
+        return grassID;
+    }
+
+    if (y < height) {
+        return dirtID;
+    }
+
     return 0;
 }
+
+/* ===========================
+ * Chunk generation
+ * ===========================
+ */
 
 noa.world.on("worldDataNeeded", function (id, data, x, y, z) {
     for (var i = 0; i < data.shape[0]; i++) {
         for (var j = 0; j < data.shape[1]; j++) {
             for (var k = 0; k < data.shape[2]; k++) {
-                var voxelID = getVoxelID(x + i, y + j, z + k);
-                data.set(i, j, k, voxelID);
+                data.set(i, j, k, getVoxelID(x + i, y + j, z + k));
             }
         }
     }
@@ -349,18 +274,15 @@ noa.world.on("worldDataNeeded", function (id, data, x, y, z) {
     noa.world.setChunkData(id, data);
 });
 
-
-
-/*
- * 
- *      Create a mesh to represent the player:
- * 
+/* ===========================
+ * Player mesh
+ * ===========================
  */
 
 var player = noa.playerEntity;
-var dat = noa.entities.getPositionData(player);
-var w = dat.width;
-var h = dat.height;
+var pd = noa.entities.getPositionData(player);
+var w = pd.width;
+var h = pd.height;
 
 var scene = noa.rendering.getScene();
 var mesh = CreateBox("player-mesh", {}, scene);
@@ -368,40 +290,36 @@ var mesh = CreateBox("player-mesh", {}, scene);
 mesh.scaling.x = w;
 mesh.scaling.z = w;
 mesh.scaling.y = h;
-
 mesh.material = noa.rendering.makeStandardMaterial();
 
-/** @type {any} */ (noa.entities).addComponent(player, noa.entities.names.mesh, {
+noa.entities.addComponent(player, noa.entities.names.mesh, {
     mesh: mesh,
     offset: [0, h / 2, 0],
 });
 
-
-
-/*
- * 
- *      Minimal interactivity 
- * 
+/* ===========================
+ * Interaction
+ * ===========================
  */
 
 noa.inputs.down.on("fire", function () {
     if (noa.targetedBlock) {
-        var pos = noa.targetedBlock.position;
-        noa.setBlock(0, pos[0], pos[1], pos[2]);
+        const p = noa.targetedBlock.position;
+        noa.setBlock(0, p[0], p[1], p[2]);
     }
 });
 
 noa.inputs.down.on("alt-fire", function () {
     if (noa.targetedBlock) {
-        var pos = noa.targetedBlock.adjacent;
-        noa.setBlock(grassID, pos[0], pos[1], pos[2]);
+        const p = noa.targetedBlock.adjacent;
+        noa.setBlock(grassID, p[0], p[1], p[2]);
     }
 });
 
 noa.inputs.bind("alt-fire", "KeyE");
 
-noa.on("tick", function (dt) {
-    var scroll = noa.inputs.pointerState.scrolly;
+noa.on("tick", function () {
+    const scroll = noa.inputs.pointerState.scrolly;
     if (scroll !== 0) {
         noa.camera.zoomDistance += scroll > 0 ? 1 : -1;
         if (noa.camera.zoomDistance < 0) noa.camera.zoomDistance = 0;
