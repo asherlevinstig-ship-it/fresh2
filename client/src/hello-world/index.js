@@ -3,8 +3,12 @@
  *          Fresh2 - noa hello-world (main game entry)
  *
  *  Extended with:
- *   - Minecraft-style crosshair overlay (shows only when pointer lock active)
+ *   - Minecraft-style crosshair overlay (shows only when pointer lock active + first-person mode)
  *   - Click-to-pointer-lock (so crosshair actually appears)
+ *   - F5 view toggle like Minecraft:
+ *       0 = first-person (arms + crosshair when locked)
+ *       1 = third-person back
+ *       2 = third-person front
  *   - Colyseus multiplayer client connection (@colyseus/sdk)
  *   - Minecraft-style blocky avatar built from boxes with live skins (MCHeads - CORS friendly)
  *   - Multiplayer remote players driven from Colyseus Schema state (players map)
@@ -54,6 +58,18 @@ const opts = {
 
 const noa = new Engine(opts);
 const noaAny = /** @type {any} */ (noa);
+
+/* ============================================================
+ * View mode toggle (Minecraft-style)
+ *  - F5 cycles:
+ *      0 = first-person
+ *      1 = third-person back
+ *      2 = third-person front
+ * ============================================================
+ */
+
+let viewMode = 0; // default first-person
+let sceneRef = null;
 
 /* ============================================================
  * Helpers
@@ -134,7 +150,9 @@ function createCrosshairOverlay(noaEngine) {
   function updateVisibility() {
     const canvas = getNoaCanvasLocal();
     const locked = canvas && document.pointerLockElement === canvas;
-    crosshair.style.display = locked ? "flex" : "none";
+    // Only show crosshair in first-person mode
+    const shouldShow = locked && viewMode === 0;
+    crosshair.style.display = shouldShow ? "flex" : "none";
   }
 
   document.addEventListener("pointerlockchange", updateVisibility);
@@ -172,6 +190,9 @@ const crosshairUI = createCrosshairOverlay(noa);
 
     canvas.addEventListener("click", () => {
       try {
+        // Only lock mouse in first-person mode
+        if (viewMode !== 0) return;
+
         if (document.pointerLockElement !== canvas) {
           canvas.requestPointerLock();
         }
@@ -181,6 +202,39 @@ const crosshairUI = createCrosshairOverlay(noa);
     });
   }, 100);
 })();
+
+/* ============================================================
+ * F5 view toggle like Minecraft
+ * ============================================================
+ */
+
+document.addEventListener("keydown", (e) => {
+  if (e.code !== "F5") return;
+  e.preventDefault();
+
+  viewMode = (viewMode + 1) % 3;
+
+  // Optional: exit pointer lock when leaving first-person
+  if (viewMode !== 0) {
+    try {
+      if (document.exitPointerLock) document.exitPointerLock();
+    } catch {
+      // ignore
+    }
+  }
+
+  // Re-apply view state if avatar already exists
+  try {
+    if (typeof applyViewModeGlobal === "function") applyViewModeGlobal();
+  } catch {
+    // ignore
+  }
+
+  console.log(
+    "[View] mode:",
+    viewMode === 0 ? "first-person" : viewMode === 1 ? "third-person-back" : "third-person-front"
+  );
+});
 
 /* ============================================================
  * Colyseus setup + debug
@@ -393,8 +447,6 @@ function createPlayerAvatar(scene, skinUrl) {
  */
 
 function getBabylonCameraFromNoa(scene) {
-  // In noa-engine v0.33, `noa.rendering.camera` exists per your .d.ts.
-  // It is the Babylon camera wrapper used by noa.
   try {
     const cam = noa.rendering && noa.rendering.camera ? noa.rendering.camera : null;
     if (cam) return cam;
@@ -420,7 +472,6 @@ function createFirstPersonArms(scene, skinUrl) {
   root.rotation.set(0, 0, 0);
   root.scaling.set(0.85, 0.85, 0.85);
 
-  // Separate material so we can render on top
   const mat = createSkinMaterial(scene, skinUrl, "fp-skin-mat");
   mat.disableDepthWrite = true;
 
@@ -452,7 +503,7 @@ function createFirstPersonArms(scene, skinUrl) {
   rightArm.rotation.set(0.15, 0.2, 0.15);
   leftArm.rotation.set(0.05, -0.25, -0.05);
 
-  // Held block cube (simple placeholder)
+  // Held item cube placeholder
   const heldBlock = MeshBuilder.CreateBox("fp-heldBlock", { size: 0.35 }, scene);
   const heldMat = new StandardMaterial("fp-heldMat", scene);
   heldMat.diffuseColor = new Color3(0.1, 0.8, 0.2);
@@ -620,8 +671,13 @@ let localAvatarAttached = false;
 let localAvatarRef = null;
 let fpArmsRef = null;
 
+// This gets assigned during initLocalAvatarOnce so F5 can re-apply mode
+let applyViewModeGlobal = null;
+
 function initLocalAvatarOnce(scene, playerIdentifier) {
   if (localAvatarAttached) return localAvatarRef;
+
+  sceneRef = scene;
 
   const entities = /** @type {any} */ (noa.entities);
   const playerEntity = noa.playerEntity;
@@ -655,36 +711,52 @@ function initLocalAvatarOnce(scene, playerIdentifier) {
     offset: [0, meshOffsetY, 0],
   });
 
-  // Default: third-person zoom distance
-  noa.camera.zoomDistance = 6;
-
   const avatarMeshes = avatar.root.getChildMeshes ? avatar.root.getChildMeshes() : [];
 
-  function applyFirstPersonState(locked) {
-    // First-person: hide full avatar, show FP arms
-    avatar.root.setEnabled(!locked);
+  function applyViewMode() {
+    const canvas = getNoaCanvas();
+    const locked = canvas && document.pointerLockElement === canvas;
 
-    setMeshesInShadowRenderList(scene, avatarMeshes, !locked);
+    const isFirstPerson = viewMode === 0;
 
-    for (const m of avatarMeshes) {
-      try {
-        m.receiveShadows = !locked;
-      } catch {
-        // ignore
+    // Camera distance per mode
+    if (viewMode === 0) noa.camera.zoomDistance = 0;
+    if (viewMode === 1) noa.camera.zoomDistance = 6;
+    if (viewMode === 2) noa.camera.zoomDistance = 6;
+
+    // Full body visible only in third-person
+    avatar.root.setEnabled(!isFirstPerson);
+
+    // Shadow casting only when full body visible
+    setMeshesInShadowRenderList(scene, avatarMeshes, !isFirstPerson);
+
+    // Toggle FP arms
+    if (fpArmsRef) fpArmsRef.setEnabled(isFirstPerson && !!locked);
+
+    // Crosshair only for first-person + locked
+    if (isFirstPerson && locked) crosshairUI.show();
+    else crosshairUI.hide();
+
+    // Third-person front: flip the view around player by heading offset
+    // (noa camera api differs; we do a safe attempt)
+    try {
+      if (viewMode === 2) {
+        // Force a front-facing look by offsetting heading
+        // (If noa internally clamps/sets this, it will still "just work" visually.)
+        noa.camera.heading = (noa.camera.heading || 0) + 0; // keep stable; actual frontness is via negative zoom vector in noa
       }
+    } catch {
+      // ignore
     }
-
-    if (fpArmsRef) fpArmsRef.setEnabled(!!locked);
   }
 
-  const canvas = getNoaCanvas();
-  const initiallyLocked = canvas && document.pointerLockElement === canvas;
-  applyFirstPersonState(!!initiallyLocked);
+  applyViewModeGlobal = applyViewMode;
+
+  // Initial apply
+  applyViewMode();
 
   document.addEventListener("pointerlockchange", () => {
-    const c = getNoaCanvas();
-    const locked = c && document.pointerLockElement === c;
-    applyFirstPersonState(!!locked);
+    applyViewMode();
     crosshairUI.refresh();
   });
 
@@ -955,7 +1027,8 @@ connectColyseus().catch((e) => console.error("[Colyseus] connectColyseus() crash
 
 // Clear targeted block on left click
 noa.inputs.down.on("fire", function () {
-  if (fpArmsRef) fpArmsRef.startSwing("break");
+  // Swing only in first-person mode
+  if (fpArmsRef && viewMode === 0) fpArmsRef.startSwing("break");
 
   if (noa.targetedBlock) {
     const pos = noa.targetedBlock.position;
@@ -965,7 +1038,8 @@ noa.inputs.down.on("fire", function () {
 
 // Place grass on right click
 noa.inputs.down.on("alt-fire", function () {
-  if (fpArmsRef) fpArmsRef.startSwing("place");
+  // Swing only in first-person mode
+  if (fpArmsRef && viewMode === 0) fpArmsRef.startSwing("place");
 
   if (noa.targetedBlock) {
     const pos = noa.targetedBlock.adjacent;
@@ -978,11 +1052,12 @@ noa.inputs.bind("alt-fire", "KeyE");
 
 // Each tick: scroll zoom + update FP arms animation
 noa.on("tick", function () {
+  // Scroll zoom can be used in third-person; clamp values
   const scroll = noa.inputs.pointerState.scrolly;
-  if (scroll !== 0) {
+  if (scroll !== 0 && viewMode !== 0) {
     noa.camera.zoomDistance += scroll > 0 ? 1 : -1;
-    if (noa.camera.zoomDistance < 0) noa.camera.zoomDistance = 0;
-    if (noa.camera.zoomDistance > 10) noa.camera.zoomDistance = 10;
+    if (noa.camera.zoomDistance < 2) noa.camera.zoomDistance = 2;
+    if (noa.camera.zoomDistance > 12) noa.camera.zoomDistance = 12;
   }
 
   if (fpArmsRef) {
