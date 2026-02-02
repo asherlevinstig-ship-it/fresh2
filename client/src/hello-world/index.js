@@ -8,11 +8,16 @@
 */
 
 
-// Engine options object, and engine instantiation.
+/*
+ *
+ *      Imports
+ *
+ */
+
 import { Engine } from 'noa-engine'
 
-// Colyseus browser client SDK (multiplayer)
-import { Client } from 'colyseus.js'
+// Colyseus (modern browser SDK - matches Colyseus Cloud reservation shape)
+import { Client } from '@colyseus/sdk'
 
 // Babylon box builder (used to create the player's mesh)
 import { CreateBox } from '@babylonjs/core/Meshes/Builders/boxBuilder'
@@ -26,7 +31,7 @@ import { CreateBox } from '@babylonjs/core/Meshes/Builders/boxBuilder'
  *  Options are passed into the engine at construction time.
  *  (See `test` example, or noa docs/source, for more options.)
  *
-*/
+ */
 
 var opts = {
     debug: true,
@@ -46,7 +51,7 @@ var noa = new Engine(opts)
  *
  *  Inserted here to overlay on top of the canvas.
  *
-*/
+ */
 
 function createCrosshair(noaEngine) {
     // Create the main container div
@@ -115,33 +120,33 @@ createCrosshair(noa)
 
 /*
  *
- *      Colyseus Multiplayer Hook + Debugging
- *
- *  This connects the client (browser) to a Colyseus server.
- *
- *  For colyseus.js:
- *  - Local dev endpoint: ws://localhost:2567
- *  - Production endpoint: wss://<your-colyseus-cloud-domain>
+ *      Colyseus Multiplayer Hook + Debug Preflight
  *
  *  IMPORTANT:
- *  The room name used here is "my_room". Your server must expose a room
- *  with this identifier in app.config.ts (rooms: { my_room: ... }).
+ *  Using @colyseus/sdk expects an HTTP(S) endpoint here, not ws://.
+ *  The SDK negotiates ws/wss internally.
  *
-*/
+ *  Local dev:  http://localhost:2567
+ *  Production: https://us-mia-ea26ba04.colyseus.cloud
+ *
+ *  Room name used here is "my_room" which must exist in server config:
+ *    rooms: { my_room: defineRoom(MyRoom) }
+ *
+ */
 
-const DEFAULT_LOCAL_ENDPOINT = 'ws://localhost:2567'
+const DEFAULT_LOCAL_ENDPOINT = 'http://localhost:2567'
 
 // Prefer env var if present, else fall back to local
 let COLYSEUS_ENDPOINT = import.meta.env.VITE_COLYSEUS_ENDPOINT ?? DEFAULT_LOCAL_ENDPOINT
 
-// If page is https and endpoint is ws://, upgrade to wss:// automatically
+// If the page is HTTPS but endpoint is http://, upgrade to https:// automatically
 if (typeof window !== 'undefined') {
-    if (window.location && window.location.protocol === 'https:' && COLYSEUS_ENDPOINT.startsWith('ws://')) {
-        COLYSEUS_ENDPOINT = COLYSEUS_ENDPOINT.replace('ws://', 'wss://')
+    if (window.location && window.location.protocol === 'https:' && COLYSEUS_ENDPOINT.startsWith('http://')) {
+        COLYSEUS_ENDPOINT = COLYSEUS_ENDPOINT.replace('http://', 'https://')
     }
 }
 
-// Create client
+// Create Colyseus client
 const colyseusClient = new Client(COLYSEUS_ENDPOINT)
 
 // Store connection references on the noa instance so other parts of the game can use them later
@@ -151,23 +156,13 @@ noa.colyseus = {
     room: null,
 }
 
-// Convert ws:// -> http:// and wss:// -> https:// so we can probe HTTP endpoints
-function toHttpEndpoint(wsEndpoint) {
-    if (wsEndpoint.startsWith('wss://')) return wsEndpoint.replace('wss://', 'https://')
-    if (wsEndpoint.startsWith('ws://')) return wsEndpoint.replace('ws://', 'http://')
-    return wsEndpoint
-}
-
-// Debug helper to inspect what the server actually returns for matchmake calls
-async function debugMatchmake(endpoint) {
-    const http = toHttpEndpoint(endpoint)
-
-    console.log('[Colyseus][debug] ws endpoint:', endpoint)
-    console.log('[Colyseus][debug] http endpoint:', http)
+// Debug helper to probe server endpoints before joining
+async function debugMatchmake(httpEndpoint) {
+    console.log('[Colyseus][debug] http endpoint:', httpEndpoint)
 
     // 1) Test your express route (should return text)
     try {
-        const r1 = await fetch(`${http}/hi`, { method: 'GET' })
+        const r1 = await fetch(`${httpEndpoint}/hi`, { method: 'GET' })
         const t1 = await r1.text()
         console.log('[Colyseus][debug] GET /hi status:', r1.status)
         console.log('[Colyseus][debug] GET /hi body:', t1.slice(0, 200))
@@ -175,9 +170,9 @@ async function debugMatchmake(endpoint) {
         console.error('[Colyseus][debug] GET /hi failed:', e)
     }
 
-    // 2) Test matchmaker joinOrCreate (should return JSON with { room: { name: ... } })
+    // 2) Test matchmaker joinOrCreate (should return JSON reservation)
     try {
-        const r2 = await fetch(`${http}/matchmake/joinOrCreate/my_room`, {
+        const r2 = await fetch(`${httpEndpoint}/matchmake/joinOrCreate/my_room`, {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
             body: '{}',
@@ -204,7 +199,7 @@ async function connectColyseus() {
     console.log('[Colyseus] endpoint:', COLYSEUS_ENDPOINT)
     console.log('[Colyseus] room name:', 'my_room')
 
-    // Probe server responses before joining, so we can diagnose "seat reservation" issues
+    // Preflight debug checks
     await debugMatchmake(COLYSEUS_ENDPOINT)
 
     try {
@@ -229,8 +224,9 @@ async function connectColyseus() {
             noa.colyseus.room = null
         })
 
-        // OPTIONAL: send a simple "hello" ping (only if your server expects it)
-        // room.send('hello', { time: Date.now() })
+        // OPTIONAL:
+        // Send a simple test message if your server listens for it.
+        // room.send("yourMessageType", { hello: "world", time: Date.now() })
 
     } catch (err) {
         console.error('[Colyseus] connection failed:', err)
@@ -252,15 +248,14 @@ connectColyseus()
  *  color/texture/etc. of a given block face, then you register a 
  *  block, which specifies the materials for a given block type.
  * 
-*/
+ */
 
-// block materials (just colors for this demo)
 var brownish = [0.45, 0.36, 0.22]
 var greenish = [0.1, 0.8, 0.2]
+
 noa.registry.registerMaterial('dirt', { color: brownish })
 noa.registry.registerMaterial('grass', { color: greenish })
 
-// block types and their material names
 var dirtID = noa.registry.registerBlock(1, { material: 'dirt' })
 var grassID = noa.registry.registerBlock(2, { material: 'grass' })
 
@@ -276,22 +271,16 @@ var grassID = noa.registry.registerBlock(2, { material: 'grass' })
  *  `noa.world.setChunkData` whenever the world data is ready.
  *  (The latter can be done asynchronously.)
  * 
-*/
+ */
 
-// simple height map worldgen function
 function getVoxelID(x, y, z) {
     if (y < -3) return dirtID
     var height = 2 * Math.sin(x / 10) + 3 * Math.cos(z / 20)
     if (y < height) return grassID
-    return 0 // signifying empty space
+    return 0
 }
 
-// register for world events
 noa.world.on('worldDataNeeded', function (id, data, x, y, z) {
-    // `id` - a unique string id for the chunk
-    // `data` - an `ndarray` of voxel ID data (see: https://github.com/scijs/ndarray)
-    // `x, y, z` - world coords of the corner of the chunk
-
     for (var i = 0; i < data.shape[0]; i++) {
         for (var j = 0; j < data.shape[1]; j++) {
             for (var k = 0; k < data.shape[2]; k++) {
@@ -301,7 +290,6 @@ noa.world.on('worldDataNeeded', function (id, data, x, y, z) {
         }
     }
 
-    // tell noa the chunk's terrain data is now set
     noa.world.setChunkData(id, data)
 })
 
@@ -311,32 +299,24 @@ noa.world.on('worldDataNeeded', function (id, data, x, y, z) {
  * 
  *      Create a mesh to represent the player:
  * 
-*/
+ */
 
-// get the player entity's ID and other info (position, size, ..)
 var player = noa.playerEntity
 var dat = noa.entities.getPositionData(player)
 var w = dat.width
 var h = dat.height
 
-// add a mesh to represent the player, and scale it, etc.
 var scene = noa.rendering.getScene()
 var mesh = CreateBox('player-mesh', {}, scene)
+
 mesh.scaling.x = w
 mesh.scaling.z = w
 mesh.scaling.y = h
 
-// this adds a default flat material, without specularity
 mesh.material = noa.rendering.makeStandardMaterial()
 
-// add "mesh" component to the player entity
-// this causes the mesh to move around in sync with the player entity
 noa.entities.addComponent(player, noa.entities.names.mesh, {
     mesh: mesh,
-
-    // offset vector is needed because noa positions are always the 
-    // bottom-center of the entity, and Babylon's CreateBox gives a 
-    // mesh registered at the center of the box
     offset: [0, h / 2, 0],
 })
 
@@ -346,9 +326,8 @@ noa.entities.addComponent(player, noa.entities.names.mesh, {
  * 
  *      Minimal interactivity 
  * 
-*/
+ */
 
-// clear targeted block on left click
 noa.inputs.down.on('fire', function () {
     if (noa.targetedBlock) {
         var pos = noa.targetedBlock.position
@@ -356,7 +335,6 @@ noa.inputs.down.on('fire', function () {
     }
 })
 
-// place some grass on right click
 noa.inputs.down.on('alt-fire', function () {
     if (noa.targetedBlock) {
         var pos = noa.targetedBlock.adjacent
@@ -364,10 +342,8 @@ noa.inputs.down.on('alt-fire', function () {
     }
 })
 
-// add a key binding for "E" to do the same as alt-fire
 noa.inputs.bind('alt-fire', 'KeyE')
 
-// each tick, consume any scroll events and use them to zoom camera
 noa.on('tick', function (dt) {
     var scroll = noa.inputs.pointerState.scrolly
     if (scroll !== 0) {
