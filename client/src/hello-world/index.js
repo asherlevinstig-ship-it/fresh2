@@ -11,9 +11,13 @@
  *   - No bundled skin assets are required (skins are loaded from a URL).
  *   - Avatar is attached to the noa player entity via noa entities mesh component.
  *
- *  IMPORTANT FIX:
- *   - Crafatar "skins/<id>" expects a Mojang UUID (no dashes), not a username.
- *     This file resolves username -> UUID via Mojang API and then loads the skin.
+ *  IMPORTANT FIXES INCLUDED:
+ *   1) Babylon crash fix: noa mesh component must receive an AbstractMesh.
+ *      We use a Babylon Mesh as the avatar root (NOT TransformNode).
+ *   2) Skin reliability: Crafatar skins endpoint expects a Mojang UUID.
+ *      We resolve username -> UUID via Mojang API, then load from Crafatar.
+ *   3) TypeScript checkJs friendliness: noa typings are incomplete, so we
+ *      access optional/untyped props via a single noaAny cast.
  *
  */
 
@@ -26,7 +30,7 @@ import { Engine } from "noa-engine";
 import { Client } from "@colyseus/sdk";
 
 import { MeshBuilder } from "@babylonjs/core/Meshes/meshBuilder";
-import { TransformNode } from "@babylonjs/core/Meshes/transformNode";
+import { Mesh } from "@babylonjs/core/Meshes/mesh";
 import { Texture } from "@babylonjs/core/Materials/Textures/texture";
 import { StandardMaterial } from "@babylonjs/core/Materials/standardMaterial";
 import { Vector4 } from "@babylonjs/core/Maths/math.vector";
@@ -47,7 +51,7 @@ const opts = {
 
 const noa = new Engine(opts);
 
-// A single "any" view of noa, so JS-check/TS doesn't complain when noa's typings are incomplete.
+// noa types are incomplete under checkJs; cast once to satisfy VS Code/TS.
 const noaAny = /** @type {any} */ (noa);
 
 /* ============================================================
@@ -101,7 +105,7 @@ function createCrosshairOverlay(noaEngine) {
   crosshair.appendChild(vLine);
   document.body.appendChild(crosshair);
 
-  function getNoaCanvas() {
+  function getNoaCanvasLocal() {
     if (noaEngine && noaEngine.container && noaEngine.container.canvas) {
       return noaEngine.container.canvas;
     }
@@ -110,7 +114,7 @@ function createCrosshairOverlay(noaEngine) {
   }
 
   function updateVisibility() {
-    const canvas = getNoaCanvas();
+    const canvas = getNoaCanvasLocal();
     const locked = canvas && document.pointerLockElement === canvas;
     crosshair.style.display = locked ? "flex" : "none";
   }
@@ -120,10 +124,8 @@ function createCrosshairOverlay(noaEngine) {
   // Poll briefly until the canvas exists, then stop.
   const interval = setInterval(() => {
     updateVisibility();
-    const canvas = getNoaCanvas();
-    if (canvas) {
-      clearInterval(interval);
-    }
+    const canvas = getNoaCanvasLocal();
+    if (canvas) clearInterval(interval);
   }, 250);
 
   return {
@@ -156,11 +158,7 @@ let COLYSEUS_ENDPOINT =
     : DEFAULT_LOCAL_ENDPOINT;
 
 // If page is HTTPS, ensure we use WSS for websocket URLs.
-if (
-  typeof window !== "undefined" &&
-  window.location &&
-  window.location.protocol === "https:"
-) {
+if (typeof window !== "undefined" && window.location && window.location.protocol === "https:") {
   if (COLYSEUS_ENDPOINT.startsWith("ws://")) {
     COLYSEUS_ENDPOINT = COLYSEUS_ENDPOINT.replace("ws://", "wss://");
   }
@@ -170,10 +168,8 @@ if (
  * Convert ws:// -> http:// and wss:// -> https:// for fetch() debugging.
  */
 function toHttpEndpoint(wsEndpoint) {
-  if (wsEndpoint.startsWith("wss://"))
-    return wsEndpoint.replace("wss://", "https://");
-  if (wsEndpoint.startsWith("ws://"))
-    return wsEndpoint.replace("ws://", "http://");
+  if (wsEndpoint.startsWith("wss://")) return wsEndpoint.replace("wss://", "https://");
+  if (wsEndpoint.startsWith("ws://")) return wsEndpoint.replace("ws://", "http://");
   return wsEndpoint;
 }
 
@@ -205,10 +201,7 @@ async function debugMatchmake(endpointWs) {
     });
 
     const t2 = await r2.text();
-    console.log(
-      "[Colyseus][debug] POST /matchmake/joinOrCreate/my_room status:",
-      r2.status
-    );
+    console.log("[Colyseus][debug] POST /matchmake/joinOrCreate/my_room status:", r2.status);
     console.log("[Colyseus][debug] raw body:", t2.slice(0, 400));
 
     try {
@@ -233,12 +226,7 @@ noaAny.colyseus = {
 
 async function connectColyseus() {
   console.log("[Colyseus] attempting connection...");
-  console.log(
-    "[Colyseus] page protocol:",
-    typeof window !== "undefined" && window.location
-      ? window.location.protocol
-      : "(unknown)"
-  );
+  console.log("[Colyseus] page protocol:", (typeof window !== "undefined" && window.location) ? window.location.protocol : "(unknown)");
   console.log("[Colyseus] endpoint:", COLYSEUS_ENDPOINT);
   console.log("[Colyseus] room name:", "my_room");
 
@@ -263,19 +251,11 @@ async function connectColyseus() {
   } catch (err) {
     console.error("[Colyseus] connection failed:", err);
     console.error("[Colyseus] endpoint used:", COLYSEUS_ENDPOINT);
-    console.error(
-      "[Colyseus] isSecurePage:",
-      typeof window !== "undefined" && window.location
-        ? window.location.protocol === "https:"
-        : "(unknown)"
-    );
+    console.error("[Colyseus] isSecurePage:", (typeof window !== "undefined" && window.location) ? (window.location.protocol === "https:") : "(unknown)");
   }
 }
 
-// Keep same behavior: connect immediately (non-blocking).
-connectColyseus().catch((e) =>
-  console.error("[Colyseus] connectColyseus() crash:", e)
-);
+connectColyseus().catch((e) => console.error("[Colyseus] connectColyseus() crash:", e));
 
 /* ============================================================
  * Minecraft skin helpers (username -> UUID -> Crafatar skin URL)
@@ -283,29 +263,22 @@ connectColyseus().catch((e) =>
  */
 
 async function usernameToMojangUuid(username) {
-  // Mojang returns "id" as UUID without dashes.
-  const url = `https://api.mojang.com/users/profiles/minecraft/${encodeURIComponent(
-    username
-  )}`;
+  const url = `https://api.mojang.com/users/profiles/minecraft/${encodeURIComponent(username)}`;
   const r = await fetch(url);
   if (!r.ok) {
     throw new Error(`Mojang username lookup failed (${r.status})`);
   }
   const j = await r.json();
   if (!j || !j.id) throw new Error("Mojang username lookup returned no id");
-  return j.id;
+  return j.id; // UUID without dashes
 }
 
 async function resolveSkinUrl(username) {
-  // Prefer UUID-based crafatar endpoint; fall back to username endpoint if lookup fails.
   try {
     const uuid = await usernameToMojangUuid(username);
     return `https://crafatar.com/skins/${uuid}`;
   } catch (e) {
-    console.warn(
-      "[Skin] Failed to resolve UUID via Mojang; falling back to username URL:",
-      e
-    );
+    console.warn("[Skin] Failed to resolve UUID via Mojang; falling back to username URL:", e);
     return `https://crafatar.com/skins/${encodeURIComponent(username)}`;
   }
 }
@@ -334,15 +307,11 @@ function makeFaceUV(front, back, right, left, top, bottom) {
 }
 
 function createPlayerAvatar(scene, skinUrl) {
-  const root = new TransformNode("mc-avatar-root", scene);
+  // IMPORTANT: root must be an AbstractMesh (Mesh), not TransformNode.
+  const root = new Mesh("mc-avatar-root", scene);
+  root.isVisible = false; // root doesn't render, children do
 
-  const skinTexture = new Texture(
-    skinUrl,
-    scene,
-    false,
-    false,
-    Texture.NEAREST_NEAREST
-  );
+  const skinTexture = new Texture(skinUrl, scene, false, false, Texture.NEAREST_NEAREST);
   skinTexture.hasAlpha = true;
   skinTexture.wrapU = Texture.CLAMP_ADDRESSMODE;
   skinTexture.wrapV = Texture.CLAMP_ADDRESSMODE;
@@ -352,12 +321,10 @@ function createPlayerAvatar(scene, skinUrl) {
   mat.emissiveColor = new Color3(0.05, 0.05, 0.05);
   mat.specularColor = new Color3(0, 0, 0);
 
+  // Optional micro-optim: freeze material once texture is loaded.
+  // If you plan to swap skins live, remove this.
   skinTexture.onLoadObservable.add(() => {
-    try {
-      mat.freeze();
-    } catch {
-      // ok
-    }
+    try { mat.freeze(); } catch { /* ok */ }
   });
 
   // HEAD (8x8x8)
@@ -411,84 +378,57 @@ function createPlayerAvatar(scene, skinUrl) {
   const bodySize = { width: 1.0, height: 1.5, depth: 0.5 };
   const limbSize = { width: 0.5, height: 1.5, depth: 0.5 };
 
-  // Total avatar height (feet -> head top)
-  const AVATAR_TOTAL_HEIGHT = limbSize.height + bodySize.height + headSize.height;
-
-  const head = MeshBuilder.CreateBox(
-    "mc-head",
-    {
-      width: headSize.width,
-      height: headSize.height,
-      depth: headSize.depth,
-      faceUV: headUV,
-    },
-    scene
-  );
+  const head = MeshBuilder.CreateBox("mc-head", {
+    width: headSize.width,
+    height: headSize.height,
+    depth: headSize.depth,
+    faceUV: headUV,
+  }, scene);
   head.material = mat;
   head.parent = root;
 
-  const body = MeshBuilder.CreateBox(
-    "mc-body",
-    {
-      width: bodySize.width,
-      height: bodySize.height,
-      depth: bodySize.depth,
-      faceUV: bodyUV,
-    },
-    scene
-  );
+  const body = MeshBuilder.CreateBox("mc-body", {
+    width: bodySize.width,
+    height: bodySize.height,
+    depth: bodySize.depth,
+    faceUV: bodyUV,
+  }, scene);
   body.material = mat;
   body.parent = root;
 
-  const rightArm = MeshBuilder.CreateBox(
-    "mc-rightArm",
-    {
-      width: limbSize.width,
-      height: limbSize.height,
-      depth: limbSize.depth,
-      faceUV: rightArmUV,
-    },
-    scene
-  );
+  const rightArm = MeshBuilder.CreateBox("mc-rightArm", {
+    width: limbSize.width,
+    height: limbSize.height,
+    depth: limbSize.depth,
+    faceUV: rightArmUV,
+  }, scene);
   rightArm.material = mat;
   rightArm.parent = root;
 
-  const leftArm = MeshBuilder.CreateBox(
-    "mc-leftArm",
-    {
-      width: limbSize.width,
-      height: limbSize.height,
-      depth: limbSize.depth,
-      faceUV: leftArmUV,
-    },
-    scene
-  );
+  const leftArm = MeshBuilder.CreateBox("mc-leftArm", {
+    width: limbSize.width,
+    height: limbSize.height,
+    depth: limbSize.depth,
+    faceUV: leftArmUV,
+  }, scene);
   leftArm.material = mat;
   leftArm.parent = root;
 
-  const rightLeg = MeshBuilder.CreateBox(
-    "mc-rightLeg",
-    {
-      width: limbSize.width,
-      height: limbSize.height,
-      depth: limbSize.depth,
-      faceUV: rightLegUV,
-    },
-    scene
-  );
+  const rightLeg = MeshBuilder.CreateBox("mc-rightLeg", {
+    width: limbSize.width,
+    height: limbSize.height,
+    depth: limbSize.depth,
+    faceUV: rightLegUV,
+  }, scene);
   rightLeg.material = mat;
   rightLeg.parent = root;
 
-  const leftLeg = MeshBuilder.CreateBox(
-    "mc-leftLeg",
-    {
-      width: limbSize.width,
-      height: limbSize.height,
-      depth: limbSize.depth,
-      faceUV: leftLegUV,
-    },
-    scene
-  );
+  const leftLeg = MeshBuilder.CreateBox("mc-leftLeg", {
+    width: limbSize.width,
+    height: limbSize.height,
+    depth: limbSize.depth,
+    faceUV: leftLegUV,
+  }, scene);
   leftLeg.material = mat;
   leftLeg.parent = root;
 
@@ -497,23 +437,20 @@ function createPlayerAvatar(scene, skinUrl) {
   rightLeg.position.set(-0.25, legY, 0);
   leftLeg.position.set(0.25, legY, 0);
 
-  const bodyY = limbSize.height + bodySize.height / 2;
+  const bodyY = limbSize.height + (bodySize.height / 2);
   body.position.set(0, bodyY, 0);
 
-  const headY = limbSize.height + bodySize.height + headSize.height / 2;
+  const headY = limbSize.height + bodySize.height + (headSize.height / 2);
   head.position.set(0, headY, 0);
 
-  const armY = limbSize.height + bodySize.height - limbSize.height / 2;
+  const armY = limbSize.height + bodySize.height - (limbSize.height / 2);
   rightArm.position.set(-(bodySize.width / 2 + limbSize.width / 2), armY, 0);
-  leftArm.position.set(bodySize.width / 2 + limbSize.width / 2, armY, 0);
+  leftArm.position.set((bodySize.width / 2 + limbSize.width / 2), armY, 0);
 
   return {
     root,
     material: mat,
     parts: { head, body, leftArm, rightArm, leftLeg, rightLeg },
-    metrics: {
-      totalHeight: AVATAR_TOTAL_HEIGHT,
-    },
   };
 }
 
@@ -569,7 +506,10 @@ function getNoaCanvas() {
 (async function initPlayerAvatar() {
   const scene = noa.rendering.getScene();
 
+  // Any Minecraft username works here; skins are resolved via Mojang -> UUID -> Crafatar.
+  // Later you can use a username from your login or from Colyseus auth.
   const username = "Steve";
+
   const skinUrl = await resolveSkinUrl(username);
   console.log("[Skin] Using skin URL:", skinUrl);
 
@@ -580,22 +520,11 @@ function getNoaCanvas() {
   // noa types are incomplete under checkJs; cast once to satisfy VS Code.
   const entities = /** @type {any} */ (noa.entities);
 
-  // ---- FIX for TS2339:
-  // We avoid reading noa.playerHeight directly from typed Engine.
-  // Instead:
-  // 1) probe it from noaAny (untyped), and
-  // 2) fall back to a deterministic value if missing.
-  const probedPlayerHeight =
-    typeof noaAny.playerHeight === "number" ? noaAny.playerHeight : null;
-
-  // If noa doesn't expose playerHeight, use an approximate capsule height:
-  // avatar total height is ~4.0 units with our chosen dimensions.
-  // Many noa setups are ~1.8-2.0 "meters". We'll use 1.8 as a safe fallback.
+  // Avoid TS2339: probe from noaAny; fallback to 1.8 if unavailable.
+  const probedPlayerHeight = (typeof noaAny.playerHeight === "number") ? noaAny.playerHeight : null;
   const playerHeight = probedPlayerHeight || 1.8;
 
-  // Avatar root is at feet center.
-  // If noa entity position is capsule center, offset should be ~playerHeight/2.
-  // This is the common case.
+  // Avatar root is at feet; noa player pos is typically capsule center -> offset by half height.
   const meshOffsetY = playerHeight * 0.5;
 
   entities.addComponent(playerEntity, noa.entities.names.mesh, {
@@ -643,7 +572,7 @@ noa.inputs.bind("alt-fire", "KeyE");
 noa.on("tick", function () {
   const scroll = noa.inputs.pointerState.scrolly;
   if (scroll !== 0) {
-    noa.camera.zoomDistance += scroll > 0 ? 1 : -1;
+    noa.camera.zoomDistance += (scroll > 0) ? 1 : -1;
     if (noa.camera.zoomDistance < 0) noa.camera.zoomDistance = 0;
     if (noa.camera.zoomDistance > 10) noa.camera.zoomDistance = 10;
   }
