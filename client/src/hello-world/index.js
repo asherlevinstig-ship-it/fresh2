@@ -5,20 +5,16 @@
  *  Based on noa's "hello-world" example, extended with:
  *   - Minecraft-style crosshair overlay
  *   - Colyseus multiplayer client connection (@colyseus/sdk)
- *   - Minecraft-style blocky avatar built from boxes with live skins (MCHeads)
+ *   - Minecraft-style blocky avatar built from boxes with live skins (MCHeads - CORS friendly)
  *
- *  Notes:
- *   - No bundled skin assets are required (skins are loaded from a URL).
- *   - Avatar is attached to the noa player entity via noa entities mesh component.
- *
- *  IMPORTANT FIXES INCLUDED:
- *   1) Babylon crash fix: noa mesh component must receive an AbstractMesh.
- *      We use a Babylon Mesh as the avatar root (NOT TransformNode).
- *   2) Client-only skins (no proxy): use MCHeads skin endpoint (CORS-enabled)
- *      https://mc-heads.net/skin/<identifier>.png
- *      Works with username OR UUID.
- *   3) TypeScript checkJs friendliness: noa typings are incomplete, so we
- *      access optional/untyped props via a single noaAny cast.
+ *  Fixes included:
+ *   - Avatar root is a Babylon Mesh (AbstractMesh) to avoid Babylon LOD/active-mesh crashes.
+ *   - Skins loaded from https://mc-heads.net/skin/<identifier>.png (username OR UUID).
+ *   - Crosshair shows when pointer lock is active.
+ *   - Click-to-lock pointer so crosshair actually appears.
+ *   - When in first-person (pointer locked), avatar and its shadows are hidden (prevents “floating shadow blob”).
+ *   - When in third-person (pointer unlocked), avatar and shadows are enabled.
+ *   - TypeScript checkJs friendliness: noa typings are incomplete, so we access optional/untyped props via `noaAny`.
  *
  */
 
@@ -51,9 +47,18 @@ const opts = {
 };
 
 const noa = new Engine(opts);
-
-// noa types are incomplete under checkJs; cast once to satisfy VS Code/TS.
 const noaAny = /** @type {any} */ (noa);
+
+/* ============================================================
+ * Helpers: get canvas
+ * ============================================================
+ */
+
+function getNoaCanvas() {
+  if (noa && noa.container && noa.container.canvas) return noa.container.canvas;
+  const c = document.querySelector("canvas");
+  return c || null;
+}
 
 /* ============================================================
  * UI: Minecraft-style Crosshair
@@ -144,6 +149,34 @@ function createCrosshairOverlay(noaEngine) {
 const crosshairUI = createCrosshairOverlay(noa);
 
 /* ============================================================
+ * Pointer lock helper (click canvas to lock mouse)
+ * - Needed so crosshair appears and FPS controls feel right.
+ * ============================================================
+ */
+
+(function enableClickToPointerLock() {
+  const interval = setInterval(() => {
+    const canvas = getNoaCanvas();
+    if (!canvas) return;
+
+    clearInterval(interval);
+
+    if (!canvas.hasAttribute("tabindex")) canvas.setAttribute("tabindex", "0");
+    canvas.style.outline = "none";
+
+    canvas.addEventListener("click", () => {
+      try {
+        if (document.pointerLockElement !== canvas) {
+          canvas.requestPointerLock();
+        }
+      } catch (e) {
+        console.warn("[PointerLock] request failed:", e);
+      }
+    });
+  }, 100);
+})();
+
+/* ============================================================
  * Colyseus Multiplayer Hook
  * - Uses @colyseus/sdk
  * - Endpoint comes from VITE_COLYSEUS_ENDPOINT, fallback localhost
@@ -159,11 +192,7 @@ let COLYSEUS_ENDPOINT =
     : DEFAULT_LOCAL_ENDPOINT;
 
 // If page is HTTPS, ensure we use WSS for websocket URLs.
-if (
-  typeof window !== "undefined" &&
-  window.location &&
-  window.location.protocol === "https:"
-) {
+if (typeof window !== "undefined" && window.location && window.location.protocol === "https:") {
   if (COLYSEUS_ENDPOINT.startsWith("ws://")) {
     COLYSEUS_ENDPOINT = COLYSEUS_ENDPOINT.replace("ws://", "wss://");
   }
@@ -231,12 +260,7 @@ noaAny.colyseus = {
 
 async function connectColyseus() {
   console.log("[Colyseus] attempting connection...");
-  console.log(
-    "[Colyseus] page protocol:",
-    typeof window !== "undefined" && window.location
-      ? window.location.protocol
-      : "(unknown)"
-  );
+  console.log("[Colyseus] page protocol:", (typeof window !== "undefined" && window.location) ? window.location.protocol : "(unknown)");
   console.log("[Colyseus] endpoint:", COLYSEUS_ENDPOINT);
   console.log("[Colyseus] room name:", "my_room");
 
@@ -261,12 +285,7 @@ async function connectColyseus() {
   } catch (err) {
     console.error("[Colyseus] connection failed:", err);
     console.error("[Colyseus] endpoint used:", COLYSEUS_ENDPOINT);
-    console.error(
-      "[Colyseus] isSecurePage:",
-      typeof window !== "undefined" && window.location
-        ? window.location.protocol === "https:"
-        : "(unknown)"
-    );
+    console.error("[Colyseus] isSecurePage:", (typeof window !== "undefined" && window.location) ? (window.location.protocol === "https:") : "(unknown)");
   }
 }
 
@@ -279,8 +298,6 @@ connectColyseus().catch((e) => console.error("[Colyseus] connectColyseus() crash
  */
 
 function getMcHeadsSkinUrl(identifier) {
-  // MCHeads: raw 64x64 skin PNG; CORS friendly for client fetch.
-  // Identifier can be username or UUID.
   return `https://mc-heads.net/skin/${encodeURIComponent(identifier)}.png`;
 }
 
@@ -308,9 +325,9 @@ function makeFaceUV(front, back, right, left, top, bottom) {
 }
 
 function createPlayerAvatar(scene, skinUrl) {
-  // IMPORTANT: root must be an AbstractMesh (Mesh), not TransformNode.
+  // Root must be an AbstractMesh (Mesh) so Babylon internal render/LOD logic is happy.
   const root = new Mesh("mc-avatar-root", scene);
-  root.isVisible = false; // root doesn't render, children do
+  root.isVisible = false;
 
   const skinTexture = new Texture(skinUrl, scene, false, false, Texture.NEAREST_NEAREST);
   skinTexture.hasAlpha = true;
@@ -322,14 +339,8 @@ function createPlayerAvatar(scene, skinUrl) {
   mat.emissiveColor = new Color3(0.05, 0.05, 0.05);
   mat.specularColor = new Color3(0, 0, 0);
 
-  // Optional micro-optim: freeze material once texture is loaded.
-  // If you plan to swap skins live, remove this.
   skinTexture.onLoadObservable.add(() => {
-    try {
-      mat.freeze();
-    } catch {
-      // ok
-    }
+    try { mat.freeze(); } catch { /* ok */ }
   });
 
   // HEAD (8x8x8)
@@ -383,51 +394,27 @@ function createPlayerAvatar(scene, skinUrl) {
   const bodySize = { width: 1.0, height: 1.5, depth: 0.5 };
   const limbSize = { width: 0.5, height: 1.5, depth: 0.5 };
 
-  const head = MeshBuilder.CreateBox(
-    "mc-head",
-    { width: headSize.width, height: headSize.height, depth: headSize.depth, faceUV: headUV },
-    scene
-  );
+  const head = MeshBuilder.CreateBox("mc-head", { width: headSize.width, height: headSize.height, depth: headSize.depth, faceUV: headUV }, scene);
   head.material = mat;
   head.parent = root;
 
-  const body = MeshBuilder.CreateBox(
-    "mc-body",
-    { width: bodySize.width, height: bodySize.height, depth: bodySize.depth, faceUV: bodyUV },
-    scene
-  );
+  const body = MeshBuilder.CreateBox("mc-body", { width: bodySize.width, height: bodySize.height, depth: bodySize.depth, faceUV: bodyUV }, scene);
   body.material = mat;
   body.parent = root;
 
-  const rightArm = MeshBuilder.CreateBox(
-    "mc-rightArm",
-    { width: limbSize.width, height: limbSize.height, depth: limbSize.depth, faceUV: rightArmUV },
-    scene
-  );
+  const rightArm = MeshBuilder.CreateBox("mc-rightArm", { width: limbSize.width, height: limbSize.height, depth: limbSize.depth, faceUV: rightArmUV }, scene);
   rightArm.material = mat;
   rightArm.parent = root;
 
-  const leftArm = MeshBuilder.CreateBox(
-    "mc-leftArm",
-    { width: limbSize.width, height: limbSize.height, depth: limbSize.depth, faceUV: leftArmUV },
-    scene
-  );
+  const leftArm = MeshBuilder.CreateBox("mc-leftArm", { width: limbSize.width, height: limbSize.height, depth: limbSize.depth, faceUV: leftArmUV }, scene);
   leftArm.material = mat;
   leftArm.parent = root;
 
-  const rightLeg = MeshBuilder.CreateBox(
-    "mc-rightLeg",
-    { width: limbSize.width, height: limbSize.height, depth: limbSize.depth, faceUV: rightLegUV },
-    scene
-  );
+  const rightLeg = MeshBuilder.CreateBox("mc-rightLeg", { width: limbSize.width, height: limbSize.height, depth: limbSize.depth, faceUV: rightLegUV }, scene);
   rightLeg.material = mat;
   rightLeg.parent = root;
 
-  const leftLeg = MeshBuilder.CreateBox(
-    "mc-leftLeg",
-    { width: limbSize.width, height: limbSize.height, depth: limbSize.depth, faceUV: leftLegUV },
-    scene
-  );
+  const leftLeg = MeshBuilder.CreateBox("mc-leftLeg", { width: limbSize.width, height: limbSize.height, depth: limbSize.depth, faceUV: leftLegUV }, scene);
   leftLeg.material = mat;
   leftLeg.parent = root;
 
@@ -451,6 +438,52 @@ function createPlayerAvatar(scene, skinUrl) {
     material: mat,
     parts: { head, body, leftArm, rightArm, leftLeg, rightLeg },
   };
+}
+
+/* ============================================================
+ * Shadows: enable/disable avatar shadow casting safely (type-safe)
+ * - Babylon does shadow casting via ShadowGenerator renderLists.
+ * - We search scene lights for a shadowGenerator and update its renderList.
+ * ============================================================
+ */
+
+function getShadowGenerators(scene) {
+  // Babylon lights optionally have getShadowGenerator().
+  // Using `any` avoids typing gaps on Light subclasses.
+  const gens = [];
+  const lights = scene.lights || [];
+  for (const l of lights) {
+    const la = /** @type {any} */ (l);
+    try {
+      const gen = la.getShadowGenerator ? la.getShadowGenerator() : null;
+      if (gen) gens.push(gen);
+    } catch {
+      // ignore
+    }
+  }
+  return gens;
+}
+
+function setMeshesInShadowRenderList(scene, meshes, shouldCast) {
+  const gens = getShadowGenerators(scene);
+  if (!gens.length) return;
+
+  for (const gen of gens) {
+    const sm = gen.getShadowMap ? gen.getShadowMap() : null;
+    if (!sm) continue;
+
+    // Ensure renderList exists
+    if (!sm.renderList) sm.renderList = [];
+
+    for (const mesh of meshes) {
+      const idx = sm.renderList.indexOf(mesh);
+      if (shouldCast) {
+        if (idx === -1) sm.renderList.push(mesh);
+      } else {
+        if (idx !== -1) sm.renderList.splice(idx, 1);
+      }
+    }
+  }
 }
 
 /* ============================================================
@@ -496,17 +529,10 @@ noa.world.on("worldDataNeeded", function (id, data, x, y, z) {
  * ============================================================
  */
 
-function getNoaCanvas() {
-  if (noa && noa.container && noa.container.canvas) return noa.container.canvas;
-  const c = document.querySelector("canvas");
-  return c || null;
-}
-
 (function initPlayerAvatar() {
   const scene = noa.rendering.getScene();
 
-  // Any Minecraft identifier works here (username OR UUID).
-  // Later you can use a username from your login or from Colyseus auth.
+  // Username OR UUID works here
   const playerIdentifier = "Steve";
 
   const skinUrl = getMcHeadsSkinUrl(playerIdentifier);
@@ -515,15 +541,14 @@ function getNoaCanvas() {
   const avatar = createPlayerAvatar(scene, skinUrl);
 
   const playerEntity = noa.playerEntity;
-
-  // noa types are incomplete under checkJs; cast once to satisfy VS Code.
   const entities = /** @type {any} */ (noa.entities);
 
-  // Avoid TS2339: probe from noaAny; fallback to 1.8 if unavailable.
-  const probedPlayerHeight = typeof noaAny.playerHeight === "number" ? noaAny.playerHeight : null;
+  // Probe playerHeight if present; fallback otherwise.
+  const probedPlayerHeight =
+    typeof noaAny.playerHeight === "number" ? noaAny.playerHeight : null;
   const playerHeight = probedPlayerHeight || 1.8;
 
-  // Avatar root is at feet; noa player pos is typically capsule center -> offset by half height.
+  // Root is at feet; noa player position is usually capsule center.
   const meshOffsetY = playerHeight * 0.5;
 
   entities.addComponent(playerEntity, noa.entities.names.mesh, {
@@ -531,14 +556,43 @@ function getNoaCanvas() {
     offset: [0, meshOffsetY, 0],
   });
 
-  // Make sure we can see our own avatar (third-person-ish).
+  // Third-person default
   noa.camera.zoomDistance = 6;
 
-  // Hide avatar in pointer lock (first-person), show otherwise.
-  document.addEventListener("pointerlockchange", () => {
-    const canvas = getNoaCanvas();
-    const locked = canvas && document.pointerLockElement === canvas;
+  // Cache avatar child meshes (actual renderable parts)
+  const avatarMeshes = avatar.root.getChildMeshes
+    ? avatar.root.getChildMeshes()
+    : [];
+
+  function applyFirstPersonState(locked) {
+    // Third-person: show avatar
+    // First-person: hide avatar
     avatar.root.setEnabled(!locked);
+
+    // If you have shadows enabled in your scene, remove/add avatar meshes to shadow renderLists.
+    // (This is the correct Babylon way; no `castShadow` property needed.)
+    setMeshesInShadowRenderList(scene, avatarMeshes, !locked);
+
+    // Receiving shadows doesn't matter much for the avatar itself when hidden,
+    // but toggling is fine and type-safe.
+    for (const m of avatarMeshes) {
+      try {
+        m.receiveShadows = !locked;
+      } catch {
+        // ignore
+      }
+    }
+  }
+
+  // Apply initial state
+  const canvas = getNoaCanvas();
+  const initiallyLocked = canvas && document.pointerLockElement === canvas;
+  applyFirstPersonState(!!initiallyLocked);
+
+  document.addEventListener("pointerlockchange", () => {
+    const c = getNoaCanvas();
+    const locked = c && document.pointerLockElement === c;
+    applyFirstPersonState(!!locked);
     crosshairUI.refresh();
   });
 })();
