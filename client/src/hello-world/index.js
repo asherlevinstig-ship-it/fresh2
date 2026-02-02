@@ -8,7 +8,7 @@
  *   - F5 view toggle like Minecraft:
  *       0 = first-person (arms + crosshair when locked)
  *       1 = third-person back
- *       2 = third-person front
+ *       2 = third-person front (basic)
  *   - Colyseus multiplayer client connection (@colyseus/sdk)
  *   - Minecraft-style blocky avatar built from boxes with live skins (MCHeads - CORS friendly)
  *   - Multiplayer remote players driven from Colyseus Schema state (players map)
@@ -20,8 +20,10 @@
  *       - Simple held block in right hand (grass)
  *
  *  Fixes included:
+ *   - FP arms root MUST be visible (visibility is inherited in Babylon)
+ *   - Crosshair refreshes on F5 toggles (not only on pointerlockchange)
+ *   - Optional pointer lock request when returning to first-person
  *   - Avatar root is a Babylon Mesh (AbstractMesh) to avoid Babylon LOD/active-mesh crashes.
- *   - Skins loaded from https://mc-heads.net/skin/<identifier>.png (username OR UUID).
  *   - First-person: full avatar hidden + removed from shadow render lists (prevents floating shadow).
  *   - Prevents double local-avatar attach (no “Entity already has component: mesh”).
  *   - Robust Colyseus state hookup: waits for room.state.players to exist before using onAdd/onRemove.
@@ -150,7 +152,8 @@ function createCrosshairOverlay(noaEngine) {
   function updateVisibility() {
     const canvas = getNoaCanvasLocal();
     const locked = canvas && document.pointerLockElement === canvas;
-    // Only show crosshair in first-person mode
+
+    // Only show crosshair in first-person mode + pointer lock
     const shouldShow = locked && viewMode === 0;
     crosshair.style.display = shouldShow ? "flex" : "none";
   }
@@ -214,21 +217,36 @@ document.addEventListener("keydown", (e) => {
 
   viewMode = (viewMode + 1) % 3;
 
-  // Optional: exit pointer lock when leaving first-person
+  // Returning to first-person: attempt lock (browser may still require a click)
+  if (viewMode === 0) {
+    const canvas = getNoaCanvas();
+    if (canvas && document.pointerLockElement !== canvas) {
+      try {
+        canvas.requestPointerLock();
+      } catch {
+        // ignore
+      }
+    }
+  }
+
+  // Leaving first person: unlock mouse
   if (viewMode !== 0) {
     try {
-      if (document.exitPointerLock) document.exitPointerLock();
+      document.exitPointerLock?.();
     } catch {
       // ignore
     }
   }
 
-  // Re-apply view state if avatar already exists
+  // Apply view-mode immediately (if avatar already exists)
   try {
     if (typeof applyViewModeGlobal === "function") applyViewModeGlobal();
   } catch {
     // ignore
   }
+
+  // IMPORTANT: refresh crosshair now (not only on pointerlockchange)
+  crosshairUI.refresh();
 
   console.log(
     "[View] mode:",
@@ -464,7 +482,8 @@ function createFirstPersonArms(scene, skinUrl) {
   }
 
   const root = new Mesh("fp-arms-root", scene);
-  root.isVisible = false;
+  // IMPORTANT: parent visibility is inherited; root MUST be visible
+  root.isVisible = true;
   root.parent = cam;
 
   // Tweak these for feel
@@ -671,7 +690,7 @@ let localAvatarAttached = false;
 let localAvatarRef = null;
 let fpArmsRef = null;
 
-// This gets assigned during initLocalAvatarOnce so F5 can re-apply mode
+// Assigned during init so F5 can re-apply mode
 let applyViewModeGlobal = null;
 
 function initLocalAvatarOnce(scene, playerIdentifier) {
@@ -730,30 +749,19 @@ function initLocalAvatarOnce(scene, playerIdentifier) {
     // Shadow casting only when full body visible
     setMeshesInShadowRenderList(scene, avatarMeshes, !isFirstPerson);
 
-    // Toggle FP arms
+    // Toggle FP arms: first-person + pointer locked
     if (fpArmsRef) fpArmsRef.setEnabled(isFirstPerson && !!locked);
 
     // Crosshair only for first-person + locked
     if (isFirstPerson && locked) crosshairUI.show();
     else crosshairUI.hide();
-
-    // Third-person front: flip the view around player by heading offset
-    // (noa camera api differs; we do a safe attempt)
-    try {
-      if (viewMode === 2) {
-        // Force a front-facing look by offsetting heading
-        // (If noa internally clamps/sets this, it will still "just work" visually.)
-        noa.camera.heading = (noa.camera.heading || 0) + 0; // keep stable; actual frontness is via negative zoom vector in noa
-      }
-    } catch {
-      // ignore
-    }
   }
 
   applyViewModeGlobal = applyViewMode;
 
   // Initial apply
   applyViewMode();
+  crosshairUI.refresh();
 
   document.addEventListener("pointerlockchange", () => {
     applyViewMode();
@@ -1052,8 +1060,9 @@ noa.inputs.bind("alt-fire", "KeyE");
 
 // Each tick: scroll zoom + update FP arms animation
 noa.on("tick", function () {
-  // Scroll zoom can be used in third-person; clamp values
   const scroll = noa.inputs.pointerState.scrolly;
+
+  // Allow scroll zoom in third-person only
   if (scroll !== 0 && viewMode !== 0) {
     noa.camera.zoomDistance += scroll > 0 ? 1 : -1;
     if (noa.camera.zoomDistance < 2) noa.camera.zoomDistance = 2;
