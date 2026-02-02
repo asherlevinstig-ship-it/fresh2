@@ -22,6 +22,7 @@ import { Client } from '@colyseus/sdk'
 // Babylon box builder (used to create the player's mesh)
 import { CreateBox } from '@babylonjs/core/Meshes/Builders/boxBuilder'
 
+console.log("[Fresh2] build stamp: SDK 0.17 path", "@colyseus/sdk", Date.now());
 
 
 /*
