@@ -6,15 +6,16 @@
  *   - Minecraft-style crosshair overlay
  *   - Colyseus multiplayer client connection (@colyseus/sdk)
  *   - Minecraft-style blocky avatar built from boxes with live skins (MCHeads - CORS friendly)
+ *   - Multiplayer remote players driven from Colyseus Schema state (players map)
  *
  *  Fixes included:
  *   - Avatar root is a Babylon Mesh (AbstractMesh) to avoid Babylon LOD/active-mesh crashes.
  *   - Skins loaded from https://mc-heads.net/skin/<identifier>.png (username OR UUID).
  *   - Crosshair shows when pointer lock is active.
  *   - Click-to-lock pointer so crosshair actually appears.
- *   - When in first-person (pointer locked), avatar and its shadows are hidden (prevents “floating shadow blob”).
- *   - When in third-person (pointer unlocked), avatar and shadows are enabled.
- *   - TypeScript checkJs friendliness: noa typings are incomplete, so we access optional/untyped props via `noaAny`.
+ *   - First-person (pointer locked): local avatar hidden + shadow casting removed from shadow render lists.
+ *   - Third-person (pointer unlocked): local avatar shown + re-added to shadow render lists.
+ *   - noa typings are incomplete; use `noaAny` for optional/untyped access.
  *
  */
 
@@ -50,7 +51,7 @@ const noa = new Engine(opts);
 const noaAny = /** @type {any} */ (noa);
 
 /* ============================================================
- * Helpers: get canvas
+ * Helpers
  * ============================================================
  */
 
@@ -150,7 +151,6 @@ const crosshairUI = createCrosshairOverlay(noa);
 
 /* ============================================================
  * Pointer lock helper (click canvas to lock mouse)
- * - Needed so crosshair appears and FPS controls feel right.
  * ============================================================
  */
 
@@ -179,7 +179,7 @@ const crosshairUI = createCrosshairOverlay(noa);
 /* ============================================================
  * Colyseus Multiplayer Hook
  * - Uses @colyseus/sdk
- * - Endpoint comes from VITE_COLYSEUS_ENDPOINT, fallback localhost
+ * - Endpoint from VITE_COLYSEUS_ENDPOINT, fallback localhost
  * - Includes debugMatchmake preflight (HTTP endpoints)
  * ============================================================
  */
@@ -191,32 +191,28 @@ let COLYSEUS_ENDPOINT =
     ? import.meta.env.VITE_COLYSEUS_ENDPOINT
     : DEFAULT_LOCAL_ENDPOINT;
 
-// If page is HTTPS, ensure we use WSS for websocket URLs.
-if (typeof window !== "undefined" && window.location && window.location.protocol === "https:") {
+if (
+  typeof window !== "undefined" &&
+  window.location &&
+  window.location.protocol === "https:"
+) {
   if (COLYSEUS_ENDPOINT.startsWith("ws://")) {
     COLYSEUS_ENDPOINT = COLYSEUS_ENDPOINT.replace("ws://", "wss://");
   }
 }
 
-/**
- * Convert ws:// -> http:// and wss:// -> https:// for fetch() debugging.
- */
 function toHttpEndpoint(wsEndpoint) {
   if (wsEndpoint.startsWith("wss://")) return wsEndpoint.replace("wss://", "https://");
   if (wsEndpoint.startsWith("ws://")) return wsEndpoint.replace("ws://", "http://");
   return wsEndpoint;
 }
 
-/**
- * Debug: check basic routes + matchmake response shape.
- */
 async function debugMatchmake(endpointWs) {
   const http = toHttpEndpoint(endpointWs);
 
   console.log("[Colyseus][debug] ws endpoint:", endpointWs);
   console.log("[Colyseus][debug] http endpoint:", http);
 
-  // 1) Test /hi
   try {
     const r1 = await fetch(`${http}/hi`, { method: "GET" });
     const t1 = await r1.text();
@@ -226,7 +222,6 @@ async function debugMatchmake(endpointWs) {
     console.error("[Colyseus][debug] GET /hi failed:", e);
   }
 
-  // 2) Test matchmake joinOrCreate
   try {
     const r2 = await fetch(`${http}/matchmake/joinOrCreate/my_room`, {
       method: "POST",
@@ -251,49 +246,14 @@ async function debugMatchmake(endpointWs) {
 
 const colyseusClient = new Client(COLYSEUS_ENDPOINT);
 
-// Store references on noa for convenience.
 noaAny.colyseus = {
   endpoint: COLYSEUS_ENDPOINT,
   client: colyseusClient,
   room: null,
 };
 
-async function connectColyseus() {
-  console.log("[Colyseus] attempting connection...");
-  console.log("[Colyseus] page protocol:", (typeof window !== "undefined" && window.location) ? window.location.protocol : "(unknown)");
-  console.log("[Colyseus] endpoint:", COLYSEUS_ENDPOINT);
-  console.log("[Colyseus] room name:", "my_room");
-
-  await debugMatchmake(COLYSEUS_ENDPOINT);
-
-  try {
-    const room = await colyseusClient.joinOrCreate("my_room");
-    noaAny.colyseus.room = room;
-
-    console.log("[Colyseus] connected OK");
-    console.log("[Colyseus] roomId:", room.roomId || "(unknown)");
-    console.log("[Colyseus] sessionId:", room.sessionId);
-
-    room.onMessage("*", (type, message) => {
-      console.log("[Colyseus] message:", type, message);
-    });
-
-    room.onLeave((code) => {
-      console.warn("[Colyseus] left room. code:", code);
-      noaAny.colyseus.room = null;
-    });
-  } catch (err) {
-    console.error("[Colyseus] connection failed:", err);
-    console.error("[Colyseus] endpoint used:", COLYSEUS_ENDPOINT);
-    console.error("[Colyseus] isSecurePage:", (typeof window !== "undefined" && window.location) ? (window.location.protocol === "https:") : "(unknown)");
-  }
-}
-
-connectColyseus().catch((e) => console.error("[Colyseus] connectColyseus() crash:", e));
-
 /* ============================================================
- * Minecraft skin helper (Client-only, CORS-friendly)
- * - MCHeads supports usernames or UUIDs
+ * MCHeads skin helper (client-only, CORS-friendly)
  * ============================================================
  */
 
@@ -303,7 +263,6 @@ function getMcHeadsSkinUrl(identifier) {
 
 /* ============================================================
  * Minecraft-style Avatar (boxes + live skin URL)
- * - Uses classic 64x64 Minecraft skin UV layout
  * ============================================================
  */
 
@@ -324,8 +283,8 @@ function makeFaceUV(front, back, right, left, top, bottom) {
   return [front, back, right, left, top, bottom];
 }
 
-function createPlayerAvatar(scene, skinUrl) {
-  // Root must be an AbstractMesh (Mesh) so Babylon internal render/LOD logic is happy.
+function createPlayerAvatar(scene, skinUrl, nameTagText) {
+  // Root must be a Mesh (AbstractMesh) so Babylon internal render logic is happy.
   const root = new Mesh("mc-avatar-root", scene);
   root.isVisible = false;
 
@@ -339,8 +298,13 @@ function createPlayerAvatar(scene, skinUrl) {
   mat.emissiveColor = new Color3(0.05, 0.05, 0.05);
   mat.specularColor = new Color3(0, 0, 0);
 
+  // Optional micro-optim: freeze after texture loads
   skinTexture.onLoadObservable.add(() => {
-    try { mat.freeze(); } catch { /* ok */ }
+    try {
+      mat.freeze();
+    } catch {
+      // ok
+    }
   });
 
   // HEAD (8x8x8)
@@ -433,6 +397,9 @@ function createPlayerAvatar(scene, skinUrl) {
   rightArm.position.set(-(bodySize.width / 2 + limbSize.width / 2), armY, 0);
   leftArm.position.set(bodySize.width / 2 + limbSize.width / 2, armY, 0);
 
+  // (Optional) nameTagText included so signature matches future expansion without breaking
+  // It's not rendered here to avoid adding extra Babylon GUI dependencies.
+
   return {
     root,
     material: mat,
@@ -441,15 +408,13 @@ function createPlayerAvatar(scene, skinUrl) {
 }
 
 /* ============================================================
- * Shadows: enable/disable avatar shadow casting safely (type-safe)
+ * Shadows: enable/disable shadow casting safely
  * - Babylon does shadow casting via ShadowGenerator renderLists.
- * - We search scene lights for a shadowGenerator and update its renderList.
+ * - We search scene lights for shadow generators and update their renderList.
  * ============================================================
  */
 
 function getShadowGenerators(scene) {
-  // Babylon lights optionally have getShadowGenerator().
-  // Using `any` avoids typing gaps on Light subclasses.
   const gens = [];
   const lights = scene.lights || [];
   for (const l of lights) {
@@ -472,7 +437,6 @@ function setMeshesInShadowRenderList(scene, meshes, shouldCast) {
     const sm = gen.getShadowMap ? gen.getShadowMap() : null;
     if (!sm) continue;
 
-    // Ensure renderList exists
     if (!sm.renderList) sm.renderList = [];
 
     for (const mesh of meshes) {
@@ -525,30 +489,72 @@ noa.world.on("worldDataNeeded", function (id, data, x, y, z) {
 });
 
 /* ============================================================
- * Player avatar mesh: attach Minecraft-style avatar to player entity
+ * Multiplayer: remote player avatars (client-side)
+ * - Listens to room.state.players changes
+ * - Spawns/updates/removes Babylon avatars for other sessionIds
+ * - Sends local position/yaw/pitch updates to server periodically
  * ============================================================
  */
 
-(function initPlayerAvatar() {
-  const scene = noa.rendering.getScene();
+function safeNum(v, fallback = 0) {
+  return typeof v === "number" && Number.isFinite(v) ? v : fallback;
+}
 
-  // Username OR UUID works here
-  const playerIdentifier = "Steve";
+function getLocalPlayerPositionFallback() {
+  // noa has different APIs across versions. We'll attempt common patterns safely.
+  try {
+    const ent = noa.playerEntity;
+    const ents = /** @type {any} */ (noa.entities);
+    if (ents && typeof ents.getPosition === "function") {
+      const p = ents.getPosition(ent);
+      if (p && p.length >= 3) return [p[0], p[1], p[2]];
+    }
+  } catch {
+    // ignore
+  }
 
+  // Fallback: try to read from player entity data if accessible
+  try {
+    const p = noaAny.playerEntity && noaAny.entities && noaAny.entities.getPosition
+      ? noaAny.entities.getPosition(noaAny.playerEntity)
+      : null;
+    if (p && p.length >= 3) return [p[0], p[1], p[2]];
+  } catch {
+    // ignore
+  }
+
+  // Last resort: origin
+  return [0, 10, 0];
+}
+
+function getCameraYawPitchFallback() {
+  // Try a few common camera fields (noa versions vary)
+  const cam = noa.camera || noaAny.camera;
+  if (!cam) return { yaw: 0, pitch: 0 };
+
+  const yaw = safeNum(cam.heading, safeNum(cam.yaw, safeNum(cam.rotation?.y, 0)));
+  const pitch = safeNum(cam.pitch, safeNum(cam.rotation?.x, 0));
+
+  return { yaw, pitch };
+}
+
+/* ============================================================
+ * Local player avatar + first/third person behavior
+ * ============================================================
+ */
+
+function initLocalAvatar(scene, playerIdentifier) {
   const skinUrl = getMcHeadsSkinUrl(playerIdentifier);
   console.log("[Skin] Using MCHeads skin URL:", skinUrl);
 
-  const avatar = createPlayerAvatar(scene, skinUrl);
+  const avatar = createPlayerAvatar(scene, skinUrl, playerIdentifier);
 
   const playerEntity = noa.playerEntity;
   const entities = /** @type {any} */ (noa.entities);
 
-  // Probe playerHeight if present; fallback otherwise.
-  const probedPlayerHeight =
-    typeof noaAny.playerHeight === "number" ? noaAny.playerHeight : null;
+  const probedPlayerHeight = typeof noaAny.playerHeight === "number" ? noaAny.playerHeight : null;
   const playerHeight = probedPlayerHeight || 1.8;
 
-  // Root is at feet; noa player position is usually capsule center.
   const meshOffsetY = playerHeight * 0.5;
 
   entities.addComponent(playerEntity, noa.entities.names.mesh, {
@@ -559,22 +565,13 @@ noa.world.on("worldDataNeeded", function (id, data, x, y, z) {
   // Third-person default
   noa.camera.zoomDistance = 6;
 
-  // Cache avatar child meshes (actual renderable parts)
-  const avatarMeshes = avatar.root.getChildMeshes
-    ? avatar.root.getChildMeshes()
-    : [];
+  const avatarMeshes = avatar.root.getChildMeshes ? avatar.root.getChildMeshes() : [];
 
   function applyFirstPersonState(locked) {
-    // Third-person: show avatar
-    // First-person: hide avatar
     avatar.root.setEnabled(!locked);
 
-    // If you have shadows enabled in your scene, remove/add avatar meshes to shadow renderLists.
-    // (This is the correct Babylon way; no `castShadow` property needed.)
     setMeshesInShadowRenderList(scene, avatarMeshes, !locked);
 
-    // Receiving shadows doesn't matter much for the avatar itself when hidden,
-    // but toggling is fine and type-safe.
     for (const m of avatarMeshes) {
       try {
         m.receiveShadows = !locked;
@@ -584,7 +581,6 @@ noa.world.on("worldDataNeeded", function (id, data, x, y, z) {
     }
   }
 
-  // Apply initial state
   const canvas = getNoaCanvas();
   const initiallyLocked = canvas && document.pointerLockElement === canvas;
   applyFirstPersonState(!!initiallyLocked);
@@ -595,7 +591,217 @@ noa.world.on("worldDataNeeded", function (id, data, x, y, z) {
     applyFirstPersonState(!!locked);
     crosshairUI.refresh();
   });
-})();
+
+  return { avatar };
+}
+
+/* ============================================================
+ * Remote players manager
+ * ============================================================
+ */
+
+function createRemotePlayersManager(scene, room) {
+  const remotes = new Map(); // sessionId -> { avatar, last }
+
+  function spawnRemote(sessionId, playerState) {
+    const name = (playerState && typeof playerState.name === "string" && playerState.name) ? playerState.name : "Steve";
+    const skinUrl = getMcHeadsSkinUrl(name);
+
+    const avatar = createPlayerAvatar(scene, skinUrl, name);
+    avatar.root.setEnabled(true);
+
+    // Start position
+    const x = safeNum(playerState.x, 0);
+    const y = safeNum(playerState.y, 10);
+    const z = safeNum(playerState.z, 0);
+    avatar.root.position.set(x, y, z);
+
+    remotes.set(sessionId, {
+      avatar,
+      last: { x, y, z, t: performance.now() },
+    });
+
+    console.log("[Remote] spawned", sessionId, "name:", name);
+  }
+
+  function removeRemote(sessionId) {
+    const r = remotes.get(sessionId);
+    if (!r) return;
+
+    // Dispose meshes/material/texture
+    try {
+      const childMeshes = r.avatar.root.getChildMeshes ? r.avatar.root.getChildMeshes() : [];
+      for (const m of childMeshes) {
+        try { m.dispose(false, true); } catch { /* ignore */ }
+      }
+      try { r.avatar.root.dispose(false, true); } catch { /* ignore */ }
+      try {
+        const mat = r.avatar.material;
+        if (mat) {
+          const tex = mat.diffuseTexture;
+          try { tex && tex.dispose && tex.dispose(); } catch { /* ignore */ }
+          try { mat.dispose && mat.dispose(); } catch { /* ignore */ }
+        }
+      } catch {
+        // ignore
+      }
+    } catch {
+      // ignore
+    }
+
+    remotes.delete(sessionId);
+    console.log("[Remote] removed", sessionId);
+  }
+
+  function updateRemote(sessionId, playerState) {
+    const r = remotes.get(sessionId);
+    if (!r) return;
+
+    const tx = safeNum(playerState.x, r.last.x);
+    const ty = safeNum(playerState.y, r.last.y);
+    const tz = safeNum(playerState.z, r.last.z);
+
+    // Simple smoothing (lerp) - runs every tick below
+    r.last.tx = tx;
+    r.last.ty = ty;
+    r.last.tz = tz;
+
+    // Optional: rotation
+    const yaw = safeNum(playerState.yaw, 0);
+    // We rotate root around Y
+    try {
+      r.avatar.root.rotation.y = yaw;
+    } catch {
+      // ignore
+    }
+  }
+
+  // Attach listeners to the players MapSchema
+  const players = room.state.players;
+
+  players.onAdd = (playerState, sessionId) => {
+    // Don't spawn a remote for ourselves
+    if (sessionId === room.sessionId) return;
+    spawnRemote(sessionId, playerState);
+
+    // Listen for changes on that player (optional, but useful for instant updates)
+    playerState.onChange = () => {
+      updateRemote(sessionId, playerState);
+    };
+  };
+
+  players.onRemove = (_playerState, sessionId) => {
+    removeRemote(sessionId);
+  };
+
+  // Also spawn any existing players if we joined late
+  players.forEach((playerState, sessionId) => {
+    if (sessionId === room.sessionId) return;
+    if (!remotes.has(sessionId)) spawnRemote(sessionId, playerState);
+  });
+
+  // Each noa tick, smooth remote movement
+  noa.on("tick", () => {
+    const dt = noaAny?.rendering?._lastDT || 0.016;
+
+    remotes.forEach((r) => {
+      const root = r.avatar.root;
+      const tx = typeof r.last.tx === "number" ? r.last.tx : r.last.x;
+      const ty = typeof r.last.ty === "number" ? r.last.ty : r.last.y;
+      const tz = typeof r.last.tz === "number" ? r.last.tz : r.last.z;
+
+      // Lerp factor: higher -> snappier
+      const alpha = Math.min(1, Math.max(0, dt * 12));
+
+      const nx = root.position.x + (tx - root.position.x) * alpha;
+      const ny = root.position.y + (ty - root.position.y) * alpha;
+      const nz = root.position.z + (tz - root.position.z) * alpha;
+
+      root.position.set(nx, ny, nz);
+
+      // Keep last
+      r.last.x = nx;
+      r.last.y = ny;
+      r.last.z = nz;
+    });
+  });
+
+  return {
+    remotes,
+    removeRemote,
+  };
+}
+
+/* ============================================================
+ * Connect to Colyseus + init local/remote multiplayer hooks
+ * ============================================================
+ */
+
+async function connectColyseus() {
+  console.log("[Colyseus] attempting connection...");
+  console.log("[Colyseus] page protocol:", (typeof window !== "undefined" && window.location) ? window.location.protocol : "(unknown)");
+  console.log("[Colyseus] endpoint:", COLYSEUS_ENDPOINT);
+  console.log("[Colyseus] room name:", "my_room");
+
+  await debugMatchmake(COLYSEUS_ENDPOINT);
+
+  try {
+    // Send a name to server so it can set PlayerState.name (for skin)
+    const joinOptions = { name: "Steve" };
+
+    const room = await colyseusClient.joinOrCreate("my_room", joinOptions);
+    noaAny.colyseus.room = room;
+
+    console.log("[Colyseus] connected OK");
+    console.log("[Colyseus] roomId:", room.roomId || "(unknown)");
+    console.log("[Colyseus] sessionId:", room.sessionId);
+
+    room.onMessage("*", (type, message) => {
+      console.log("[Colyseus] message:", type, message);
+    });
+
+    room.onLeave((code) => {
+      console.warn("[Colyseus] left room. code:", code);
+      noaAny.colyseus.room = null;
+    });
+
+    // Init local avatar
+    const scene = noa.rendering.getScene();
+    initLocalAvatar(scene, "Steve");
+
+    // Init remote players manager based on schema state
+    createRemotePlayersManager(scene, room);
+
+    // Periodically send local transform updates
+    const sendRateMs = 50; // 20Hz
+    setInterval(() => {
+      if (!noaAny.colyseus.room) return;
+
+      const [x, y, z] = getLocalPlayerPositionFallback();
+      const { yaw, pitch } = getCameraYawPitchFallback();
+
+      noaAny.colyseus.room.send("move", {
+        x, y, z,
+        yaw, pitch,
+      });
+    }, sendRateMs);
+
+  } catch (err) {
+    console.error("[Colyseus] connection failed:", err);
+    console.error("[Colyseus] endpoint used:", COLYSEUS_ENDPOINT);
+    console.error("[Colyseus] isSecurePage:", (typeof window !== "undefined" && window.location) ? (window.location.protocol === "https:") : "(unknown)");
+
+    // Still init local avatar even if multiplayer fails (keeps single-player working)
+    try {
+      const scene = noa.rendering.getScene();
+      initLocalAvatar(scene, "Steve");
+    } catch (e) {
+      console.error("[Avatar] failed to init after Colyseus failure:", e);
+    }
+  }
+}
+
+connectColyseus().catch((e) => console.error("[Colyseus] connectColyseus() crash:", e));
 
 /* ============================================================
  * Minimal interactivity
