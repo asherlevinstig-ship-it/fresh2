@@ -1,328 +1,539 @@
-/* 
+/*
  *
- *          noa hello-world (full game entry)
+ *          Fresh2 - noa hello-world (main game entry)
  *
- *  Includes:
- *   - noa-engine setup
- *   - crosshair UI
- *   - Colyseus multiplayer client
- *   - biome-based terrain (fast-noise-lite)
- *   - caves
- *   - player mesh
- *   - block interaction
+ *  Based on noa's "hello-world" example, extended with:
+ *   - Minecraft-style crosshair overlay
+ *   - Colyseus multiplayer client connection (@colyseus/sdk)
+ *   - Minecraft-style blocky avatar built from boxes with live skins (Crafatar)
+ *
+ *  Notes:
+ *   - No bundled skin assets are required (skins are loaded from a URL).
+ *   - Avatar is attached to the noa player entity via noa entities mesh component.
  *
  */
 
-/* ===========================
+
+
+/* ============================================================
  * Imports
- * ===========================
+ * ============================================================
  */
 
 import { Engine } from "noa-engine";
 import { Client } from "@colyseus/sdk";
-import FastNoiseLite from "fastnoise-lite";
 
-import { CreateBox } from "@babylonjs/core/Meshes/Builders/boxBuilder";
+import { MeshBuilder } from "@babylonjs/core/Meshes/meshBuilder";
+import { TransformNode } from "@babylonjs/core/Meshes/transformNode";
+import { Texture } from "@babylonjs/core/Materials/Textures/texture";
+import { StandardMaterial } from "@babylonjs/core/Materials/standardMaterial";
+import { Vector4 } from "@babylonjs/core/Maths/math.vector";
+import { Color3 } from "@babylonjs/core/Maths/math.color";
 
-/* ===========================
- * Engine options
- * ===========================
+
+
+/* ============================================================
+ * Engine options + instantiate noa
+ * ============================================================
  */
 
-var opts = {
-    debug: true,
-    showFPS: true,
-    chunkSize: 32,
-    chunkAddDistance: 2.5,
-    chunkRemoveDistance: 3.5,
+const opts = {
+  debug: true,
+  showFPS: true,
+  chunkSize: 32,
+  chunkAddDistance: 2.5,
+  chunkRemoveDistance: 3.5,
 };
 
-var noa = new Engine(opts);
+const noa = new Engine(opts);
 
-/* ===========================
- * Crosshair UI
- * ===========================
+
+
+/* ============================================================
+ * UI: Minecraft-style Crosshair
+ * - Always exists as a DOM overlay.
+ * - Shows automatically when pointer lock is active on the canvas.
+ * ============================================================
  */
 
-function createCrosshair(noaEngine) {
-    const crosshair = document.createElement("div");
-    crosshair.id = "noa-crosshair";
+function createCrosshairOverlay(noaEngine) {
+  const crosshair = document.createElement("div");
+  crosshair.id = "noa-crosshair";
 
-    Object.assign(crosshair.style, {
-        position: "fixed",
-        top: "50%",
-        left: "50%",
-        width: "14px",
-        height: "14px",
-        transform: "translate(-50%, -50%)",
-        pointerEvents: "none",
-        zIndex: "999999",
-        display: "none",
-    });
+  Object.assign(crosshair.style, {
+    position: "fixed",
+    top: "50%",
+    left: "50%",
+    width: "16px",
+    height: "16px",
+    transform: "translate(-50%, -50%)",
+    pointerEvents: "none",
+    zIndex: "999999",
+    display: "none",
+    alignItems: "center",
+    justifyContent: "center",
+  });
 
-    const lineStyle = {
-        position: "absolute",
-        backgroundColor: "rgba(255,255,255,0.9)",
-        boxShadow: "0 0 2px rgba(0,0,0,0.9)",
-    };
+  const lineStyle = {
+    position: "absolute",
+    backgroundColor: "rgba(255,255,255,0.9)",
+    boxShadow: "0px 0px 2px rgba(0,0,0,0.85)",
+  };
 
-    const h = document.createElement("div");
-    Object.assign(h.style, lineStyle, {
-        width: "100%",
-        height: "2px",
-        top: "6px",
-    });
+  const hLine = document.createElement("div");
+  Object.assign(hLine.style, lineStyle, {
+    width: "100%",
+    height: "2px",
+    top: "7px",
+    left: "0px",
+  });
 
-    const v = document.createElement("div");
-    Object.assign(v.style, lineStyle, {
-        width: "2px",
-        height: "100%",
-        left: "6px",
-    });
+  const vLine = document.createElement("div");
+  Object.assign(vLine.style, lineStyle, {
+    width: "2px",
+    height: "100%",
+    left: "7px",
+    top: "0px",
+  });
 
-    crosshair.appendChild(h);
-    crosshair.appendChild(v);
-    document.body.appendChild(crosshair);
+  crosshair.appendChild(hLine);
+  crosshair.appendChild(vLine);
+  document.body.appendChild(crosshair);
 
-    function update() {
-        crosshair.style.display = document.pointerLockElement ? "block" : "none";
+  function getNoaCanvas() {
+    if (noaEngine && noaEngine.container && noaEngine.container.canvas) {
+      return noaEngine.container.canvas;
     }
+    const c = document.querySelector("canvas");
+    return c || null;
+  }
 
-    document.addEventListener("pointerlockchange", update);
+  function updateVisibility() {
+    const canvas = getNoaCanvas();
+    const locked = canvas && document.pointerLockElement === canvas;
+    crosshair.style.display = locked ? "flex" : "none";
+  }
 
-    function bindCanvas() {
-        const canvas =
-            noaEngine?.container?.canvas || document.querySelector("canvas");
+  document.addEventListener("pointerlockchange", updateVisibility);
 
-        if (!canvas) return;
-
-        canvas.addEventListener("click", () => {
-            if (!document.pointerLockElement && canvas.requestPointerLock) {
-                canvas.requestPointerLock();
-            }
-        });
-
-        update();
+  // Poll briefly until the canvas exists, then stop.
+  const interval = setInterval(() => {
+    updateVisibility();
+    const canvas = getNoaCanvas();
+    if (canvas) {
+      clearInterval(interval);
     }
+  }, 250);
 
-    bindCanvas();
-    setTimeout(bindCanvas, 300);
-    setTimeout(bindCanvas, 1000);
+  return {
+    element: crosshair,
+    show: () => { crosshair.style.display = "flex"; },
+    hide: () => { crosshair.style.display = "none"; },
+    refresh: updateVisibility,
+  };
 }
 
-createCrosshair(noa);
+const crosshairUI = createCrosshairOverlay(noa);
 
-/* ===========================
- * Colyseus connection
- * ===========================
+
+
+/* ============================================================
+ * Colyseus Multiplayer Hook
+ * - Uses @colyseus/sdk
+ * - Endpoint comes from VITE_COLYSEUS_ENDPOINT, fallback localhost
+ * - Includes debugMatchmake preflight (HTTP endpoints)
+ * ============================================================
  */
 
-const DEFAULT_ENDPOINT = "ws://localhost:2567";
+const DEFAULT_LOCAL_ENDPOINT = "ws://localhost:2567";
 
 let COLYSEUS_ENDPOINT =
-    (import.meta.env && import.meta.env.VITE_COLYSEUS_ENDPOINT) ||
-    DEFAULT_ENDPOINT;
+  (import.meta.env && import.meta.env.VITE_COLYSEUS_ENDPOINT)
+    ? import.meta.env.VITE_COLYSEUS_ENDPOINT
+    : DEFAULT_LOCAL_ENDPOINT;
 
-if (typeof window !== "undefined") {
-    if (window.location.protocol === "https:" && COLYSEUS_ENDPOINT.startsWith("ws://")) {
-        COLYSEUS_ENDPOINT = COLYSEUS_ENDPOINT.replace("ws://", "wss://");
-    }
+// If page is HTTPS, ensure we use WSS for websocket URLs.
+if (typeof window !== "undefined" && window.location && window.location.protocol === "https:") {
+  if (COLYSEUS_ENDPOINT.startsWith("ws://")) {
+    COLYSEUS_ENDPOINT = COLYSEUS_ENDPOINT.replace("ws://", "wss://");
+  }
 }
 
-console.log("[Fresh2] build stamp: SDK 0.17 path @colyseus/sdk", Date.now());
+/**
+ * Convert ws:// -> http:// and wss:// -> https:// for fetch() debugging.
+ */
+function toHttpEndpoint(wsEndpoint) {
+  if (wsEndpoint.startsWith("wss://")) return wsEndpoint.replace("wss://", "https://");
+  if (wsEndpoint.startsWith("ws://")) return wsEndpoint.replace("ws://", "http://");
+  return wsEndpoint;
+}
+
+/**
+ * Debug: check basic routes + matchmake response shape.
+ */
+async function debugMatchmake(endpointWs) {
+  const http = toHttpEndpoint(endpointWs);
+
+  console.log("[Colyseus][debug] ws endpoint:", endpointWs);
+  console.log("[Colyseus][debug] http endpoint:", http);
+
+  // 1) Test /hi
+  try {
+    const r1 = await fetch(`${http}/hi`, { method: "GET" });
+    const t1 = await r1.text();
+    console.log("[Colyseus][debug] GET /hi status:", r1.status);
+    console.log("[Colyseus][debug] GET /hi body:", t1.slice(0, 200));
+  } catch (e) {
+    console.error("[Colyseus][debug] GET /hi failed:", e);
+  }
+
+  // 2) Test matchmake joinOrCreate
+  try {
+    const r2 = await fetch(`${http}/matchmake/joinOrCreate/my_room`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: "{}",
+    });
+
+    const t2 = await r2.text();
+    console.log("[Colyseus][debug] POST /matchmake/joinOrCreate/my_room status:", r2.status);
+    console.log("[Colyseus][debug] raw body:", t2.slice(0, 400));
+
+    try {
+      const j = JSON.parse(t2);
+      console.log("[Colyseus][debug] parsed JSON:", j);
+    } catch {
+      console.warn("[Colyseus][debug] response was not JSON");
+    }
+  } catch (e) {
+    console.error("[Colyseus][debug] matchmake POST failed:", e);
+  }
+}
 
 const colyseusClient = new Client(COLYSEUS_ENDPOINT);
 
-noa.colyseus = {
-    endpoint: COLYSEUS_ENDPOINT,
-    client: colyseusClient,
-    room: null,
+// Store references on noa for convenience.
+/** @type {any} */ (noa).colyseus = {
+  endpoint: COLYSEUS_ENDPOINT,
+  client: colyseusClient,
+  room: null,
 };
 
 async function connectColyseus() {
-    console.log("[Colyseus] attempting connection...");
-    console.log("[Colyseus] page protocol:", window.location.protocol);
-    console.log("[Colyseus] endpoint:", COLYSEUS_ENDPOINT);
-    console.log("[Colyseus] room name:", "my_room");
+  console.log("[Colyseus] attempting connection...");
+  console.log("[Colyseus] page protocol:", (typeof window !== "undefined" && window.location) ? window.location.protocol : "(unknown)");
+  console.log("[Colyseus] endpoint:", COLYSEUS_ENDPOINT);
+  console.log("[Colyseus] room name:", "my_room");
 
-    try {
-        const room = await colyseusClient.joinOrCreate("my_room");
+  await debugMatchmake(COLYSEUS_ENDPOINT);
 
-        noa.colyseus.room = room;
+  try {
+    const room = await colyseusClient.joinOrCreate("my_room");
+    /** @type {any} */ (noa).colyseus.room = room;
 
-        console.log("[Colyseus] connected OK");
-        console.log("[Colyseus] roomId:", room.roomId);
-        console.log("[Colyseus] sessionId:", room.sessionId);
+    console.log("[Colyseus] connected OK");
+    console.log("[Colyseus] roomId:", room.roomId || "(unknown)");
+    console.log("[Colyseus] sessionId:", room.sessionId);
 
-        room.onMessage("*", (type, message) => {
-            console.log("[Colyseus] message:", type, message);
-        });
+    room.onMessage("*", (type, message) => {
+      console.log("[Colyseus] message:", type, message);
+    });
 
-        room.onLeave((code) => {
-            console.warn("[Colyseus] left room. code:", code);
-            noa.colyseus.room = null;
-        });
-    } catch (err) {
-        console.error("[Colyseus] connection failed:", err);
-    }
+    room.onLeave((code) => {
+      console.warn("[Colyseus] left room. code:", code);
+      /** @type {any} */ (noa).colyseus.room = null;
+    });
+  } catch (err) {
+    console.error("[Colyseus] connection failed:", err);
+    console.error("[Colyseus] endpoint used:", COLYSEUS_ENDPOINT);
+    console.error("[Colyseus] isSecurePage:", (typeof window !== "undefined" && window.location) ? (window.location.protocol === "https:") : "(unknown)");
+  }
 }
 
-connectColyseus();
+connectColyseus().catch((e) => console.error("[Colyseus] connectColyseus() crash:", e));
 
-/* ===========================
- * World seed + noise
- * ===========================
+
+
+/* ============================================================
+ * Minecraft-style Avatar (boxes + live skin URL)
+ * - Uses classic 64x64 Minecraft skin UV layout
+ * ============================================================
  */
 
-const WORLD_SEED = 1337;
+function uvRect(px, py, pw, ph) {
+  const texW = 64;
+  const texH = 64;
 
-const heightNoise = new FastNoiseLite(WORLD_SEED);
-heightNoise.SetNoiseType(FastNoiseLite.NoiseType.OpenSimplex2);
-heightNoise.SetFrequency(0.005);
+  const u0 = px / texW;
+  const v0 = py / texH;
+  const u1 = (px + pw) / texW;
+  const v1 = (py + ph) / texH;
 
-const tempNoise = new FastNoiseLite(WORLD_SEED + 1);
-tempNoise.SetNoiseType(FastNoiseLite.NoiseType.OpenSimplex2);
-tempNoise.SetFrequency(0.001);
-
-const moistureNoise = new FastNoiseLite(WORLD_SEED + 2);
-moistureNoise.SetNoiseType(FastNoiseLite.NoiseType.OpenSimplex2);
-moistureNoise.SetFrequency(0.001);
-
-const caveNoise = new FastNoiseLite(WORLD_SEED + 3);
-caveNoise.SetNoiseType(FastNoiseLite.NoiseType.OpenSimplex2);
-caveNoise.SetFrequency(0.03);
-
-/* ===========================
- * Materials & blocks
- * ===========================
- */
-
-noa.registry.registerMaterial("dirt", { color: [0.45, 0.36, 0.22] });
-noa.registry.registerMaterial("grass", { color: [0.1, 0.8, 0.2] });
-noa.registry.registerMaterial("sand", { color: [0.9, 0.85, 0.55] });
-noa.registry.registerMaterial("snow", { color: [0.95, 0.95, 0.95] });
-
-var dirtID = noa.registry.registerBlock(1, { material: "dirt" });
-var grassID = noa.registry.registerBlock(2, { material: "grass" });
-var sandID = noa.registry.registerBlock(3, { material: "sand" });
-var snowID = noa.registry.registerBlock(4, { material: "snow" });
-
-/* ===========================
- * Biomes
- * ===========================
- */
-
-function getBiome(x, z) {
-    const t = tempNoise.GetNoise(x, z);
-    const m = moistureNoise.GetNoise(x, z);
-
-    if (t > 0.4 && m < 0.0) return "desert";
-    if (t < -0.3) return "snow";
-    if (t > 0.2 && m > 0.2) return "mountains";
-    return "plains";
+  return new Vector4(u0, v0, u1, v1);
 }
 
-/* ===========================
- * Terrain voxel logic
- * ===========================
+// Babylon box face order: [0]=front, [1]=back, [2]=right, [3]=left, [4]=top, [5]=bottom
+function makeFaceUV(front, back, right, left, top, bottom) {
+  return [front, back, right, left, top, bottom];
+}
+
+function createPlayerAvatar(scene, skinUrl) {
+  const root = new TransformNode("mc-avatar-root", scene);
+
+  const skinTexture = new Texture(skinUrl, scene, false, false, Texture.NEAREST_NEAREST);
+  skinTexture.hasAlpha = true;
+  skinTexture.wrapU = Texture.CLAMP_ADDRESSMODE;
+  skinTexture.wrapV = Texture.CLAMP_ADDRESSMODE;
+
+  const mat = new StandardMaterial("mc-skin-mat", scene);
+  mat.diffuseTexture = skinTexture;
+  mat.emissiveColor = new Color3(0.05, 0.05, 0.05);
+  mat.specularColor = new Color3(0, 0, 0);
+
+  // HEAD (8x8x8)
+  const headUV = makeFaceUV(
+    uvRect(8, 8, 8, 8),
+    uvRect(24, 8, 8, 8),
+    uvRect(16, 8, 8, 8),
+    uvRect(0, 8, 8, 8),
+    uvRect(8, 0, 8, 8),
+    uvRect(16, 0, 8, 8)
+  );
+
+  // BODY (8x12x4)
+  const bodyUV = makeFaceUV(
+    uvRect(20, 20, 8, 12),
+    uvRect(32, 20, 8, 12),
+    uvRect(28, 20, 4, 12),
+    uvRect(16, 20, 4, 12),
+    uvRect(20, 16, 8, 4),
+    uvRect(28, 16, 8, 4)
+  );
+
+  // RIGHT ARM (4x12x4)
+  const rightArmUV = makeFaceUV(
+    uvRect(44, 20, 4, 12),
+    uvRect(52, 20, 4, 12),
+    uvRect(48, 20, 4, 12),
+    uvRect(40, 20, 4, 12),
+    uvRect(44, 16, 4, 4),
+    uvRect(48, 16, 4, 4)
+  );
+
+  // LEFT ARM (classic reuse)
+  const leftArmUV = rightArmUV;
+
+  // RIGHT LEG (4x12x4)
+  const rightLegUV = makeFaceUV(
+    uvRect(4, 20, 4, 12),
+    uvRect(12, 20, 4, 12),
+    uvRect(8, 20, 4, 12),
+    uvRect(0, 20, 4, 12),
+    uvRect(4, 16, 4, 4),
+    uvRect(8, 16, 4, 4)
+  );
+
+  // LEFT LEG (classic reuse)
+  const leftLegUV = rightLegUV;
+
+  // Sizes
+  const headSize = { width: 1.0, height: 1.0, depth: 1.0 };
+  const bodySize = { width: 1.0, height: 1.5, depth: 0.5 };
+  const limbSize = { width: 0.5, height: 1.5, depth: 0.5 };
+
+  const head = MeshBuilder.CreateBox("mc-head", {
+    width: headSize.width,
+    height: headSize.height,
+    depth: headSize.depth,
+    faceUV: headUV,
+  }, scene);
+  head.material = mat;
+  head.parent = root;
+
+  const body = MeshBuilder.CreateBox("mc-body", {
+    width: bodySize.width,
+    height: bodySize.height,
+    depth: bodySize.depth,
+    faceUV: bodyUV,
+  }, scene);
+  body.material = mat;
+  body.parent = root;
+
+  const rightArm = MeshBuilder.CreateBox("mc-rightArm", {
+    width: limbSize.width,
+    height: limbSize.height,
+    depth: limbSize.depth,
+    faceUV: rightArmUV,
+  }, scene);
+  rightArm.material = mat;
+  rightArm.parent = root;
+
+  const leftArm = MeshBuilder.CreateBox("mc-leftArm", {
+    width: limbSize.width,
+    height: limbSize.height,
+    depth: limbSize.depth,
+    faceUV: leftArmUV,
+  }, scene);
+  leftArm.material = mat;
+  leftArm.parent = root;
+
+  const rightLeg = MeshBuilder.CreateBox("mc-rightLeg", {
+    width: limbSize.width,
+    height: limbSize.height,
+    depth: limbSize.depth,
+    faceUV: rightLegUV,
+  }, scene);
+  rightLeg.material = mat;
+  rightLeg.parent = root;
+
+  const leftLeg = MeshBuilder.CreateBox("mc-leftLeg", {
+    width: limbSize.width,
+    height: limbSize.height,
+    depth: limbSize.depth,
+    faceUV: leftLegUV,
+  }, scene);
+  leftLeg.material = mat;
+  leftLeg.parent = root;
+
+  // Position parts (root at feet center)
+  const legY = limbSize.height / 2;
+  rightLeg.position.set(-0.25, legY, 0);
+  leftLeg.position.set(0.25, legY, 0);
+
+  const bodyY = limbSize.height + (bodySize.height / 2);
+  body.position.set(0, bodyY, 0);
+
+  const headY = limbSize.height + bodySize.height + (headSize.height / 2);
+  head.position.set(0, headY, 0);
+
+  const armY = limbSize.height + bodySize.height - (limbSize.height / 2);
+  rightArm.position.set(-(bodySize.width / 2 + limbSize.width / 2), armY, 0);
+  leftArm.position.set((bodySize.width / 2 + limbSize.width / 2), armY, 0);
+
+  return {
+    root,
+    material: mat,
+    parts: { head, body, leftArm, rightArm, leftLeg, rightLeg },
+  };
+}
+
+
+
+/* ============================================================
+ * Register voxel types (materials + blocks)
+ * ============================================================
+ */
+
+const brownish = [0.45, 0.36, 0.22];
+const greenish = [0.1, 0.8, 0.2];
+
+noa.registry.registerMaterial("dirt", { color: brownish });
+noa.registry.registerMaterial("grass", { color: greenish });
+
+const dirtID = noa.registry.registerBlock(1, { material: "dirt" });
+const grassID = noa.registry.registerBlock(2, { material: "grass" });
+
+
+
+/* ============================================================
+ * World generation
+ * ============================================================
  */
 
 function getVoxelID(x, y, z) {
-    const biome = getBiome(x, z);
-    const base = heightNoise.GetNoise(x, z);
-
-    let height = 0;
-
-    if (biome === "desert") height = base * 4 + 5;
-    if (biome === "plains") height = base * 8 + 8;
-    if (biome === "mountains") height = base * 20 + 12;
-    if (biome === "snow") height = base * 10 + 10;
-
-    height = Math.floor(height);
-
-    if (y < height - 2 && caveNoise.GetNoise(x, y, z) > 0.5) {
-        return 0;
-    }
-
-    if (y === height) {
-        if (biome === "desert") return sandID;
-        if (biome === "snow") return snowID;
-        return grassID;
-    }
-
-    if (y < height) {
-        return dirtID;
-    }
-
-    return 0;
+  if (y < -3) return dirtID;
+  const height = 2 * Math.sin(x / 10) + 3 * Math.cos(z / 20);
+  if (y < height) return grassID;
+  return 0;
 }
 
-/* ===========================
- * Chunk generation
- * ===========================
- */
-
 noa.world.on("worldDataNeeded", function (id, data, x, y, z) {
-    for (var i = 0; i < data.shape[0]; i++) {
-        for (var j = 0; j < data.shape[1]; j++) {
-            for (var k = 0; k < data.shape[2]; k++) {
-                data.set(i, j, k, getVoxelID(x + i, y + j, z + k));
-            }
-        }
+  for (let i = 0; i < data.shape[0]; i++) {
+    for (let j = 0; j < data.shape[1]; j++) {
+      for (let k = 0; k < data.shape[2]; k++) {
+        const voxelID = getVoxelID(x + i, y + j, z + k);
+        data.set(i, j, k, voxelID);
+      }
     }
-
-    noa.world.setChunkData(id, data);
+  }
+  noa.world.setChunkData(id, data);
 });
 
-/* ===========================
- * Player mesh
- * ===========================
+
+
+/* ============================================================
+ * Player avatar mesh: attach Minecraft-style avatar to player entity
+ * ============================================================
  */
 
-var player = noa.playerEntity;
-var pd = noa.entities.getPositionData(player);
-var w = pd.width;
-var h = pd.height;
+const scene = noa.rendering.getScene();
 
-var scene = noa.rendering.getScene();
-var mesh = CreateBox("player-mesh", {}, scene);
+// Any Minecraft username works here; skins are loaded from Crafatar.
+// Later you can use a username from your login or from Colyseus auth.
+const username = "Steve";
+const skinUrl = `https://crafatar.com/skins/${encodeURIComponent(username)}`;
 
-mesh.scaling.x = w;
-mesh.scaling.z = w;
-mesh.scaling.y = h;
-mesh.material = noa.rendering.makeStandardMaterial();
+const avatar = createPlayerAvatar(scene, skinUrl);
 
-noa.entities.addComponent(player, noa.entities.names.mesh, {
-    mesh: mesh,
-    offset: [0, h / 2, 0],
+const playerEntity = noa.playerEntity;
+
+// noa types are incomplete under checkJs; cast once to satisfy VS Code.
+const entities = /** @type {any} */ (noa.entities);
+
+entities.addComponent(playerEntity, noa.entities.names.mesh, {
+  mesh: avatar.root,
+  offset: [0, 0, 0],
 });
 
-/* ===========================
- * Interaction
- * ===========================
+// Make sure we can see our own avatar (third-person-ish).
+noa.camera.zoomDistance = 6;
+
+// Hide avatar in pointer lock (first-person), show otherwise.
+function getNoaCanvas() {
+  if (noa && noa.container && noa.container.canvas) return noa.container.canvas;
+  const c = document.querySelector("canvas");
+  return c || null;
+}
+
+document.addEventListener("pointerlockchange", () => {
+  const canvas = getNoaCanvas();
+  const locked = canvas && document.pointerLockElement === canvas;
+  avatar.root.setEnabled(!locked);
+  crosshairUI.refresh();
+});
+
+
+
+/* ============================================================
+ * Minimal interactivity
+ * ============================================================
  */
 
+// Clear targeted block on left click
 noa.inputs.down.on("fire", function () {
-    if (noa.targetedBlock) {
-        const p = noa.targetedBlock.position;
-        noa.setBlock(0, p[0], p[1], p[2]);
-    }
+  if (noa.targetedBlock) {
+    const pos = noa.targetedBlock.position;
+    noa.setBlock(0, pos[0], pos[1], pos[2]);
+  }
 });
 
+// Place grass on right click
 noa.inputs.down.on("alt-fire", function () {
-    if (noa.targetedBlock) {
-        const p = noa.targetedBlock.adjacent;
-        noa.setBlock(grassID, p[0], p[1], p[2]);
-    }
+  if (noa.targetedBlock) {
+    const pos = noa.targetedBlock.adjacent;
+    noa.setBlock(grassID, pos[0], pos[1], pos[2]);
+  }
 });
 
+// Bind "E" to alt-fire
 noa.inputs.bind("alt-fire", "KeyE");
 
+// Each tick: scroll zoom
 noa.on("tick", function () {
-    const scroll = noa.inputs.pointerState.scrolly;
-    if (scroll !== 0) {
-        noa.camera.zoomDistance += scroll > 0 ? 1 : -1;
-        if (noa.camera.zoomDistance < 0) noa.camera.zoomDistance = 0;
-        if (noa.camera.zoomDistance > 10) noa.camera.zoomDistance = 10;
-    }
+  const scroll = noa.inputs.pointerState.scrolly;
+  if (scroll !== 0) {
+    noa.camera.zoomDistance += (scroll > 0) ? 1 : -1;
+    if (noa.camera.zoomDistance < 0) noa.camera.zoomDistance = 0;
+    if (noa.camera.zoomDistance > 10) noa.camera.zoomDistance = 10;
+  }
 });
