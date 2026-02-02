@@ -2,7 +2,7 @@
  *
  *          Fresh2 - noa hello-world (main game entry)
  *
- *  Based on noa's "hello-world" example, extended with:
+ *  Extended with:
  *   - Minecraft-style crosshair overlay
  *   - Colyseus multiplayer client connection (@colyseus/sdk)
  *   - Minecraft-style blocky avatar built from boxes with live skins (MCHeads - CORS friendly)
@@ -13,9 +13,10 @@
  *   - Skins loaded from https://mc-heads.net/skin/<identifier>.png (username OR UUID).
  *   - Crosshair shows when pointer lock is active.
  *   - Click-to-lock pointer so crosshair actually appears.
- *   - First-person (pointer locked): local avatar hidden + shadow casting removed from shadow render lists.
+ *   - First-person (pointer locked): local avatar hidden + removed from shadow render lists.
  *   - Third-person (pointer unlocked): local avatar shown + re-added to shadow render lists.
- *   - noa typings are incomplete; use `noaAny` for optional/untyped access.
+ *   - Robust Colyseus state hookup: waits for room.state.players to exist before using onAdd/onRemove.
+ *   - Prevents double local-avatar attach (no “Entity already has component: mesh”).
  *
  */
 
@@ -61,10 +62,12 @@ function getNoaCanvas() {
   return c || null;
 }
 
+function safeNum(v, fallback = 0) {
+  return typeof v === "number" && Number.isFinite(v) ? v : fallback;
+}
+
 /* ============================================================
  * UI: Minecraft-style Crosshair
- * - Always exists as a DOM overlay.
- * - Shows automatically when pointer lock is active on the canvas.
  * ============================================================
  */
 
@@ -128,7 +131,6 @@ function createCrosshairOverlay(noaEngine) {
 
   document.addEventListener("pointerlockchange", updateVisibility);
 
-  // Poll briefly until the canvas exists, then stop.
   const interval = setInterval(() => {
     updateVisibility();
     const canvas = getNoaCanvasLocal();
@@ -137,12 +139,8 @@ function createCrosshairOverlay(noaEngine) {
 
   return {
     element: crosshair,
-    show: () => {
-      crosshair.style.display = "flex";
-    },
-    hide: () => {
-      crosshair.style.display = "none";
-    },
+    show: () => (crosshair.style.display = "flex"),
+    hide: () => (crosshair.style.display = "none"),
     refresh: updateVisibility,
   };
 }
@@ -177,10 +175,7 @@ const crosshairUI = createCrosshairOverlay(noa);
 })();
 
 /* ============================================================
- * Colyseus Multiplayer Hook
- * - Uses @colyseus/sdk
- * - Endpoint from VITE_COLYSEUS_ENDPOINT, fallback localhost
- * - Includes debugMatchmake preflight (HTTP endpoints)
+ * Colyseus setup + debug
  * ============================================================
  */
 
@@ -191,26 +186,18 @@ let COLYSEUS_ENDPOINT =
     ? import.meta.env.VITE_COLYSEUS_ENDPOINT
     : DEFAULT_LOCAL_ENDPOINT;
 
-if (
-  typeof window !== "undefined" &&
-  window.location &&
-  window.location.protocol === "https:"
-) {
-  if (COLYSEUS_ENDPOINT.startsWith("ws://")) {
-    COLYSEUS_ENDPOINT = COLYSEUS_ENDPOINT.replace("ws://", "wss://");
-  }
-}
-
+// NOTE: If you pass https://host as endpoint, Colyseus Client can handle it.
+// But we still keep your debugMatchmake ws->http conversion helper.
 function toHttpEndpoint(wsEndpoint) {
   if (wsEndpoint.startsWith("wss://")) return wsEndpoint.replace("wss://", "https://");
   if (wsEndpoint.startsWith("ws://")) return wsEndpoint.replace("ws://", "http://");
   return wsEndpoint;
 }
 
-async function debugMatchmake(endpointWs) {
-  const http = toHttpEndpoint(endpointWs);
+async function debugMatchmake(endpointWsOrHttp) {
+  const http = toHttpEndpoint(endpointWsOrHttp);
 
-  console.log("[Colyseus][debug] ws endpoint:", endpointWs);
+  console.log("[Colyseus][debug] ws endpoint:", endpointWsOrHttp);
   console.log("[Colyseus][debug] http endpoint:", http);
 
   try {
@@ -253,7 +240,7 @@ noaAny.colyseus = {
 };
 
 /* ============================================================
- * MCHeads skin helper (client-only, CORS-friendly)
+ * MCHeads skin helper
  * ============================================================
  */
 
@@ -262,20 +249,14 @@ function getMcHeadsSkinUrl(identifier) {
 }
 
 /* ============================================================
- * Minecraft-style Avatar (boxes + live skin URL)
+ * Avatar (Minecraft skin UVs)
  * ============================================================
  */
 
 function uvRect(px, py, pw, ph) {
   const texW = 64;
   const texH = 64;
-
-  const u0 = px / texW;
-  const v0 = py / texH;
-  const u1 = (px + pw) / texW;
-  const v1 = (py + ph) / texH;
-
-  return new Vector4(u0, v0, u1, v1);
+  return new Vector4(px / texW, py / texH, (px + pw) / texW, (py + ph) / texH);
 }
 
 // Babylon box face order: [0]=front, [1]=back, [2]=right, [3]=left, [4]=top, [5]=bottom
@@ -283,8 +264,7 @@ function makeFaceUV(front, back, right, left, top, bottom) {
   return [front, back, right, left, top, bottom];
 }
 
-function createPlayerAvatar(scene, skinUrl, nameTagText) {
-  // Root must be a Mesh (AbstractMesh) so Babylon internal render logic is happy.
+function createPlayerAvatar(scene, skinUrl) {
   const root = new Mesh("mc-avatar-root", scene);
   root.isVisible = false;
 
@@ -298,13 +278,8 @@ function createPlayerAvatar(scene, skinUrl, nameTagText) {
   mat.emissiveColor = new Color3(0.05, 0.05, 0.05);
   mat.specularColor = new Color3(0, 0, 0);
 
-  // Optional micro-optim: freeze after texture loads
   skinTexture.onLoadObservable.add(() => {
-    try {
-      mat.freeze();
-    } catch {
-      // ok
-    }
+    try { mat.freeze(); } catch { /* ok */ }
   });
 
   // HEAD (8x8x8)
@@ -353,32 +328,43 @@ function createPlayerAvatar(scene, skinUrl, nameTagText) {
   // LEFT LEG (classic reuse)
   const leftLegUV = rightLegUV;
 
-  // Sizes
   const headSize = { width: 1.0, height: 1.0, depth: 1.0 };
   const bodySize = { width: 1.0, height: 1.5, depth: 0.5 };
   const limbSize = { width: 0.5, height: 1.5, depth: 0.5 };
 
-  const head = MeshBuilder.CreateBox("mc-head", { width: headSize.width, height: headSize.height, depth: headSize.depth, faceUV: headUV }, scene);
+  const head = MeshBuilder.CreateBox("mc-head", {
+    width: headSize.width, height: headSize.height, depth: headSize.depth, faceUV: headUV,
+  }, scene);
   head.material = mat;
   head.parent = root;
 
-  const body = MeshBuilder.CreateBox("mc-body", { width: bodySize.width, height: bodySize.height, depth: bodySize.depth, faceUV: bodyUV }, scene);
+  const body = MeshBuilder.CreateBox("mc-body", {
+    width: bodySize.width, height: bodySize.height, depth: bodySize.depth, faceUV: bodyUV,
+  }, scene);
   body.material = mat;
   body.parent = root;
 
-  const rightArm = MeshBuilder.CreateBox("mc-rightArm", { width: limbSize.width, height: limbSize.height, depth: limbSize.depth, faceUV: rightArmUV }, scene);
+  const rightArm = MeshBuilder.CreateBox("mc-rightArm", {
+    width: limbSize.width, height: limbSize.height, depth: limbSize.depth, faceUV: rightArmUV,
+  }, scene);
   rightArm.material = mat;
   rightArm.parent = root;
 
-  const leftArm = MeshBuilder.CreateBox("mc-leftArm", { width: limbSize.width, height: limbSize.height, depth: limbSize.depth, faceUV: leftArmUV }, scene);
+  const leftArm = MeshBuilder.CreateBox("mc-leftArm", {
+    width: limbSize.width, height: limbSize.height, depth: limbSize.depth, faceUV: leftArmUV,
+  }, scene);
   leftArm.material = mat;
   leftArm.parent = root;
 
-  const rightLeg = MeshBuilder.CreateBox("mc-rightLeg", { width: limbSize.width, height: limbSize.height, depth: limbSize.depth, faceUV: rightLegUV }, scene);
+  const rightLeg = MeshBuilder.CreateBox("mc-rightLeg", {
+    width: limbSize.width, height: limbSize.height, depth: limbSize.depth, faceUV: rightLegUV,
+  }, scene);
   rightLeg.material = mat;
   rightLeg.parent = root;
 
-  const leftLeg = MeshBuilder.CreateBox("mc-leftLeg", { width: limbSize.width, height: limbSize.height, depth: limbSize.depth, faceUV: leftLegUV }, scene);
+  const leftLeg = MeshBuilder.CreateBox("mc-leftLeg", {
+    width: limbSize.width, height: limbSize.height, depth: limbSize.depth, faceUV: leftLegUV,
+  }, scene);
   leftLeg.material = mat;
   leftLeg.parent = root;
 
@@ -397,9 +383,6 @@ function createPlayerAvatar(scene, skinUrl, nameTagText) {
   rightArm.position.set(-(bodySize.width / 2 + limbSize.width / 2), armY, 0);
   leftArm.position.set(bodySize.width / 2 + limbSize.width / 2, armY, 0);
 
-  // (Optional) nameTagText included so signature matches future expansion without breaking
-  // It's not rendered here to avoid adding extra Babylon GUI dependencies.
-
   return {
     root,
     material: mat,
@@ -408,9 +391,7 @@ function createPlayerAvatar(scene, skinUrl, nameTagText) {
 }
 
 /* ============================================================
- * Shadows: enable/disable shadow casting safely
- * - Babylon does shadow casting via ShadowGenerator renderLists.
- * - We search scene lights for shadow generators and update their renderList.
+ * Shadows: enable/disable casting via ShadowGenerator renderList
  * ============================================================
  */
 
@@ -489,72 +470,38 @@ noa.world.on("worldDataNeeded", function (id, data, x, y, z) {
 });
 
 /* ============================================================
- * Multiplayer: remote player avatars (client-side)
- * - Listens to room.state.players changes
- * - Spawns/updates/removes Babylon avatars for other sessionIds
- * - Sends local position/yaw/pitch updates to server periodically
+ * Local avatar: init once
  * ============================================================
  */
 
-function safeNum(v, fallback = 0) {
-  return typeof v === "number" && Number.isFinite(v) ? v : fallback;
-}
+let localAvatarAttached = false;
+let localAvatarRef = null;
 
-function getLocalPlayerPositionFallback() {
-  // noa has different APIs across versions. We'll attempt common patterns safely.
+function initLocalAvatarOnce(scene, playerIdentifier) {
+  if (localAvatarAttached) return localAvatarRef;
+
+  const entities = /** @type {any} */ (noa.entities);
+  const playerEntity = noa.playerEntity;
+
+  // If mesh component already exists, don't re-add
   try {
-    const ent = noa.playerEntity;
-    const ents = /** @type {any} */ (noa.entities);
-    if (ents && typeof ents.getPosition === "function") {
-      const p = ents.getPosition(ent);
-      if (p && p.length >= 3) return [p[0], p[1], p[2]];
+    if (entities && typeof entities.hasComponent === "function") {
+      if (entities.hasComponent(playerEntity, noa.entities.names.mesh)) {
+        localAvatarAttached = true;
+        return localAvatarRef;
+      }
     }
   } catch {
     // ignore
   }
 
-  // Fallback: try to read from player entity data if accessible
-  try {
-    const p = noaAny.playerEntity && noaAny.entities && noaAny.entities.getPosition
-      ? noaAny.entities.getPosition(noaAny.playerEntity)
-      : null;
-    if (p && p.length >= 3) return [p[0], p[1], p[2]];
-  } catch {
-    // ignore
-  }
-
-  // Last resort: origin
-  return [0, 10, 0];
-}
-
-function getCameraYawPitchFallback() {
-  // Try a few common camera fields (noa versions vary)
-  const cam = noa.camera || noaAny.camera;
-  if (!cam) return { yaw: 0, pitch: 0 };
-
-  const yaw = safeNum(cam.heading, safeNum(cam.yaw, safeNum(cam.rotation?.y, 0)));
-  const pitch = safeNum(cam.pitch, safeNum(cam.rotation?.x, 0));
-
-  return { yaw, pitch };
-}
-
-/* ============================================================
- * Local player avatar + first/third person behavior
- * ============================================================
- */
-
-function initLocalAvatar(scene, playerIdentifier) {
   const skinUrl = getMcHeadsSkinUrl(playerIdentifier);
   console.log("[Skin] Using MCHeads skin URL:", skinUrl);
 
-  const avatar = createPlayerAvatar(scene, skinUrl, playerIdentifier);
-
-  const playerEntity = noa.playerEntity;
-  const entities = /** @type {any} */ (noa.entities);
+  const avatar = createPlayerAvatar(scene, skinUrl);
 
   const probedPlayerHeight = typeof noaAny.playerHeight === "number" ? noaAny.playerHeight : null;
   const playerHeight = probedPlayerHeight || 1.8;
-
   const meshOffsetY = playerHeight * 0.5;
 
   entities.addComponent(playerEntity, noa.entities.names.mesh, {
@@ -568,19 +515,19 @@ function initLocalAvatar(scene, playerIdentifier) {
   const avatarMeshes = avatar.root.getChildMeshes ? avatar.root.getChildMeshes() : [];
 
   function applyFirstPersonState(locked) {
+    // Show avatar only when NOT locked
     avatar.root.setEnabled(!locked);
 
+    // Remove/add to shadow render lists
     setMeshesInShadowRenderList(scene, avatarMeshes, !locked);
 
+    // Safe toggle receiveShadows
     for (const m of avatarMeshes) {
-      try {
-        m.receiveShadows = !locked;
-      } catch {
-        // ignore
-      }
+      try { m.receiveShadows = !locked; } catch { /* ignore */ }
     }
   }
 
+  // Initial apply
   const canvas = getNoaCanvas();
   const initiallyLocked = canvas && document.pointerLockElement === canvas;
   applyFirstPersonState(!!initiallyLocked);
@@ -592,33 +539,41 @@ function initLocalAvatar(scene, playerIdentifier) {
     crosshairUI.refresh();
   });
 
-  return { avatar };
+  localAvatarAttached = true;
+  localAvatarRef = { avatar };
+  return localAvatarRef;
 }
 
 /* ============================================================
- * Remote players manager
+ * Remote players manager: robust hookup
  * ============================================================
  */
 
 function createRemotePlayersManager(scene, room) {
-  const remotes = new Map(); // sessionId -> { avatar, last }
+  const remotes = new Map(); // sessionId -> { avatar, tx, ty, tz }
 
   function spawnRemote(sessionId, playerState) {
-    const name = (playerState && typeof playerState.name === "string" && playerState.name) ? playerState.name : "Steve";
-    const skinUrl = getMcHeadsSkinUrl(name);
+    const name =
+      playerState && typeof playerState.name === "string" && playerState.name
+        ? playerState.name
+        : "Steve";
 
-    const avatar = createPlayerAvatar(scene, skinUrl, name);
+    const skinUrl = getMcHeadsSkinUrl(name);
+    const avatar = createPlayerAvatar(scene, skinUrl);
+
     avatar.root.setEnabled(true);
 
-    // Start position
     const x = safeNum(playerState.x, 0);
     const y = safeNum(playerState.y, 10);
     const z = safeNum(playerState.z, 0);
+
     avatar.root.position.set(x, y, z);
 
     remotes.set(sessionId, {
       avatar,
-      last: { x, y, z, t: performance.now() },
+      tx: x,
+      ty: y,
+      tz: z,
     });
 
     console.log("[Remote] spawned", sessionId, "name:", name);
@@ -628,13 +583,13 @@ function createRemotePlayersManager(scene, room) {
     const r = remotes.get(sessionId);
     if (!r) return;
 
-    // Dispose meshes/material/texture
     try {
       const childMeshes = r.avatar.root.getChildMeshes ? r.avatar.root.getChildMeshes() : [];
       for (const m of childMeshes) {
         try { m.dispose(false, true); } catch { /* ignore */ }
       }
       try { r.avatar.root.dispose(false, true); } catch { /* ignore */ }
+
       try {
         const mat = r.avatar.material;
         if (mat) {
@@ -657,83 +612,118 @@ function createRemotePlayersManager(scene, room) {
     const r = remotes.get(sessionId);
     if (!r) return;
 
-    const tx = safeNum(playerState.x, r.last.x);
-    const ty = safeNum(playerState.y, r.last.y);
-    const tz = safeNum(playerState.z, r.last.z);
+    r.tx = safeNum(playerState.x, r.tx);
+    r.ty = safeNum(playerState.y, r.ty);
+    r.tz = safeNum(playerState.z, r.tz);
 
-    // Simple smoothing (lerp) - runs every tick below
-    r.last.tx = tx;
-    r.last.ty = ty;
-    r.last.tz = tz;
-
-    // Optional: rotation
     const yaw = safeNum(playerState.yaw, 0);
-    // We rotate root around Y
+    try { r.avatar.root.rotation.y = yaw; } catch { /* ignore */ }
+  }
+
+  // Smooth movement each tick
+  noa.on("tick", () => {
+    // dt is not stable in noa public api; use a safe approx
+    const dt = 1 / 60;
+    const alpha = Math.min(1, Math.max(0, dt * 12));
+
+    remotes.forEach((r) => {
+      const root = r.avatar.root;
+      root.position.set(
+        root.position.x + (r.tx - root.position.x) * alpha,
+        root.position.y + (r.ty - root.position.y) * alpha,
+        root.position.z + (r.tz - root.position.z) * alpha
+      );
+    });
+  });
+
+  // Wait for room.state.players to exist
+  function hookPlayersMap(players) {
+    players.onAdd = (playerState, sessionId) => {
+      if (sessionId === room.sessionId) return;
+      spawnRemote(sessionId, playerState);
+
+      // Watch per-player changes
+      try {
+        playerState.onChange = () => updateRemote(sessionId, playerState);
+      } catch {
+        // ignore
+      }
+    };
+
+    players.onRemove = (_playerState, sessionId) => {
+      removeRemote(sessionId);
+    };
+
+    // Spawn existing
     try {
-      r.avatar.root.rotation.y = yaw;
+      players.forEach((playerState, sessionId) => {
+        if (sessionId === room.sessionId) return;
+        if (!remotes.has(sessionId)) spawnRemote(sessionId, playerState);
+      });
     } catch {
       // ignore
     }
   }
 
-  // Attach listeners to the players MapSchema
-  const players = room.state.players;
+  // Robust wait loop: state patches may arrive after join resolves
+  (function waitForPlayersMap() {
+    const maxWaitMs = 5000;
+    const start = performance.now();
 
-  players.onAdd = (playerState, sessionId) => {
-    // Don't spawn a remote for ourselves
-    if (sessionId === room.sessionId) return;
-    spawnRemote(sessionId, playerState);
+    const interval = setInterval(() => {
+      const players = room && room.state ? room.state.players : null;
 
-    // Listen for changes on that player (optional, but useful for instant updates)
-    playerState.onChange = () => {
-      updateRemote(sessionId, playerState);
-    };
-  };
+      if (players) {
+        clearInterval(interval);
+        hookPlayersMap(players);
+        console.log("[Remote] hooked room.state.players");
+        return;
+      }
 
-  players.onRemove = (_playerState, sessionId) => {
-    removeRemote(sessionId);
-  };
+      if (performance.now() - start > maxWaitMs) {
+        clearInterval(interval);
+        console.warn(
+          "[Remote] room.state.players was never found. " +
+            "Your server may still be running an old schema. " +
+            "Remote avatars disabled for this session."
+        );
+      }
+    }, 50);
+  })();
 
-  // Also spawn any existing players if we joined late
-  players.forEach((playerState, sessionId) => {
-    if (sessionId === room.sessionId) return;
-    if (!remotes.has(sessionId)) spawnRemote(sessionId, playerState);
-  });
-
-  // Each noa tick, smooth remote movement
-  noa.on("tick", () => {
-    const dt = noaAny?.rendering?._lastDT || 0.016;
-
-    remotes.forEach((r) => {
-      const root = r.avatar.root;
-      const tx = typeof r.last.tx === "number" ? r.last.tx : r.last.x;
-      const ty = typeof r.last.ty === "number" ? r.last.ty : r.last.y;
-      const tz = typeof r.last.tz === "number" ? r.last.tz : r.last.z;
-
-      // Lerp factor: higher -> snappier
-      const alpha = Math.min(1, Math.max(0, dt * 12));
-
-      const nx = root.position.x + (tx - root.position.x) * alpha;
-      const ny = root.position.y + (ty - root.position.y) * alpha;
-      const nz = root.position.z + (tz - root.position.z) * alpha;
-
-      root.position.set(nx, ny, nz);
-
-      // Keep last
-      r.last.x = nx;
-      r.last.y = ny;
-      r.last.z = nz;
-    });
-  });
-
-  return {
-    remotes,
-    removeRemote,
-  };
+  return { remotes };
 }
 
 /* ============================================================
- * Connect to Colyseus + init local/remote multiplayer hooks
+ * Local transform sender (client -> server)
+ * ============================================================
+ */
+
+function getLocalPlayerPositionFallback() {
+  try {
+    const ent = noa.playerEntity;
+    const ents = /** @type {any} */ (noa.entities);
+    if (ents && typeof ents.getPosition === "function") {
+      const p = ents.getPosition(ent);
+      if (p && p.length >= 3) return [p[0], p[1], p[2]];
+    }
+  } catch {
+    // ignore
+  }
+  return [0, 10, 0];
+}
+
+function getCameraYawPitchFallback() {
+  const cam = noa.camera || noaAny.camera;
+  if (!cam) return { yaw: 0, pitch: 0 };
+
+  const yaw = safeNum(cam.heading, safeNum(cam.yaw, safeNum(cam.rotation?.y, 0)));
+  const pitch = safeNum(cam.pitch, safeNum(cam.rotation?.x, 0));
+  return { yaw, pitch };
+}
+
+/* ============================================================
+ * Connect Colyseus + init everything
  * ============================================================
  */
 
@@ -746,7 +736,6 @@ async function connectColyseus() {
   await debugMatchmake(COLYSEUS_ENDPOINT);
 
   try {
-    // Send a name to server so it can set PlayerState.name (for skin)
     const joinOptions = { name: "Steve" };
 
     const room = await colyseusClient.joinOrCreate("my_room", joinOptions);
@@ -765,25 +754,23 @@ async function connectColyseus() {
       noaAny.colyseus.room = null;
     });
 
-    // Init local avatar
+    // Always init local avatar ONCE
     const scene = noa.rendering.getScene();
-    initLocalAvatar(scene, "Steve");
+    initLocalAvatarOnce(scene, "Steve");
 
-    // Init remote players manager based on schema state
+    // Hook remote players (waits for state.players to exist)
     createRemotePlayersManager(scene, room);
 
-    // Periodically send local transform updates
+    // Send local transform periodically
     const sendRateMs = 50; // 20Hz
     setInterval(() => {
-      if (!noaAny.colyseus.room) return;
+      const activeRoom = noaAny.colyseus.room;
+      if (!activeRoom) return;
 
       const [x, y, z] = getLocalPlayerPositionFallback();
       const { yaw, pitch } = getCameraYawPitchFallback();
 
-      noaAny.colyseus.room.send("move", {
-        x, y, z,
-        yaw, pitch,
-      });
+      activeRoom.send("move", { x, y, z, yaw, pitch });
     }, sendRateMs);
 
   } catch (err) {
@@ -791,12 +778,12 @@ async function connectColyseus() {
     console.error("[Colyseus] endpoint used:", COLYSEUS_ENDPOINT);
     console.error("[Colyseus] isSecurePage:", (typeof window !== "undefined" && window.location) ? (window.location.protocol === "https:") : "(unknown)");
 
-    // Still init local avatar even if multiplayer fails (keeps single-player working)
+    // Keep single-player: init local avatar once even if multiplayer fails
     try {
       const scene = noa.rendering.getScene();
-      initLocalAvatar(scene, "Steve");
+      initLocalAvatarOnce(scene, "Steve");
     } catch (e) {
-      console.error("[Avatar] failed to init after Colyseus failure:", e);
+      console.error("[Avatar] init failed after Colyseus failure:", e);
     }
   }
 }

@@ -1,67 +1,85 @@
 import { Room, Client, CloseCode } from "colyseus";
-import { MyRoomState } from "./schema/MyRoomState.js";
+import { MyRoomState, PlayerState } from "./schema/MyRoomState.js";
+
+type JoinOptions = { name?: string };
+
+type MoveMsg = {
+  x: number;
+  y: number;
+  z: number;
+  yaw?: number;
+  pitch?: number;
+};
 
 export class MyRoom extends Room {
-  public maxClients = 4;
-  public state = new MyRoomState();
+  public maxClients = 16;
 
-  /**
-   * Called when a new room is created.
-   */
+  // Optional: keep a typed view of state for TS convenience
+  public state!: MyRoomState;
+
   public onCreate(options: any) {
-    // Set the initial state (already done via property initializer)
-    // If you prefer explicit init, you can do:
-    // this.setState(new MyRoomState());
+    this.setState(new MyRoomState());
 
-    // Optional: log creation
     console.log("room", this.roomId, "created with options:", options);
 
-    /**
-     * Register message handlers here.
-     * Clients will call: room.send("yourMessageType", payload)
-     */
-    this.onMessage("yourMessageType", (client: Client, message: any) => {
-      /**
-       * Handle "yourMessageType" message.
-       */
-      console.log(client.sessionId, "sent a message:", message);
+    this.onMessage("move", (client: Client, msg: MoveMsg) => {
+      const p = this.state.players.get(client.sessionId);
+      if (!p) return;
+
+      if (
+        !Number.isFinite(msg.x) ||
+        !Number.isFinite(msg.y) ||
+        !Number.isFinite(msg.z)
+      ) {
+        return;
+      }
+
+      p.x = msg.x;
+      p.y = msg.y;
+      p.z = msg.z;
+
+      if (typeof msg.yaw === "number" && Number.isFinite(msg.yaw)) p.yaw = msg.yaw;
+      if (typeof msg.pitch === "number" && Number.isFinite(msg.pitch)) p.pitch = msg.pitch;
     });
 
-    /**
-     * Optional helper message type you can use for quick connectivity tests.
-     * Clients can call: room.send("hello", {...})
-     */
     this.onMessage("hello", (client: Client, message: any) => {
       console.log(client.sessionId, "said hello:", message);
-
-      // Example: reply to only that client
       client.send("hello_ack", { ok: true, serverTime: Date.now() });
     });
   }
 
-  /**
-   * Called when a client joins the room.
-   */
-  public onJoin(client: Client, options: any) {
+  public onJoin(client: Client, options: JoinOptions) {
     console.log(client.sessionId, "joined!", "options:", options);
 
-    // Optional: send a welcome message
+    const p = new PlayerState();
+    p.id = client.sessionId;
+
+    if (options && typeof options.name === "string" && options.name.trim()) {
+      p.name = options.name.trim();
+    } else {
+      p.name = "Steve";
+    }
+
+    // Spawn
+    p.x = 0;
+    p.y = 10;
+    p.z = 0;
+    p.yaw = 0;
+    p.pitch = 0;
+
+    this.state.players.set(client.sessionId, p);
+
     client.send("welcome", {
       roomId: this.roomId,
       sessionId: client.sessionId,
     });
   }
 
-  /**
-   * Called when a client leaves the room.
-   */
   public onLeave(client: Client, code: CloseCode) {
     console.log(client.sessionId, "left!", code);
+    this.state.players.delete(client.sessionId);
   }
 
-  /**
-   * Called when the room is disposed.
-   */
   public onDispose() {
     console.log("room", this.roomId, "disposing...");
   }
