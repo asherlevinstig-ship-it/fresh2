@@ -12,7 +12,7 @@
 import { Engine } from 'noa-engine'
 
 // Colyseus browser client SDK (multiplayer)
-import { Client } from '@colyseus/sdk'
+import { Client } from 'colyseus.js'
 
 // Babylon box builder (used to create the player's mesh)
 import { CreateBox } from '@babylonjs/core/Meshes/Builders/boxBuilder'
@@ -115,17 +115,13 @@ createCrosshair(noa)
 
 /*
  *
- *      Colyseus Multiplayer Hook
+ *      Colyseus Multiplayer Hook + Debugging
  *
  *  This connects the client (browser) to a Colyseus server.
  *
- *  IMPORTANT NOTE ABOUT ENDPOINTS:
- *  With @colyseus/sdk you should pass the HTTP(S) endpoint (not ws://).
- *  The SDK will negotiate ws/wss internally.
- *
- *  - In local dev, it falls back to http://localhost:2567
- *  - On Vercel, set VITE_COLYSEUS_ENDPOINT to:
- *      https://us-mia-ea26ba04.colyseus.cloud
+ *  For colyseus.js:
+ *  - Local dev endpoint: ws://localhost:2567
+ *  - Production endpoint: wss://<your-colyseus-cloud-domain>
  *
  *  IMPORTANT:
  *  The room name used here is "my_room". Your server must expose a room
@@ -133,17 +129,15 @@ createCrosshair(noa)
  *
 */
 
-// Default local endpoint (HTTP, not WS)
-const DEFAULT_LOCAL_ENDPOINT = 'http://localhost:2567'
+const DEFAULT_LOCAL_ENDPOINT = 'ws://localhost:2567'
 
 // Prefer env var if present, else fall back to local
-let COLYSEUS_ENDPOINT =
-    import.meta.env.VITE_COLYSEUS_ENDPOINT ?? DEFAULT_LOCAL_ENDPOINT
+let COLYSEUS_ENDPOINT = import.meta.env.VITE_COLYSEUS_ENDPOINT ?? DEFAULT_LOCAL_ENDPOINT
 
-// If the page is HTTPS but endpoint is http://, upgrade to https:// automatically
+// If page is https and endpoint is ws://, upgrade to wss:// automatically
 if (typeof window !== 'undefined') {
-    if (window.location && window.location.protocol === 'https:' && COLYSEUS_ENDPOINT.startsWith('http://')) {
-        COLYSEUS_ENDPOINT = COLYSEUS_ENDPOINT.replace('http://', 'https://')
+    if (window.location && window.location.protocol === 'https:' && COLYSEUS_ENDPOINT.startsWith('ws://')) {
+        COLYSEUS_ENDPOINT = COLYSEUS_ENDPOINT.replace('ws://', 'wss://')
     }
 }
 
@@ -157,11 +151,61 @@ noa.colyseus = {
     room: null,
 }
 
+// Convert ws:// -> http:// and wss:// -> https:// so we can probe HTTP endpoints
+function toHttpEndpoint(wsEndpoint) {
+    if (wsEndpoint.startsWith('wss://')) return wsEndpoint.replace('wss://', 'https://')
+    if (wsEndpoint.startsWith('ws://')) return wsEndpoint.replace('ws://', 'http://')
+    return wsEndpoint
+}
+
+// Debug helper to inspect what the server actually returns for matchmake calls
+async function debugMatchmake(endpoint) {
+    const http = toHttpEndpoint(endpoint)
+
+    console.log('[Colyseus][debug] ws endpoint:', endpoint)
+    console.log('[Colyseus][debug] http endpoint:', http)
+
+    // 1) Test your express route (should return text)
+    try {
+        const r1 = await fetch(`${http}/hi`, { method: 'GET' })
+        const t1 = await r1.text()
+        console.log('[Colyseus][debug] GET /hi status:', r1.status)
+        console.log('[Colyseus][debug] GET /hi body:', t1.slice(0, 200))
+    } catch (e) {
+        console.error('[Colyseus][debug] GET /hi failed:', e)
+    }
+
+    // 2) Test matchmaker joinOrCreate (should return JSON with { room: { name: ... } })
+    try {
+        const r2 = await fetch(`${http}/matchmake/joinOrCreate/my_room`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: '{}',
+        })
+
+        const t2 = await r2.text()
+        console.log('[Colyseus][debug] POST /matchmake/joinOrCreate/my_room status:', r2.status)
+        console.log('[Colyseus][debug] raw body:', t2.slice(0, 400))
+
+        try {
+            const j = JSON.parse(t2)
+            console.log('[Colyseus][debug] parsed JSON:', j)
+        } catch {
+            console.warn('[Colyseus][debug] response was not JSON')
+        }
+    } catch (e) {
+        console.error('[Colyseus][debug] matchmake POST failed:', e)
+    }
+}
+
 async function connectColyseus() {
     console.log('[Colyseus] attempting connection...')
     console.log('[Colyseus] page protocol:', (typeof window !== 'undefined' && window.location) ? window.location.protocol : '(unknown)')
     console.log('[Colyseus] endpoint:', COLYSEUS_ENDPOINT)
     console.log('[Colyseus] room name:', 'my_room')
+
+    // Probe server responses before joining, so we can diagnose "seat reservation" issues
+    await debugMatchmake(COLYSEUS_ENDPOINT)
 
     try {
         // Join an existing room or create one if none exist
