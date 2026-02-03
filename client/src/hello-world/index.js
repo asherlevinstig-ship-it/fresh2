@@ -1,20 +1,20 @@
 /*
  * Fresh2 - noa hello-world (main game entry)
- * Debug build with:
- *  - Crosshair overlay + F6 force-crosshair for debugging
- *  - First-person arms rig + debug HUD (top-left)
- *  - Pointer lock click + pointer lock diagnostics
- *    IMPORTANT: lock target = #noa-container (noa.container at runtime), NOT canvas
- *  - F5 view toggle (first/third/third-front)
- *  - F7 flips FP arms Z (debug if arms are behind camera)
- *  - Colyseus connect + remote players (schema players map)
- *  - MCHeads skins (CORS friendly)
  *
- * Fixes included:
- *  - Avatar root isVisible must be TRUE (or third-person never renders)
- *  - Pointer lock checks/requests use noa container element
- *  - Babylon Texture observable guard (some builds miss onErrorObservable)
- *  - Typescript checkJs fixes: cast noa.container to HTMLElement via any
+ * Includes:
+ *  - Crosshair overlay (pointer lock based) + F6 force-crosshair
+ *  - Pointer lock on #noa-container
+ *  - First-person arms (parented to Babylon scene.activeCamera)
+ *  - Third-person avatar (attached to player entity)
+ *  - F5 view toggle (first / third-back / third-front)
+ *  - F7 flip FP arms Z (debug)
+ *  - F8 toggle a big debug cube in front of camera (proves visibility)
+ *  - Colyseus connect + remote players hook (safe)
+ *  - MCHeads skin URL (CORS enabled)
+ *
+ * Key fixes:
+ *  - Do NOT parent to noa.rendering.camera (may not be Babylon Camera)
+ *  - Always match mesh.layerMask to activeCamera.layerMask
  */
 
 import { Engine } from "noa-engine";
@@ -44,18 +44,23 @@ const noa = new Engine(opts);
 const noaAny = /** @type {any} */ (noa);
 
 /* ============================================================
- * View mode + debug flags
+ * State
  * ============================================================
  */
 
 let viewMode = 0; // 0 first, 1 third-back, 2 third-front
-let forceCrosshair = false; // F6 toggles this
+let forceCrosshair = false;
 
-let sceneRef = null;
 let applyViewModeGlobal = null;
 
+let fpArmsRef = null;
+let localAvatar = null;
+
+let debugCube = null;
+let debugCubeOn = false;
+
 /* ============================================================
- * Helpers
+ * Small helpers
  * ============================================================
  */
 
@@ -67,15 +72,16 @@ function clamp(v, a, b) {
   return Math.max(a, Math.min(b, v));
 }
 
-/**
- * Return HTMLElement only to avoid TS mismatch between Element.requestPointerLock
- * and HTMLCanvasElement.requestPointerLock in different lib.dom versions.
- * @returns {HTMLElement|null}
+/* ============================================================
+ * Pointer lock target (noa container, NOT canvas)
+ * ============================================================
  */
+
+/** @returns {HTMLElement|null} */
 function getPointerLockTarget() {
   const c = /** @type {any} */ (noa).container;
 
-  // Runtime: noa.container is actually the DOM element (#noa-container)
+  // runtime: noa.container is actually #noa-container element
   if (c && typeof c === "object" && "addEventListener" in c && "requestPointerLock" in c) {
     return /** @type {HTMLElement} */ (/** @type {any} */ (c));
   }
@@ -93,7 +99,7 @@ function isPointerLockedToNoa() {
 }
 
 /* ============================================================
- * Debug HUD (top-left)
+ * Debug HUD
  * ============================================================
  */
 
@@ -114,55 +120,53 @@ function createDebugHUD() {
     borderRadius: "6px",
     pointerEvents: "none",
     whiteSpace: "pre",
-    maxWidth: "60vw",
+    maxWidth: "70vw",
   });
-  el.textContent = "debug hud init...";
   document.body.appendChild(el);
 
   const state = {
     viewMode: 0,
-    forceCrosshair: false,
+    locked: false,
     lockTarget: "(none)",
-    pointerLocked: false,
-    pointerLockEl: "(none)",
-    cameraType: "(none)",
-    cameraName: "(none)",
-    activeCameraName: "(none)",
-    armsExists: false,
-    armsEnabled: false,
-    armsParent: "(none)",
-    armsPos: "(n/a)",
-    armsLocalPos: "(n/a)",
-    crosshairVisible: false,
+    lockEl: "(none)",
+
+    camName: "(none)",
+    camClass: "(none)",
+    camMask: "(none)",
+
     avatarEnabled: false,
     avatarVisible: false,
-    lastApply: "(never)",
+    avatarMask: "(n/a)",
+    avatarChildCount: 0,
+
+    armsEnabled: false,
+    armsExists: false,
+    armsMask: "(n/a)",
+    armsParent: "(none)",
+
+    crosshair: false,
+    last: "(boot)",
     lastError: "(none)",
+
+    debugCube: false,
   };
 
   function render() {
     el.textContent =
-      `Fresh2 Debug HUD\n` +
+      `Fresh2 Debug\n` +
       `viewMode: ${state.viewMode} (${state.viewMode === 0 ? "first" : state.viewMode === 1 ? "third-back" : "third-front"})\n` +
-      `forceCrosshair (F6): ${state.forceCrosshair}\n` +
+      `locked: ${state.locked}\n` +
       `lockTarget: ${state.lockTarget}\n` +
-      `pointerLocked: ${state.pointerLocked}\n` +
-      `pointerLockElement: ${state.pointerLockEl}\n` +
-      `noa.rendering.camera: ${state.cameraType} (${state.cameraName})\n` +
-      `scene.activeCamera: ${state.activeCameraName}\n` +
-      `avatar: enabled=${state.avatarEnabled} visible=${state.avatarVisible}\n` +
-      `arms: exists=${state.armsExists} enabled=${state.armsEnabled}\n` +
-      `arms.parent: ${state.armsParent}\n` +
-      `arms.worldPos: ${state.armsPos}\n` +
-      `arms.localPos: ${state.armsLocalPos}\n` +
-      `crosshairVisible: ${state.crosshairVisible}\n` +
-      `last applyViewMode: ${state.lastApply}\n` +
-      `last error: ${state.lastError}\n` +
-      `\nKeys:\n` +
-      `  F5 = toggle view\n` +
-      `  F6 = force crosshair\n` +
-      `  F7 = flip FP arms Z (debug)\n` +
-      `  Click (in first-person) = pointer lock\n`;
+      `pointerLockEl: ${state.lockEl}\n` +
+      `camera: ${state.camName} (${state.camClass}) mask=${state.camMask}\n` +
+      `avatar: enabled=${state.avatarEnabled} visible=${state.avatarVisible} mask=${state.avatarMask} children=${state.avatarChildCount}\n` +
+      `arms: exists=${state.armsExists} enabled=${state.armsEnabled} mask=${state.armsMask}\n` +
+      `armsParent: ${state.armsParent}\n` +
+      `crosshair: ${state.crosshair} (F6 force=${forceCrosshair})\n` +
+      `debugCube (F8): ${state.debugCube}\n` +
+      `last: ${state.last}\n` +
+      `error: ${state.lastError}\n` +
+      `\nKeys: F5 view | F6 crosshair | F7 flip arms Z | F8 debug cube\n`;
   }
 
   return { el, state, render };
@@ -183,8 +187,8 @@ function createCrosshairOverlay() {
     position: "fixed",
     top: "50%",
     left: "50%",
-    width: "26px",
-    height: "26px",
+    width: "22px",
+    height: "22px",
     transform: "translate(-50%, -50%)",
     pointerEvents: "none",
     zIndex: "999999",
@@ -199,74 +203,47 @@ function createCrosshairOverlay() {
     boxShadow: "0px 0px 3px rgba(0,0,0,0.95)",
   };
 
-  const hLine = document.createElement("div");
-  Object.assign(hLine.style, lineStyle, {
-    width: "100%",
-    height: "3px",
-    top: "11px",
-    left: "0px",
-  });
+  const h = document.createElement("div");
+  Object.assign(h.style, lineStyle, { width: "100%", height: "3px", top: "9px", left: "0px" });
 
-  const vLine = document.createElement("div");
-  Object.assign(vLine.style, lineStyle, {
-    width: "3px",
-    height: "100%",
-    left: "11px",
-    top: "0px",
-  });
+  const v = document.createElement("div");
+  Object.assign(v.style, lineStyle, { width: "3px", height: "100%", left: "9px", top: "0px" });
 
-  const dot = document.createElement("div");
-  Object.assign(dot.style, {
-    position: "absolute",
-    width: "6px",
-    height: "6px",
-    left: "10px",
-    top: "10px",
-    background: "rgba(255,0,0,0.95)",
-    borderRadius: "3px",
-    boxShadow: "0px 0px 3px rgba(0,0,0,0.95)",
-  });
-
-  crosshair.appendChild(hLine);
-  crosshair.appendChild(vLine);
-  crosshair.appendChild(dot);
+  crosshair.appendChild(h);
+  crosshair.appendChild(v);
   document.body.appendChild(crosshair);
 
-  function updateVisibility() {
-    const target = getPointerLockTarget();
+  function refresh() {
     const locked = isPointerLockedToNoa();
-    const shouldShow = forceCrosshair || (locked && viewMode === 0);
+    const show = forceCrosshair || (locked && viewMode === 0);
+    crosshair.style.display = show ? "flex" : "none";
 
-    crosshair.style.display = shouldShow ? "flex" : "none";
+    debugHUD.state.crosshair = show;
 
-    debugHUD.state.lockTarget = target
-      ? `${target.tagName.toLowerCase()}#${target.id || "(no-id)"}`
+    const target = getPointerLockTarget();
+    debugHUD.state.lockTarget = target ? `${target.tagName.toLowerCase()}#${target.id || "(no-id)"}` : "(none)";
+    debugHUD.state.locked = locked;
+    debugHUD.state.lockEl = document.pointerLockElement
+      ? `${/** @type {any} */ (document.pointerLockElement).tagName?.toLowerCase?.() || "el"}#${/** @type {any} */ (document.pointerLockElement).id || "(no-id)"}`
       : "(none)";
-    debugHUD.state.pointerLocked = locked;
-    debugHUD.state.pointerLockEl = document.pointerLockElement
-      ? `${/** @type {any} */ (document.pointerLockElement).tagName?.toLowerCase?.() || "element"}#${/** @type {any} */ (document.pointerLockElement).id || "(no-id)"}`
-      : "(none)";
-    debugHUD.state.crosshairVisible = crosshair.style.display !== "none";
+    debugHUD.state.last = "crosshair.refresh";
     debugHUD.render();
   }
 
-  document.addEventListener("pointerlockchange", () => {
-    console.log("[PointerLock] change. element:", document.pointerLockElement);
-    updateVisibility();
-  });
+  document.addEventListener("pointerlockchange", refresh);
 
-  const interval = setInterval(() => {
-    updateVisibility();
-    if (getPointerLockTarget()) clearInterval(interval);
+  const i = setInterval(() => {
+    refresh();
+    if (getPointerLockTarget()) clearInterval(i);
   }, 250);
 
-  return { element: crosshair, refresh: updateVisibility };
+  return { refresh };
 }
 
 const crosshairUI = createCrosshairOverlay();
 
 /* ============================================================
- * Pointer lock helper (click lockTarget to lock mouse)
+ * Click-to-lock pointer
  * ============================================================
  */
 
@@ -282,20 +259,11 @@ const crosshairUI = createCrosshairOverlay();
 
     target.addEventListener("click", () => {
       try {
-        if (viewMode !== 0) {
-          console.log("[PointerLock] click ignored (not first-person)");
-          return;
-        }
-
-        if (document.pointerLockElement !== target) {
-          console.log("[PointerLock] requesting lock on:", target);
-          target.requestPointerLock();
-        } else {
-          console.log("[PointerLock] already locked");
-        }
+        if (viewMode !== 0) return;
+        if (document.pointerLockElement !== target) target.requestPointerLock();
       } catch (e) {
-        console.warn("[PointerLock] request failed:", e);
         debugHUD.state.lastError = String(e?.message || e);
+        debugHUD.state.last = "pointerlock.request failed";
         debugHUD.render();
       }
     });
@@ -305,41 +273,58 @@ const crosshairUI = createCrosshairOverlay();
 })();
 
 /* ============================================================
- * F5 view toggle + F6 force crosshair + F7 flip arms Z
+ * Babylon camera + layerMask forcing
  * ============================================================
  */
 
-let fpArmsRef = null;
+function getBabylonCamera(scene) {
+  // The real camera Babylon uses to render:
+  return scene && scene.activeCamera ? scene.activeCamera : null;
+}
+
+function forceLayerMaskToCamera(scene, rootNode) {
+  const cam = getBabylonCamera(scene);
+  if (!cam || !rootNode) return;
+
+  const mask = /** @type {any} */ (cam).layerMask ?? 0x0fffffff;
+
+  // Apply to root and all child meshes
+  try {
+    rootNode.layerMask = mask;
+  } catch {}
+
+  try {
+    const meshes = rootNode.getChildMeshes ? rootNode.getChildMeshes() : [];
+    for (const m of meshes) {
+      try { m.layerMask = mask; } catch {}
+      try { m.alwaysSelectAsActiveMesh = true; } catch {}
+      try { m.isPickable = false; } catch {}
+    }
+  } catch {}
+}
+
+/* ============================================================
+ * F5 / F6 / F7 / F8
+ * ============================================================
+ */
 
 document.addEventListener("keydown", (e) => {
   if (e.code === "F5") {
     e.preventDefault();
-
     viewMode = (viewMode + 1) % 3;
 
     if (viewMode !== 0) {
-      try {
-        document.exitPointerLock?.();
-      } catch {}
+      try { document.exitPointerLock?.(); } catch {}
     }
 
-    try {
-      if (typeof applyViewModeGlobal === "function") applyViewModeGlobal();
-    } catch {}
-
+    try { if (typeof applyViewModeGlobal === "function") applyViewModeGlobal(); } catch {}
     crosshairUI.refresh();
-
-    console.log(
-      "[View] mode:",
-      viewMode === 0 ? "first-person" : viewMode === 1 ? "third-person-back" : "third-person-front"
-    );
+    console.log("[View] mode:", viewMode === 0 ? "first" : viewMode === 1 ? "third-back" : "third-front");
   }
 
   if (e.code === "F6") {
     e.preventDefault();
     forceCrosshair = !forceCrosshair;
-    debugHUD.state.forceCrosshair = forceCrosshair;
-    console.log("[Debug] forceCrosshair:", forceCrosshair);
     crosshairUI.refresh();
   }
 
@@ -347,16 +332,25 @@ document.addEventListener("keydown", (e) => {
     e.preventDefault();
     if (fpArmsRef && fpArmsRef.root) {
       fpArmsRef.root.position.z *= -1;
-      console.log("[Debug] flipped FP arms Z. new local z:", fpArmsRef.root.position.z);
+      console.log("[Debug] flipped FP arms Z:", fpArmsRef.root.position.z);
       if (typeof applyViewModeGlobal === "function") applyViewModeGlobal();
-    } else {
-      console.log("[Debug] F7 ignored: fpArmsRef missing");
     }
+  }
+
+  if (e.code === "F8") {
+    e.preventDefault();
+    debugCubeOn = !debugCubeOn;
+    if (debugCube) {
+      debugCube.setEnabled(debugCubeOn);
+    }
+    debugHUD.state.debugCube = debugCubeOn;
+    debugHUD.state.last = "F8 debugCube toggled";
+    debugHUD.render();
   }
 });
 
 /* ============================================================
- * Colyseus setup + debug
+ * Colyseus (kept)
  * ============================================================
  */
 
@@ -393,17 +387,9 @@ async function debugMatchmake(endpointWsOrHttp) {
       headers: { "Content-Type": "application/json" },
       body: "{}",
     });
-
     const t2 = await r2.text();
-    console.log("[Colyseus][debug] POST /matchmake/joinOrCreate/my_room status:", r2.status);
+    console.log("[Colyseus][debug] POST joinOrCreate status:", r2.status);
     console.log("[Colyseus][debug] raw body:", t2.slice(0, 400));
-
-    try {
-      const j = JSON.parse(t2);
-      console.log("[Colyseus][debug] parsed JSON:", j);
-    } catch {
-      console.warn("[Colyseus][debug] response was not JSON");
-    }
   } catch (e) {
     console.error("[Colyseus][debug] matchmake POST failed:", e);
   }
@@ -413,7 +399,7 @@ const colyseusClient = new Client(COLYSEUS_ENDPOINT);
 noaAny.colyseus = { endpoint: COLYSEUS_ENDPOINT, client: colyseusClient, room: null };
 
 /* ============================================================
- * MCHeads skins
+ * Skins (MCHeads)
  * ============================================================
  */
 
@@ -422,7 +408,7 @@ function getMcHeadsSkinUrl(identifier) {
 }
 
 /* ============================================================
- * Avatar + UV helpers
+ * UV helpers + material
  * ============================================================
  */
 
@@ -436,7 +422,7 @@ function makeFaceUV(front, back, right, left, top, bottom) {
   return [front, back, right, left, top, bottom];
 }
 
-function createSkinMaterial(scene, skinUrl, name = "mc-skin-mat") {
+function createSkinMaterial(scene, skinUrl, name) {
   const skinTexture = new Texture(skinUrl, scene, false, false, Texture.NEAREST_NEAREST);
   skinTexture.hasAlpha = true;
   skinTexture.wrapU = Texture.CLAMP_ADDRESSMODE;
@@ -446,23 +432,23 @@ function createSkinMaterial(scene, skinUrl, name = "mc-skin-mat") {
   mat.diffuseTexture = skinTexture;
   mat.emissiveColor = new Color3(0.05, 0.05, 0.05);
   mat.specularColor = new Color3(0, 0, 0);
+  mat.backFaceCulling = false; // helpful during debugging
 
   if (skinTexture.onLoadObservable && typeof skinTexture.onLoadObservable.add === "function") {
-    skinTexture.onLoadObservable.add(() => {
-      console.log("[Skin] loaded:", skinUrl);
-      try { mat.freeze(); } catch {}
-    });
-  } else {
-    console.log("[Skin] onLoadObservable missing; continuing:", skinUrl);
+    skinTexture.onLoadObservable.add(() => console.log("[Skin] loaded:", skinUrl));
   }
-
   return mat;
 }
+
+/* ============================================================
+ * Third-person avatar (player body)
+ * ============================================================
+ */
 
 function createPlayerAvatar(scene, skinUrl) {
   const root = new Mesh("mc-avatar-root", scene);
 
-  // ✅ FIX: MUST be visible or children never render (even if enabled)
+  // Important: root must be visible
   root.isVisible = true;
 
   const mat = createSkinMaterial(scene, skinUrl, "mc-skin-mat");
@@ -545,32 +531,18 @@ function createPlayerAvatar(scene, skinUrl) {
   rightArm.position.set(-(bodySize.width / 2 + limbSize.width / 2), armY, 0);
   leftArm.position.set(bodySize.width / 2 + limbSize.width / 2, armY, 0);
 
-  return { root, material: mat, parts: { head, body, leftArm, rightArm, leftLeg, rightLeg } };
+  return { root, material: mat };
 }
 
 /* ============================================================
- * First-person arms rig
+ * First-person arms (parent to scene.activeCamera)
  * ============================================================
  */
 
-function getBabylonCameraFromNoa(scene) {
-  try {
-    const cam = noa.rendering && noa.rendering.camera ? noa.rendering.camera : null;
-    if (cam) return cam;
-  } catch {}
-  return scene.activeCamera || null;
-}
-
 function createFirstPersonArms(scene, skinUrl) {
-  const cam = getBabylonCameraFromNoa(scene);
-
-  debugHUD.state.cameraType = cam ? (cam.getClassName ? cam.getClassName() : typeof cam) : "(none)";
-  debugHUD.state.cameraName = cam ? (cam.name || "(unnamed)") : "(none)";
-  debugHUD.state.activeCameraName = scene.activeCamera ? (scene.activeCamera.name || "(unnamed)") : "(none)";
-  debugHUD.render();
-
+  const cam = getBabylonCamera(scene);
   if (!cam) {
-    console.warn("[FPArms] No camera found; skipping first-person arms.");
+    console.warn("[FPArms] no activeCamera");
     return null;
   }
 
@@ -578,13 +550,13 @@ function createFirstPersonArms(scene, skinUrl) {
   root.isVisible = true;
   root.parent = cam;
 
-  // NOTE: if arms are behind camera, press F7 to flip Z
-  root.position.set(0.38, -0.42, 0.95);
+  // Push forward from camera
+  root.position.set(0.38, -0.42, 1.10);
   root.rotation.set(0, 0, 0);
   root.scaling.set(0.85, 0.85, 0.85);
 
   const mat = createSkinMaterial(scene, skinUrl, "fp-skin-mat");
-  mat.disableDepthWrite = true;
+  mat.backFaceCulling = false;
 
   const armUV = makeFaceUV(
     uvRect(44, 20, 4, 12),
@@ -600,12 +572,10 @@ function createFirstPersonArms(scene, skinUrl) {
   const rightArm = MeshBuilder.CreateBox("fp-rightArm", { width: armSize.width, height: armSize.height, depth: armSize.depth, faceUV: armUV }, scene);
   rightArm.material = mat;
   rightArm.parent = root;
-  rightArm.renderingGroupId = 2;
 
   const leftArm = MeshBuilder.CreateBox("fp-leftArm", { width: armSize.width, height: armSize.height, depth: armSize.depth, faceUV: armUV }, scene);
   leftArm.material = mat;
   leftArm.parent = root;
-  leftArm.renderingGroupId = 2;
 
   rightArm.position.set(0.32, -0.15, 0.0);
   leftArm.position.set(-0.22, -0.22, -0.05);
@@ -613,16 +583,12 @@ function createFirstPersonArms(scene, skinUrl) {
   rightArm.rotation.set(0.15, 0.2, 0.15);
   leftArm.rotation.set(0.05, -0.25, -0.05);
 
-  const anim = { active: false, t: 0, duration: 0.18, strength: 1.0 };
+  const anim = { active: false, t: 0, duration: 0.18 };
 
   const base = {
     rootRotX: root.rotation.x,
-    rightRotX: rightArm.rotation.x,
-    rightRotY: rightArm.rotation.y,
-    rightRotZ: rightArm.rotation.z,
-    leftRotX: leftArm.rotation.x,
-    leftRotY: leftArm.rotation.y,
-    leftRotZ: leftArm.rotation.z,
+    rx: rightArm.rotation.x, ry: rightArm.rotation.y, rz: rightArm.rotation.z,
+    lx: leftArm.rotation.x, ly: leftArm.rotation.y, lz: leftArm.rotation.z,
   };
 
   function startSwing() {
@@ -640,22 +606,22 @@ function createFirstPersonArms(scene, skinUrl) {
 
     const p = clamp(anim.t / anim.duration, 0, 1);
     const e = easeInOutQuad(p);
-    const swing = Math.sin(e * Math.PI) * anim.strength;
+    const swing = Math.sin(e * Math.PI);
 
-    rightArm.rotation.x = base.rightRotX + swing * 0.9;
-    rightArm.rotation.y = base.rightRotY + swing * 0.25;
-    rightArm.rotation.z = base.rightRotZ - swing * 0.15;
+    rightArm.rotation.x = base.rx + swing * 0.9;
+    rightArm.rotation.y = base.ry + swing * 0.25;
+    rightArm.rotation.z = base.rz - swing * 0.15;
 
-    leftArm.rotation.x = base.leftRotX + swing * 0.25;
-    leftArm.rotation.y = base.leftRotY - swing * 0.15;
-    leftArm.rotation.z = base.leftRotZ + swing * 0.05;
+    leftArm.rotation.x = base.lx + swing * 0.25;
+    leftArm.rotation.y = base.ly - swing * 0.15;
+    leftArm.rotation.z = base.lz + swing * 0.05;
 
     root.rotation.x = base.rootRotX + swing * 0.08;
 
     if (p >= 1) {
       anim.active = false;
-      rightArm.rotation.set(base.rightRotX, base.rightRotY, base.rightRotZ);
-      leftArm.rotation.set(base.leftRotX, base.leftRotY, base.leftRotZ);
+      rightArm.rotation.set(base.rx, base.ry, base.rz);
+      leftArm.rotation.set(base.lx, base.ly, base.lz);
       root.rotation.x = base.rootRotX;
     }
   }
@@ -664,8 +630,37 @@ function createFirstPersonArms(scene, skinUrl) {
     root.setEnabled(enabled);
   }
 
-  console.log("[FPArms] created OK. parent:", root.parent);
+  // Force masks to match camera
+  forceLayerMaskToCamera(scene, root);
+
+  console.log("[FPArms] created. parent:", root.parent, "cam:", cam.name);
   return { root, startSwing, update, setEnabled };
+}
+
+/* ============================================================
+ * Debug cube (proves mesh visibility)
+ * ============================================================
+ */
+
+function ensureDebugCube(scene) {
+  if (debugCube) return;
+
+  const cam = getBabylonCamera(scene);
+  debugCube = MeshBuilder.CreateBox("debugCube", { size: 0.7 }, scene);
+  const m = new StandardMaterial("debugCubeMat", scene);
+  m.diffuseColor = new Color3(1, 0, 1);
+  m.emissiveColor = new Color3(0.2, 0, 0.2);
+  m.backFaceCulling = false;
+  debugCube.material = m;
+
+  // Parent to active camera, slightly forward
+  if (cam) {
+    debugCube.parent = cam;
+    debugCube.position.set(0.0, 0.0, 2.0);
+  }
+
+  debugCube.setEnabled(false);
+  forceLayerMaskToCamera(scene, debugCube);
 }
 
 /* ============================================================
@@ -707,7 +702,7 @@ noa.world.on("worldDataNeeded", function (id, data, x, y, z) {
 });
 
 /* ============================================================
- * Local avatar init
+ * Local avatar attach + view mode logic
  * ============================================================
  */
 
@@ -722,9 +717,12 @@ function initLocalAvatarOnce(scene, playerIdentifier) {
   const skinUrl = getMcHeadsSkinUrl(playerIdentifier);
   console.log("[Skin] Using MCHeads skin URL:", skinUrl);
 
-  const avatar = createPlayerAvatar(scene, skinUrl);
+  localAvatar = createPlayerAvatar(scene, skinUrl);
   fpArmsRef = createFirstPersonArms(scene, skinUrl);
 
+  ensureDebugCube(scene);
+
+  // Attach avatar to noa player entity (mesh component)
   const playerHeight = typeof noaAny.playerHeight === "number" ? noaAny.playerHeight : 1.8;
   const meshOffsetY = playerHeight * 0.5;
 
@@ -732,66 +730,84 @@ function initLocalAvatarOnce(scene, playerIdentifier) {
     if (entities && typeof entities.hasComponent === "function") {
       if (!entities.hasComponent(playerEntity, noa.entities.names.mesh)) {
         entities.addComponent(playerEntity, noa.entities.names.mesh, {
-          mesh: avatar.root,
+          mesh: localAvatar.root,
           offset: [0, meshOffsetY, 0],
         });
-      } else {
-        console.warn("[Avatar] player already has mesh component; skipping addComponent");
       }
     } else {
       entities.addComponent(playerEntity, noa.entities.names.mesh, {
-        mesh: avatar.root,
+        mesh: localAvatar.root,
         offset: [0, meshOffsetY, 0],
       });
     }
   } catch (e) {
-    console.error("[Avatar] failed to add mesh component:", e);
+    console.error("[Avatar] add mesh component failed:", e);
     debugHUD.state.lastError = String(e?.message || e);
-    debugHUD.render();
   }
+
+  // Always align masks to camera
+  forceLayerMaskToCamera(scene, localAvatar.root);
+  if (fpArmsRef) forceLayerMaskToCamera(scene, fpArmsRef.root);
 
   function applyViewMode() {
     const locked = isPointerLockedToNoa();
-    const isFirstPerson = viewMode === 0;
+    const isFirst = viewMode === 0;
 
+    // Camera zoom control
     if (viewMode === 0) noa.camera.zoomDistance = 0;
     if (viewMode === 1) noa.camera.zoomDistance = 6;
     if (viewMode === 2) noa.camera.zoomDistance = 6;
 
-    // Show body in 3rd person, hide in 1st
-    avatar.root.setEnabled(!isFirstPerson);
+    // Avatar only visible in 3rd person
+    localAvatar.root.setEnabled(!isFirst);
 
-    // Arms only when locked in 1st person
-    const armsEnabled = !!(fpArmsRef && isFirstPerson && locked);
+    // Arms only visible in first-person AND locked
+    const armsEnabled = !!(fpArmsRef && isFirst && locked);
     if (fpArmsRef) fpArmsRef.setEnabled(armsEnabled);
+
+    // Keep layerMasks in sync with activeCamera (noa can change it)
+    forceLayerMaskToCamera(scene, localAvatar.root);
+    if (fpArmsRef) forceLayerMaskToCamera(scene, fpArmsRef.root);
+    if (debugCube) forceLayerMaskToCamera(scene, debugCube);
 
     crosshairUI.refresh();
 
-    debugHUD.state.viewMode = viewMode;
-    debugHUD.state.forceCrosshair = forceCrosshair;
-    debugHUD.state.pointerLocked = locked;
+    // HUD camera info
+    const cam = getBabylonCamera(scene);
+    debugHUD.state.camName = cam ? cam.name : "(none)";
+    debugHUD.state.camClass = cam && cam.getClassName ? cam.getClassName() : "(none)";
+    debugHUD.state.camMask = cam ? String((/** @type {any} */ (cam).layerMask ?? "(none)")) : "(none)";
 
-    debugHUD.state.avatarEnabled = avatar.root.isEnabled();
-    debugHUD.state.avatarVisible = avatar.root.isVisible;
+    debugHUD.state.viewMode = viewMode;
+    debugHUD.state.locked = locked;
+
+    debugHUD.state.avatarEnabled = localAvatar.root.isEnabled();
+    debugHUD.state.avatarVisible = localAvatar.root.isVisible;
+    debugHUD.state.avatarMask = String(localAvatar.root.layerMask ?? "(none)");
+    debugHUD.state.avatarChildCount = localAvatar.root.getChildMeshes ? localAvatar.root.getChildMeshes().length : 0;
 
     debugHUD.state.armsExists = !!fpArmsRef;
     debugHUD.state.armsEnabled = armsEnabled;
+    debugHUD.state.armsMask = fpArmsRef ? String(fpArmsRef.root.layerMask ?? "(none)") : "(n/a)";
+    debugHUD.state.armsParent = fpArmsRef && fpArmsRef.root.parent ? (fpArmsRef.root.parent.name || "(parent)") : "(none)";
 
-    if (fpArmsRef && fpArmsRef.root) {
-      const p = fpArmsRef.root.getAbsolutePosition();
-      debugHUD.state.armsPos = `${p.x.toFixed(2)}, ${p.y.toFixed(2)}, ${p.z.toFixed(2)}`;
-      debugHUD.state.armsParent = fpArmsRef.root.parent ? (fpArmsRef.root.parent.name || "(parent)") : "(none)";
-      debugHUD.state.armsLocalPos = `${fpArmsRef.root.position.x.toFixed(2)}, ${fpArmsRef.root.position.y.toFixed(2)}, ${fpArmsRef.root.position.z.toFixed(2)}`;
-    } else {
-      debugHUD.state.armsPos = "(n/a)";
-      debugHUD.state.armsParent = "(none)";
-      debugHUD.state.armsLocalPos = "(n/a)";
-    }
+    debugHUD.state.debugCube = debugCubeOn;
+    if (debugCube) debugCube.setEnabled(debugCubeOn);
 
-    debugHUD.state.lastApply = new Date().toLocaleTimeString();
+    debugHUD.state.last = "applyViewMode";
     debugHUD.render();
 
-    console.log("[applyViewMode]", { viewMode, locked, isFirstPerson, armsEnabled, pointerLockEl: document.pointerLockElement });
+    console.log("[applyViewMode]", {
+      viewMode,
+      locked,
+      avatarEnabled: localAvatar.root.isEnabled(),
+      avatarVisible: localAvatar.root.isVisible,
+      armsEnabled,
+      cam: cam ? cam.name : "(none)",
+      camMask: cam ? (/** @type {any} */ (cam).layerMask) : "(none)",
+      avatarMask: localAvatar.root.layerMask,
+      armsMask: fpArmsRef ? fpArmsRef.root.layerMask : "(n/a)",
+    });
   }
 
   applyViewModeGlobal = applyViewMode;
@@ -803,7 +819,7 @@ function initLocalAvatarOnce(scene, playerIdentifier) {
 }
 
 /* ============================================================
- * Remote players manager
+ * Remote players (kept minimal + safe)
  * ============================================================
  */
 
@@ -818,59 +834,37 @@ function createRemotePlayersManager(scene, room) {
 
     const skinUrl = getMcHeadsSkinUrl(name);
     const avatar = createPlayerAvatar(scene, skinUrl);
-
     avatar.root.setEnabled(true);
+
+    // IMPORTANT: align mask to camera
+    forceLayerMaskToCamera(scene, avatar.root);
 
     const x = safeNum(playerState.x, 0);
     const y = safeNum(playerState.y, 10);
     const z = safeNum(playerState.z, 0);
-
     avatar.root.position.set(x, y, z);
-    remotes.set(sessionId, { avatar, tx: x, ty: y, tz: z });
 
+    remotes.set(sessionId, { avatar, tx: x, ty: y, tz: z });
     console.log("[Remote] spawned", sessionId, "name:", name);
   }
 
   function removeRemote(sessionId) {
     const r = remotes.get(sessionId);
     if (!r) return;
-
-    try {
-      const childMeshes = r.avatar.root.getChildMeshes ? r.avatar.root.getChildMeshes() : [];
-      for (const m of childMeshes) {
-        try { m.dispose(false, true); } catch {}
-      }
-      try { r.avatar.root.dispose(false, true); } catch {}
-      try {
-        const mat = r.avatar.material;
-        if (mat) {
-          const tex = mat.diffuseTexture;
-          try { tex && tex.dispose && tex.dispose(); } catch {}
-          try { mat.dispose && mat.dispose(); } catch {}
-        }
-      } catch {}
-    } catch {}
-
+    try { r.avatar.root.dispose(false, true); } catch {}
     remotes.delete(sessionId);
-    console.log("[Remote] removed", sessionId);
   }
 
   function updateRemote(sessionId, playerState) {
     const r = remotes.get(sessionId);
     if (!r) return;
-
     r.tx = safeNum(playerState.x, r.tx);
     r.ty = safeNum(playerState.y, r.ty);
     r.tz = safeNum(playerState.z, r.tz);
-
-    const yaw = safeNum(playerState.yaw, 0);
-    try { r.avatar.root.rotation.y = yaw; } catch {}
   }
 
   noa.on("tick", () => {
-    const dt = 1 / 60;
-    const alpha = clamp(dt * 12, 0, 1);
-
+    const alpha = 0.2;
     remotes.forEach((r) => {
       const root = r.avatar.root;
       root.position.set(
@@ -881,35 +875,27 @@ function createRemotePlayersManager(scene, room) {
     });
   });
 
-  function hookPlayersMap(players) {
-    players.onAdd = (playerState, sessionId) => {
-      if (sessionId === room.sessionId) return;
-      spawnRemote(sessionId, playerState);
-      try { playerState.onChange = () => updateRemote(sessionId, playerState); } catch {}
-    };
-
-    players.onRemove = (_playerState, sessionId) => {
-      removeRemote(sessionId);
-    };
-  }
-
   (function waitForPlayersMap() {
-    const maxWaitMs = 5000;
     const start = performance.now();
-
     const interval = setInterval(() => {
       const players = room && room.state ? room.state.players : null;
-
       if (players) {
         clearInterval(interval);
-        hookPlayersMap(players);
+
+        players.onAdd = (playerState, sessionId) => {
+          if (sessionId === room.sessionId) return;
+          spawnRemote(sessionId, playerState);
+          try { playerState.onChange = () => updateRemote(sessionId, playerState); } catch {}
+        };
+
+        players.onRemove = (_ps, sessionId) => removeRemote(sessionId);
+
         console.log("[Remote] hooked room.state.players");
         return;
       }
-
-      if (performance.now() - start > maxWaitMs) {
+      if (performance.now() - start > 5000) {
         clearInterval(interval);
-        console.warn("[Remote] room.state.players never found; remote avatars disabled.");
+        console.warn("[Remote] no room.state.players found (schema mismatch?)");
       }
     }, 50);
   })();
@@ -935,14 +921,13 @@ function getLocalPlayerPositionFallback() {
 function getCameraYawPitchFallback() {
   const cam = noa.camera || noaAny.camera;
   if (!cam) return { yaw: 0, pitch: 0 };
-
-  const yaw = safeNum(cam.heading, safeNum(cam.yaw, safeNum(cam.rotation?.y, 0)));
-  const pitch = safeNum(cam.pitch, safeNum(cam.rotation?.x, 0));
+  const yaw = safeNum(cam.heading, safeNum(cam.yaw, 0));
+  const pitch = safeNum(cam.pitch, 0);
   return { yaw, pitch };
 }
 
 /* ============================================================
- * Connect Colyseus + init everything
+ * Connect Colyseus
  * ============================================================
  */
 
@@ -953,26 +938,21 @@ async function connectColyseus() {
   await debugMatchmake(COLYSEUS_ENDPOINT);
 
   try {
-    const joinOptions = { name: "Steve" };
-
-    const room = await colyseusClient.joinOrCreate("my_room", joinOptions);
+    const room = await colyseusClient.joinOrCreate("my_room", { name: "Steve" });
     noaAny.colyseus.room = room;
 
     console.log("[Colyseus] connected OK");
     console.log("[Colyseus] roomId:", room.roomId || "(unknown)");
     console.log("[Colyseus] sessionId:", room.sessionId);
 
-    room.onMessage("*", (type, message) => {
-      console.log("[Colyseus] message:", type, message);
-    });
+    room.onMessage("*", (type, message) => console.log("[Colyseus] message:", type, message));
 
-    room.onLeave((code) => {
-      console.warn("[Colyseus] left room. code:", code);
+    room.onLeave(() => {
+      console.warn("[Colyseus] left room");
       noaAny.colyseus.room = null;
     });
 
     const scene = noa.rendering.getScene();
-    sceneRef = scene;
 
     initLocalAvatarOnce(scene, "Steve");
     createRemotePlayersManager(scene, room);
@@ -980,10 +960,8 @@ async function connectColyseus() {
     setInterval(() => {
       const activeRoom = noaAny.colyseus.room;
       if (!activeRoom) return;
-
       const [x, y, z] = getLocalPlayerPositionFallback();
       const { yaw, pitch } = getCameraYawPitchFallback();
-
       activeRoom.send("move", { x, y, z, yaw, pitch });
     }, 50);
   } catch (err) {
@@ -991,26 +969,16 @@ async function connectColyseus() {
     debugHUD.state.lastError = String(err?.message || err);
     debugHUD.render();
 
-    try {
-      const scene = noa.rendering.getScene();
-      sceneRef = scene;
-      initLocalAvatarOnce(scene, "Steve");
-    } catch (e) {
-      console.error("[Avatar] init failed after Colyseus failure:", e);
-      debugHUD.state.lastError = String(e?.message || e);
-      debugHUD.render();
-    }
+    // Still init local avatar offline
+    const scene = noa.rendering.getScene();
+    initLocalAvatarOnce(scene, "Steve");
   }
 }
 
-connectColyseus().catch((e) => {
-  console.error("[Colyseus] connectColyseus() crash:", e);
-  debugHUD.state.lastError = String(e?.message || e);
-  debugHUD.render();
-});
+connectColyseus().catch((e) => console.error("[Colyseus] connect crash:", e));
 
 /* ============================================================
- * Minimal interactivity + FP arm animations
+ * Minimal interactivity
  * ============================================================
  */
 
@@ -1035,16 +1003,12 @@ noa.inputs.down.on("alt-fire", function () {
 noa.inputs.bind("alt-fire", "KeyE");
 
 noa.on("tick", function () {
+  // Third-person scroll zoom
   const scroll = noa.inputs.pointerState.scrolly;
-
   if (scroll !== 0 && viewMode !== 0) {
     noa.camera.zoomDistance += scroll > 0 ? 1 : -1;
     noa.camera.zoomDistance = clamp(noa.camera.zoomDistance, 2, 12);
   }
 
   if (fpArmsRef) fpArmsRef.update(1 / 60);
-
-  debugHUD.state.viewMode = viewMode;
-  debugHUD.state.forceCrosshair = forceCrosshair;
-  debugHUD.render();
 });
