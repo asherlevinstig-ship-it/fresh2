@@ -1,20 +1,19 @@
 /*
- * Fresh2 - noa hello-world (main game entry) - REWORK V7.2 (JS-safe, NO OMITS)
+ * Fresh2 - noa hello-world (main game entry) - REWORK V7.3 (NOA-compatible)
  *
- * Rethink:
- * - Treat NOA's Babylon camera as `any` (prevents "FreeCamera not assignable to Node" in JS+TS check)
- * - Never pass Babylon Vector3 into typed DeepImmutable signatures (use plain arrays or create via same module)
- * - Parent using setParent / parent assignment through `any` to avoid protected/private typing conflicts
+ * Key fixes vs V7.2:
+ * - DO NOT use TransformNode as root for NOA mesh component.
+ *   NOA expects an AbstractMesh (BABYLON.Mesh). TransformNode can crash Babylon render loop.
+ * - Keep JS-safe `any` barriers to avoid TS type incompatibilities in a .js file.
  *
- * Still recommended: dedupe Babylon packages in the build (single Babylon instance).
+ * Keys:
+ * F5 view | F6 crosshair | F7 flip arms | F8 debug sphere | F9 arms lock toggle
  */
 
 import { Engine } from "noa-engine";
 import { Client } from "@colyseus/sdk";
 
-// Use babylonjs (UMD) to better match NOA.
-// If your project still has @babylonjs/core, TS may still see mixed types.
-// This file avoids those type errors by using `any` barriers.
+// IMPORTANT: use babylonjs package (UMD) to match NOA more often than @babylonjs/core.
 import * as BABYLON from "babylonjs";
 
 /* ============================================================
@@ -140,7 +139,7 @@ function createDebugHUD() {
 
   function render() {
     el.textContent =
-      `Fresh2 Debug V7.2\n` +
+      `Fresh2 Debug V7.3\n` +
       `viewMode: ${state.viewMode} (${state.viewMode === 0 ? "first" : state.viewMode === 1 ? "third-back" : "third-front"})\n` +
       `locked: ${state.locked}\n` +
       `camPos: ${state.camPos}\n` +
@@ -241,15 +240,14 @@ const crosshairUI = createCrosshairOverlay();
 })();
 
 /* ============================================================
- * NOA + Babylon camera access (treat as any to avoid TS conflicts)
+ * NOA scene/camera as ANY (avoid TS mismatches)
  * ============================================================
  */
 
 function getNoaBabylonCameraAny() {
   try {
     const r = /** @type {any} */ (noa).rendering;
-    const cam = r && r.camera ? r.camera : null;
-    return /** @type {any} */ (cam);
+    return /** @type {any} */ (r && r.camera ? r.camera : null);
   } catch {
     return null;
   }
@@ -257,8 +255,7 @@ function getNoaBabylonCameraAny() {
 
 function getNoaSceneAny() {
   try {
-    const s = /** @type {any} */ (noa).rendering.getScene();
-    return /** @type {any} */ (s);
+    return /** @type {any} */ (/** @type {any} */ (noa).rendering.getScene());
   } catch {
     return null;
   }
@@ -298,7 +295,7 @@ function createSkinMaterial(scene, skinUrl, name) {
 }
 
 /* ============================================================
- * Test cube (placed in front of camera every frame)
+ * Test cube (in front of camera)
  * ============================================================
  */
 
@@ -317,12 +314,16 @@ function createTestCube(scene) {
 }
 
 /* ============================================================
- * Third-person avatar
+ * Third-person avatar (ROOT MUST BE A MESH for NOA)
  * ============================================================
  */
 
 function createPlayerAvatar(scene, skinUrl) {
-  const root = new BABYLON.TransformNode("mc-avatar-root", scene);
+  // IMPORTANT: Mesh root, not TransformNode (NOA mesh component expects AbstractMesh)
+  const root = new BABYLON.Mesh("mc-avatar-root", scene);
+  root.isPickable = false;
+  root.setEnabled(false);
+  root.isVisible = false;
 
   const mat = createSkinMaterial(scene, skinUrl, "mc-skin-mat");
 
@@ -349,6 +350,7 @@ function createPlayerAvatar(scene, skinUrl) {
     m.parent = root;
     m.isPickable = false;
     m.alwaysSelectAsActiveMesh = true;
+    m.isVisible = true;
     return m;
   }
 
@@ -371,13 +373,16 @@ function createPlayerAvatar(scene, skinUrl) {
 }
 
 /* ============================================================
- * First-person arms (camera-parented, using ANY barrier)
+ * First-person arms (ROOT MUST BE A MESH for safety with NOA/Babylon)
  * ============================================================
  */
 
 function createFirstPersonArms(scene, skinUrl) {
-  const root = new BABYLON.TransformNode("fp-arms-root", scene);
+  // Mesh root (safe for Babylon active mesh eval)
+  const root = new BABYLON.Mesh("fp-arms-root", scene);
+  root.isPickable = false;
   root.setEnabled(false);
+  root.isVisible = false; // root itself hidden; child arms visible
 
   const mat = createSkinMaterial(scene, skinUrl, "fp-skin-mat");
   const armUV = makeFaceUV(
@@ -387,8 +392,16 @@ function createFirstPersonArms(scene, skinUrl) {
 
   const r = BABYLON.MeshBuilder.CreateBox("fp-rightArm", { width: 0.35, height: 0.9, depth: 0.35, faceUV: armUV }, scene);
   const l = BABYLON.MeshBuilder.CreateBox("fp-leftArm", { width: 0.35, height: 0.9, depth: 0.35, faceUV: armUV }, scene);
-  r.material = mat; l.material = mat;
-  r.parent = root; l.parent = root;
+  r.material = mat;
+  l.material = mat;
+
+  r.parent = root;
+  l.parent = root;
+
+  r.isPickable = false;
+  l.isPickable = false;
+  r.isVisible = true;
+  l.isVisible = true;
 
   r.position.set(0.45, -0.35, 1.0);
   l.position.set(-0.35, -0.40, 0.95);
@@ -409,7 +422,10 @@ function createFirstPersonArms(scene, skinUrl) {
     return x < 0.5 ? 2 * x * x : 1 - Math.pow(-2 * x + 2, 2) / 2;
   }
 
-  function startSwing() { anim.active = true; anim.t = 0; }
+  function startSwing() {
+    anim.active = true;
+    anim.t = 0;
+  }
 
   function updateAnim(dt) {
     if (!anim.active) return;
@@ -437,10 +453,8 @@ function createFirstPersonArms(scene, skinUrl) {
     const camAny = getNoaBabylonCameraAny();
     if (!camAny) return;
 
-    // avoid TS "FreeCamera not assignable to Node" by using `any`
+    // Use ANY barrier to avoid TS "Node mismatch" issues.
     const rootAny = /** @type {any} */ (root);
-
-    // both work depending on Babylon build:
     if (typeof rootAny.setParent === "function") rootAny.setParent(camAny);
     else rootAny.parent = camAny;
 
@@ -450,12 +464,18 @@ function createFirstPersonArms(scene, skinUrl) {
   function setEnabled(v) {
     enabled = v;
     root.setEnabled(v);
+    root.isVisible = false;
+    r.setEnabled(v);
+    l.setEnabled(v);
     if (v) attachToCamera();
   }
 
   return {
-    root, rightArm: r, leftArm: l,
-    startSwing, updateAnim,
+    root,
+    rightArm: r,
+    leftArm: l,
+    startSwing,
+    updateAnim,
     setEnabled,
     get enabled() { return enabled; },
     get flipZ() { return flipZ; },
@@ -573,6 +593,7 @@ function initLocalAvatarOnce(scene, playerIdentifier) {
 
     const avatarOn = !isFirst;
     localAvatar.root.setEnabled(avatarOn);
+    localAvatar.root.isVisible = false; // root invisible, child boxes visible
 
     const armsOn = isFirst && (!armsRequirePointerLock || locked);
     fpArmsRef.setEnabled(armsOn);
@@ -623,16 +644,7 @@ function createRemotePlayersManager(scene, room) {
   function removeRemote(sessionId) {
     const r = remotes.get(sessionId);
     if (!r) return;
-    try {
-      // avatar.root is TransformNode; disposing children meshes should still work
-      r.avatar.head.dispose(false, true);
-      r.avatar.body.dispose(false, true);
-      r.avatar.rightArm.dispose(false, true);
-      r.avatar.leftArm.dispose(false, true);
-      r.avatar.rightLeg.dispose(false, true);
-      r.avatar.leftLeg.dispose(false, true);
-      r.avatar.root.dispose();
-    } catch {}
+    try { r.avatar.root.dispose(false, true); } catch {}
     remotes.delete(sessionId);
   }
 
@@ -770,10 +782,8 @@ noa.on("tick", function () {
 noa.on("beforeRender", function () {
   const camAny = getNoaBabylonCameraAny();
 
-  // Place cube in front of camera each frame
   if (camAny && testCube) {
     try {
-      // Avoid TS DeepImmutable issues: use BABYLON.Vector3 from same module as camera methods expect.
       const dir = camAny.getDirection(new BABYLON.Vector3(0, 0, 1));
       const pos = camAny.position.add(dir.scale(8));
       testCube.position.copyFrom(pos);
