@@ -1,15 +1,18 @@
 /*
- * Fresh2 - noa hello-world (main game entry) - FIXED V5 (Plain JS, NO OMITS)
+ * Fresh2 - noa hello-world (main game entry) - FIXED V6.1 (Plain JS, NO OMITS, noa-engine v0.33.0)
  *
- * Included fixes:
- * - FIX: Avatar + FP arms were not rendering because parent roots had `isVisible = false`
- *        (in Babylon, a parent with isVisible=false hides children)
- * - Roots now start disabled via `setEnabled(false)` instead of invisible
- * - Pointer lock target normalization (prevents TS checkJs union-type errors in .js)
- * - Debug toggle: arms can show in first-person even without pointer lock (F9)
+ * Fixes:
+ * 1) Uses noa.rendering.camera (correct for noa v0.33.0 typings)
+ * 2) Forces layerMask match to NOA Babylon camera for all custom meshes
+ * 3) FPS arms parented to NOA Babylon camera (stable)
+ * 4) Test cube forced 6 units in front of camera each frame (can’t “miss” it)
  *
- * Notes:
- * - If you STILL see nothing after this, suspect two Babylon copies being bundled.
+ * Debug keys:
+ * - F5: view mode
+ * - F6: crosshair toggle
+ * - F7: flip arms
+ * - F8: debug sphere toggle
+ * - F9: arms require pointer lock toggle
  */
 
 import { Engine } from "noa-engine";
@@ -45,10 +48,6 @@ const noa = new Engine(opts);
 let viewMode = 0; // 0 first, 1 third-back, 2 third-front
 let forceCrosshair = false;
 
-/**
- * Debug: arms usually require pointer lock.
- * Toggle with F9 to show arms even without pointer lock (useful to diagnose lock issues).
- */
 let armsRequirePointerLock = true;
 
 let applyViewModeGlobal = null;
@@ -58,6 +57,8 @@ let localAvatar = null;
 
 let debugSphere = null;
 let debugSphereOn = false;
+
+let testCube = null;
 
 /* ============================================================
  * Small helpers
@@ -77,12 +78,7 @@ function clamp(v, a, b) {
  * ============================================================
  */
 
-/**
- * Returns something usable as a pointer lock element.
- * May be NOA container, a div, or a canvas.
- */
 function getPointerLockTarget() {
-  // noa.container is usually the #noa-container div, but typing can be weird
   const noaAny = noa;
   const c = noaAny && noaAny.container;
   if (c && typeof c === "object" && "requestPointerLock" in c) return c;
@@ -93,18 +89,12 @@ function getPointerLockTarget() {
   return document.querySelector("canvas");
 }
 
-/**
- * Convert whatever we got into a real DOM element (or null).
- * This avoids TS checkJs errors in .js files and is safer at runtime.
- */
 function toDomElement(maybeEl) {
   if (!maybeEl) return null;
 
-  // Already a DOM element
   if (maybeEl instanceof HTMLElement) return maybeEl;
   if (maybeEl instanceof HTMLCanvasElement) return maybeEl;
 
-  // If it "quacks" like a DOM element (NOA container sometimes does)
   if (typeof maybeEl === "object") {
     const hasAdd = typeof maybeEl.addEventListener === "function";
     const hasReq = typeof maybeEl.requestPointerLock === "function";
@@ -150,7 +140,6 @@ function createDebugHUD() {
   const state = {
     viewMode: 0,
     locked: false,
-
     camPos: "(none)",
     camHeading: 0,
     camPitch: 0,
@@ -162,6 +151,9 @@ function createDebugHUD() {
     armsPos: "(none)",
     armsRequireLock: true,
 
+    testCubePos: "(none)",
+    testCubeOn: false,
+
     debugSphere: false,
     debugSpherePos: "(none)",
 
@@ -172,13 +164,14 @@ function createDebugHUD() {
 
   function render() {
     el.textContent =
-      `Fresh2 Debug V5 (JS)\n` +
+      `Fresh2 Debug V6.1 (JS)\n` +
       `viewMode: ${state.viewMode} (${state.viewMode === 0 ? "first" : state.viewMode === 1 ? "third-back" : "third-front"})\n` +
       `locked: ${state.locked}\n` +
       `camPos: ${state.camPos}\n` +
       `camHeading: ${state.camHeading.toFixed(2)} pitch: ${state.camPitch.toFixed(2)}\n` +
       `avatar: enabled=${state.avatarEnabled} pos=${state.avatarPos}\n` +
       `arms: enabled=${state.armsEnabled} pos=${state.armsPos} (requireLock=${state.armsRequireLock})\n` +
+      `testCube: enabled=${state.testCubeOn} pos=${state.testCubePos}\n` +
       `debugSphere (F8): ${state.debugSphere} pos=${state.debugSpherePos}\n` +
       `crosshair: ${state.crosshair}\n` +
       `last: ${state.last}\n` +
@@ -262,16 +255,12 @@ const crosshairUI = createCrosshairOverlay();
     if (typeof el.hasAttribute === "function" && !el.hasAttribute("tabindex")) {
       el.setAttribute("tabindex", "1");
     }
-    if (el.style) {
-      el.style.outline = "none";
-    }
+    if (el.style) el.style.outline = "none";
 
     el.addEventListener("click", () => {
       try {
         if (viewMode !== 0) return;
-        if (document.pointerLockElement !== el) {
-          el.requestPointerLock();
-        }
+        if (document.pointerLockElement !== el) el.requestPointerLock();
       } catch (e) {
         debugHUD.state.lastError = String(e && e.message ? e.message : e);
       }
@@ -289,18 +278,13 @@ const crosshairUI = createCrosshairOverlay();
 function getNoaCameraPosition() {
   try {
     const pos = noa.camera.getPosition();
-    if (pos && pos.length >= 3) {
-      return new Vector3(pos[0], pos[1], pos[2]);
-    }
+    if (pos && pos.length >= 3) return new Vector3(pos[0], pos[1], pos[2]);
   } catch {}
 
-  // Fallback: player position + eye offset
   try {
     const ent = noa.playerEntity;
     const pos = noa.entities.getPosition(ent);
-    if (pos && pos.length >= 3) {
-      return new Vector3(pos[0], pos[1] + 1.6, pos[2]);
-    }
+    if (pos && pos.length >= 3) return new Vector3(pos[0], pos[1] + 1.6, pos[2]);
   } catch {}
 
   return new Vector3(0, 10, 0);
@@ -312,8 +296,36 @@ function getNoaCameraRotation() {
   return { heading, pitch };
 }
 
+/**
+ * In noa-engine v0.33.0 the Babylon camera is exposed as noa.rendering.camera.
+ * Use bracket access to keep TS checkJs quiet in .js.
+ */
+function getNoaBabylonCamera() {
+  try {
+    const r = noa.rendering;
+    if (r && typeof r === "object") {
+      const cam = r["camera"];
+      if (cam) return cam;
+    }
+  } catch {}
+  return null;
+}
+
+function applyNoaCameraMask(mesh) {
+  try {
+    const cam = getNoaBabylonCamera();
+    if (cam && typeof cam.layerMask === "number") {
+      mesh.layerMask = cam.layerMask;
+    } else {
+      mesh.layerMask = 0xFFFFFFFF;
+    }
+  } catch {
+    mesh.layerMask = 0xFFFFFFFF;
+  }
+}
+
 /* ============================================================
- * Key handlers: F5/F6/F7/F8/F9
+ * Key handlers
  * ============================================================
  */
 
@@ -321,9 +333,11 @@ document.addEventListener("keydown", (e) => {
   if (e.code === "F5") {
     e.preventDefault();
     viewMode = (viewMode + 1) % 3;
+
     if (viewMode !== 0) {
       try { document.exitPointerLock?.(); } catch {}
     }
+
     try { if (typeof applyViewModeGlobal === "function") applyViewModeGlobal(); } catch {}
     crosshairUI.refresh();
     console.log("[View] mode:", viewMode);
@@ -444,13 +458,12 @@ function createSkinMaterial(scene, skinUrl, name) {
 
 function createPlayerAvatar(scene, skinUrl) {
   const root = new Mesh("mc-avatar-root", scene);
-
-  // ✅ FIX: parent must remain visible, otherwise children never render
   root.isVisible = true;
   root.isPickable = false;
-
-  // Start disabled
   root.setEnabled(false);
+  root.renderingGroupId = 0;
+
+  applyNoaCameraMask(root);
 
   const mat = createSkinMaterial(scene, skinUrl, "mc-skin-mat");
 
@@ -486,13 +499,12 @@ function createPlayerAvatar(scene, skinUrl) {
     mesh.isVisible = true;
     mesh.isPickable = false;
 
-    // Avoid culling oddities
+    mesh.renderingGroupId = 0;
+    applyNoaCameraMask(mesh);
+
     mesh.alwaysSelectAsActiveMesh = true;
     mesh.doNotSyncBoundingInfo = false;
     mesh.refreshBoundingInfo();
-
-    // Render after terrain
-    mesh.renderingGroupId = 1;
 
     return mesh;
   }
@@ -525,19 +537,18 @@ function createPlayerAvatar(scene, skinUrl) {
 }
 
 /* ============================================================
- * First-person arms - manual positioning
+ * First-person arms (parented to NOA Babylon camera)
  * ============================================================
  */
 
 function createFirstPersonArms(scene, skinUrl) {
   const root = new Mesh("fp-arms-root", scene);
-
-  // ✅ FIX: parent must remain visible, otherwise children never render
   root.isVisible = true;
   root.isPickable = false;
-
-  // Start disabled
   root.setEnabled(false);
+  root.renderingGroupId = 0;
+
+  applyNoaCameraMask(root);
 
   const mat = createSkinMaterial(scene, skinUrl, "fp-skin-mat");
 
@@ -558,7 +569,8 @@ function createFirstPersonArms(scene, skinUrl) {
   rightArm.isVisible = true;
   rightArm.isPickable = false;
   rightArm.alwaysSelectAsActiveMesh = true;
-  rightArm.renderingGroupId = 1;
+  rightArm.renderingGroupId = 0;
+  applyNoaCameraMask(rightArm);
 
   const leftArm = MeshBuilder.CreateBox(
     "fp-leftArm",
@@ -570,18 +582,14 @@ function createFirstPersonArms(scene, skinUrl) {
   leftArm.isVisible = true;
   leftArm.isPickable = false;
   leftArm.alwaysSelectAsActiveMesh = true;
-  leftArm.renderingGroupId = 1;
+  leftArm.renderingGroupId = 0;
+  applyNoaCameraMask(leftArm);
 
-  const rightArmOffset = new Vector3(0.45, -0.35, 0.55);
-  const leftArmOffset = new Vector3(-0.35, -0.40, 0.50);
-
-  rightArm.position.copyFrom(rightArmOffset);
-  leftArm.position.copyFrom(leftArmOffset);
+  rightArm.position.set(0.45, -0.35, 1.0);
+  leftArm.position.set(-0.35, -0.40, 0.95);
 
   rightArm.rotation.set(0.15, 0.2, 0.15);
   leftArm.rotation.set(0.05, -0.25, -0.05);
-
-  root.alwaysSelectAsActiveMesh = true;
 
   const anim = { active: false, t: 0, duration: 0.18 };
   const base = {
@@ -623,41 +631,33 @@ function createFirstPersonArms(scene, skinUrl) {
     }
   }
 
-  function updatePosition() {
-    if (!enabled) return;
+  function parentToCameraIfPossible() {
+    const cam = getNoaBabylonCamera();
+    if (!cam) return;
 
-    const camPos = getNoaCameraPosition();
-    const rot = getNoaCameraRotation();
-    const heading = rot.heading;
-    const pitch = rot.pitch;
+    root.parent = cam;
 
-    const quat = Quaternion.RotationYawPitchRoll(heading, pitch, 0);
+    // flip just moves root through camera
+    root.position.set(0, 0, flipZ ? -1.0 : 1.0);
 
-    const forwardDist = flipZ ? -0.6 : 0.6;
-    const downDist = -0.3;
-    const rightDist = 0.1;
-
-    const localOffset = new Vector3(rightDist, downDist, forwardDist);
-    const worldOffset = localOffset.rotateByQuaternionToRef(quat, new Vector3());
-
-    root.position.copyFrom(camPos.add(worldOffset));
-    root.rotationQuaternion = quat;
+    applyNoaCameraMask(root);
+    applyNoaCameraMask(rightArm);
+    applyNoaCameraMask(leftArm);
   }
 
   function setEnabled(val) {
     enabled = val;
     root.setEnabled(val);
-
-    // Keep visibility aligned with enabled
     root.isVisible = val;
-
     rightArm.setEnabled(val);
     leftArm.setEnabled(val);
     rightArm.isVisible = val;
     leftArm.isVisible = val;
+
+    if (val) parentToCameraIfPossible();
   }
 
-  console.log("[FPArms] created (manual positioning)");
+  console.log("[FPArms] created (camera-parented)");
 
   return {
     root,
@@ -665,16 +665,18 @@ function createFirstPersonArms(scene, skinUrl) {
     leftArm,
     startSwing,
     updateAnim,
-    updatePosition,
     setEnabled,
     get flipZ() { return flipZ; },
-    set flipZ(v) { flipZ = v; },
+    set flipZ(v) {
+      flipZ = v;
+      if (enabled) root.position.z = flipZ ? -1.0 : 1.0;
+    },
     get enabled() { return enabled; },
   };
 }
 
 /* ============================================================
- * Debug sphere - world space
+ * Debug sphere
  * ============================================================
  */
 
@@ -688,26 +690,29 @@ function createDebugSphere(scene) {
   sphere.isPickable = false;
 
   sphere.alwaysSelectAsActiveMesh = true;
-  sphere.doNotSyncBoundingInfo = false;
   sphere.refreshBoundingInfo();
-  sphere.renderingGroupId = 1;
+  sphere.renderingGroupId = 0;
+
+  applyNoaCameraMask(sphere);
 
   sphere.setEnabled(false);
   sphere.isVisible = false;
 
-  console.log("[DebugSphere] created in world space, renderingGroupId:", sphere.renderingGroupId);
+  console.log("[DebugSphere] created");
   return sphere;
 }
 
-/**
- * Create a solid-color test cube to diagnose rendering issues
+/* ============================================================
+ * Test Cube
+ * ============================================================
  */
+
 function createTestCube(scene) {
   const cube = MeshBuilder.CreateBox("testCube", { size: 2 }, scene);
 
   const mat = new StandardMaterial("testCubeMat", scene);
   mat.diffuseColor = new Color3(1, 0, 0);
-  mat.emissiveColor = new Color3(0.5, 0, 0);
+  mat.emissiveColor = new Color3(0.8, 0, 0);
   mat.specularColor = new Color3(0, 0, 0);
   mat.backFaceCulling = false;
 
@@ -716,15 +721,13 @@ function createTestCube(scene) {
   cube.isVisible = true;
 
   cube.alwaysSelectAsActiveMesh = true;
-  cube.doNotSyncBoundingInfo = false;
   cube.refreshBoundingInfo();
+  cube.renderingGroupId = 0;
 
-  cube.renderingGroupId = 1;
+  applyNoaCameraMask(cube);
 
-  // Put it somewhere visible
   cube.position.set(0, 30, 6);
-
-  console.log("[TestCube] created at (0, 30, 6) - bright red, should be visible!");
+  console.log("[TestCube] created at (0, 30, 6) - should be visible!");
   return cube;
 }
 
@@ -772,7 +775,6 @@ noa.world.on("worldDataNeeded", function (id, data, x, y, z) {
  */
 
 let localAvatarAttached = false;
-let testCube = null;
 
 function initLocalAvatarOnce(scene, playerIdentifier) {
   if (localAvatarAttached) return;
@@ -780,14 +782,12 @@ function initLocalAvatarOnce(scene, playerIdentifier) {
   const skinUrl = getMcHeadsSkinUrl(playerIdentifier);
   console.log("[Skin] URL:", skinUrl);
 
-  // Diagnostics: test cube should ALWAYS be visible if Babylon is rendering
   testCube = createTestCube(scene);
-
   localAvatar = createPlayerAvatar(scene, skinUrl);
   fpArmsRef = createFirstPersonArms(scene, skinUrl);
   debugSphere = createDebugSphere(scene);
 
-  // Attach avatar to player entity using bracket notation
+  // Attach avatar to player entity
   const playerEntity = noa.playerEntity;
   try {
     const entities = noa.entities;
@@ -795,6 +795,7 @@ function initLocalAvatarOnce(scene, playerIdentifier) {
 
     const hasComp = entities["hasComponent"];
     const addComp = entities["addComponent"];
+    const getComp = entities["getComponent"];
 
     if (typeof hasComp === "function" && typeof addComp === "function") {
       if (!hasComp.call(entities, playerEntity, meshCompName)) {
@@ -803,16 +804,22 @@ function initLocalAvatarOnce(scene, playerIdentifier) {
           offset: [0, 0, 0],
         });
         console.log("[Avatar] attached to player entity");
+      } else {
+        // replace mesh if already present
+        if (typeof getComp === "function") {
+          const comp = getComp.call(entities, playerEntity, meshCompName);
+          if (comp && typeof comp === "object" && "mesh" in comp) {
+            comp.mesh = localAvatar.root;
+            console.log("[Avatar] replaced existing mesh component mesh");
+          }
+        }
       }
-    } else {
-      console.warn("[Avatar] hasComponent/addComponent not found, trying direct add");
-      if (typeof addComp === "function") {
-        addComp.call(entities, playerEntity, meshCompName, {
-          mesh: localAvatar.root,
-          offset: [0, 0, 0],
-        });
-        console.log("[Avatar] attached (fallback)");
-      }
+    } else if (typeof addComp === "function") {
+      addComp.call(entities, playerEntity, meshCompName, {
+        mesh: localAvatar.root,
+        offset: [0, 0, 0],
+      });
+      console.log("[Avatar] attached (fallback)");
     }
   } catch (e) {
     console.error("[Avatar] attach failed:", e);
@@ -825,9 +832,7 @@ function initLocalAvatarOnce(scene, playerIdentifier) {
 
     noa.camera.zoomDistance = isFirst ? 0 : 6;
 
-    // Avatar: show only in 3rd person
     const avatarOn = !isFirst;
-
     localAvatar.root.setEnabled(avatarOn);
     localAvatar.root.isVisible = avatarOn;
 
@@ -838,7 +843,6 @@ function initLocalAvatarOnce(scene, playerIdentifier) {
     localAvatar.rightLeg.setEnabled(avatarOn);
     localAvatar.leftLeg.setEnabled(avatarOn);
 
-    // Arms: show only in first person, and optionally require lock
     const armsOn = isFirst && (!armsRequirePointerLock || locked);
     fpArmsRef.setEnabled(armsOn);
 
@@ -854,7 +858,6 @@ function initLocalAvatarOnce(scene, playerIdentifier) {
 
   applyViewModeGlobal = applyViewMode;
   applyViewMode();
-
   document.addEventListener("pointerlockchange", applyViewMode);
 
   localAvatarAttached = true;
@@ -971,10 +974,11 @@ async function connectColyseus() {
 
     const scene = noa.rendering.getScene();
 
-    // Diagnostic logs
     try {
       console.log("[Babylon] scene:", scene && scene.constructor ? scene.constructor.name : "(unknown)");
       console.log("[Babylon] engine:", scene && scene.getEngine ? (scene.getEngine()?.constructor?.name || "(unknown)") : "(no getEngine)");
+      const cam = getNoaBabylonCamera();
+      console.log("[Babylon] noa.rendering.camera:", cam ? cam.constructor?.name : "(null)", "layerMask:", cam && cam.layerMask);
     } catch {}
 
     initLocalAvatarOnce(scene, "Steve");
@@ -1020,8 +1024,18 @@ noa.on("tick", function () {
 });
 
 noa.on("beforeRender", function () {
-  if (fpArmsRef && fpArmsRef.enabled) {
-    fpArmsRef.updatePosition();
+  // Keep test cube always in front of camera so you cannot miss it
+  if (testCube) {
+    const camPos = getNoaCameraPosition();
+    const rot = getNoaCameraRotation();
+    const heading = rot.heading;
+
+    const fx = Math.sin(heading) * 6;
+    const fz = Math.cos(heading) * 6;
+    testCube.position.set(camPos.x + fx, camPos.y, camPos.z + fz);
+
+    debugHUD.state.testCubePos = `${testCube.position.x.toFixed(1)},${testCube.position.y.toFixed(1)},${testCube.position.z.toFixed(1)}`;
+    debugHUD.state.testCubeOn = testCube.isEnabled();
   }
 
   if (debugSphere && debugSphereOn) {
@@ -1040,17 +1054,11 @@ noa.on("beforeRender", function () {
   if (localAvatar) {
     const pos = localAvatar.root.position;
     debugHUD.state.avatarPos = `${pos.x.toFixed(1)},${pos.y.toFixed(1)},${pos.z.toFixed(1)}`;
-
-    if (localAvatar.head) {
-      localAvatar.head.computeWorldMatrix(true);
-      const worldPos = localAvatar.head.getAbsolutePosition();
-      debugHUD.state.avatarPos += ` head@${worldPos.x.toFixed(1)},${worldPos.y.toFixed(1)},${worldPos.z.toFixed(1)}`;
-    }
   }
 
   if (fpArmsRef) {
-    const pos = fpArmsRef.root.position;
-    debugHUD.state.armsPos = `${pos.x.toFixed(1)},${pos.y.toFixed(1)},${pos.z.toFixed(1)}`;
+    const abs = fpArmsRef.root.getAbsolutePosition ? fpArmsRef.root.getAbsolutePosition() : fpArmsRef.root.position;
+    debugHUD.state.armsPos = `${abs.x.toFixed(1)},${abs.y.toFixed(1)},${abs.z.toFixed(1)}`;
   }
 
   const camPos = getNoaCameraPosition();
