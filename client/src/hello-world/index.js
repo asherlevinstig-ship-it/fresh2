@@ -427,6 +427,16 @@ function createPlayerAvatar(scene, skinUrl) {
     mesh.parent = root;
     mesh.isVisible = true;
     mesh.isPickable = false;
+    
+    // CRITICAL: Disable frustum culling - noa's camera might have weird bounds
+    mesh.alwaysSelectAsActiveMesh = true;
+    // Force mesh to never be culled
+    mesh.doNotSyncBoundingInfo = false;
+    mesh.refreshBoundingInfo();
+    
+    // Render AFTER terrain
+    mesh.renderingGroupId = 1;
+    
     return mesh;
   }
 
@@ -450,6 +460,9 @@ function createPlayerAvatar(scene, skinUrl) {
   const armY = limbSize.height + bodySize.height - limbSize.height / 2;
   rightArm.position.set(-(bodySize.width / 2 + limbSize.width / 2), armY, 0);
   leftArm.position.set(bodySize.width / 2 + limbSize.width / 2, armY, 0);
+
+  // Also set on root
+  root.alwaysSelectAsActiveMesh = true;
 
   console.log("[Avatar] created with 6 parts");
 
@@ -479,12 +492,16 @@ function createFirstPersonArms(scene, skinUrl) {
   rightArm.parent = root;
   rightArm.isVisible = true;
   rightArm.isPickable = false;
+  rightArm.alwaysSelectAsActiveMesh = true;
+  rightArm.renderingGroupId = 1;
 
   const leftArm = MeshBuilder.CreateBox("fp-leftArm", { width: armSize.width, height: armSize.height, depth: armSize.depth, faceUV: armUV }, scene);
   leftArm.material = mat;
   leftArm.parent = root;
   leftArm.isVisible = true;
   leftArm.isPickable = false;
+  leftArm.alwaysSelectAsActiveMesh = true;
+  leftArm.renderingGroupId = 1;
 
   const rightArmOffset = new Vector3(0.45, -0.35, 0.55);
   const leftArmOffset = new Vector3(-0.35, -0.40, 0.50);
@@ -494,6 +511,8 @@ function createFirstPersonArms(scene, skinUrl) {
 
   rightArm.rotation.set(0.15, 0.2, 0.15);
   leftArm.rotation.set(0.05, -0.25, -0.05);
+
+  root.alwaysSelectAsActiveMesh = true;
 
   const anim = { active: false, t: 0, duration: 0.18 };
   const base = {
@@ -590,10 +609,54 @@ function createDebugSphere(scene) {
   mat.backFaceCulling = false;
   sphere.material = mat;
   sphere.isPickable = false;
+  
+  // CRITICAL: Disable frustum culling
+  sphere.alwaysSelectAsActiveMesh = true;
+  sphere.doNotSyncBoundingInfo = false;
+  sphere.refreshBoundingInfo();
+  sphere.renderingGroupId = 1;
+  
   sphere.setEnabled(false);
 
-  console.log("[DebugSphere] created in world space");
+  console.log("[DebugSphere] created in world space, renderingGroupId:", sphere.renderingGroupId);
   return sphere;
+}
+
+/**
+ * Create a simple solid-color test cube to diagnose rendering issues
+ */
+function createTestCube(scene) {
+  // Create a simple box with NO texture, just solid color
+  const cube = MeshBuilder.CreateBox("testCube", { size: 2 }, scene);
+  
+  const mat = new StandardMaterial("testCubeMat", scene);
+  mat.diffuseColor = new Color3(1, 0, 0); // Bright red
+  mat.emissiveColor = new Color3(0.5, 0, 0); // Glow so it's visible in shadow
+  mat.specularColor = new Color3(0, 0, 0);
+  mat.backFaceCulling = false;
+  
+  cube.material = mat;
+  cube.isPickable = false;
+  cube.isVisible = true;
+  
+  // Frustum culling fixes
+  cube.alwaysSelectAsActiveMesh = true;
+  cube.doNotSyncBoundingInfo = false;
+  cube.refreshBoundingInfo();
+  
+  // Try rendering AFTER terrain (group 1 instead of default 0)
+  cube.renderingGroupId = 1;
+  
+  // Position it at a fixed world location, high above terrain
+  cube.position.set(0, 15, 0);
+  
+  console.log("[TestCube] created at (0, 15, 0) - bright red, should be visible!");
+  console.log("[TestCube] isVisible:", cube.isVisible, "isEnabled:", cube.isEnabled());
+  console.log("[TestCube] material:", cube.material?.name);
+  console.log("[TestCube] position:", cube.position.toString());
+  console.log("[TestCube] renderingGroupId:", cube.renderingGroupId);
+  
+  return cube;
 }
 
 /* ============================================================
@@ -640,12 +703,16 @@ noa.world.on("worldDataNeeded", function (id, data, x, y, z) {
  */
 
 let localAvatarAttached = false;
+let testCube = null;
 
 function initLocalAvatarOnce(scene, playerIdentifier) {
   if (localAvatarAttached) return;
 
   const skinUrl = getMcHeadsSkinUrl(playerIdentifier);
   console.log("[Skin] URL:", skinUrl);
+
+  // Create a simple test cube first - this will help diagnose rendering issues
+  testCube = createTestCube(scene);
 
   localAvatar = createPlayerAvatar(scene, skinUrl);
   fpArmsRef = createFirstPersonArms(scene, skinUrl);
@@ -889,6 +956,13 @@ noa.on("beforeRender", function () {
   if (localAvatar) {
     const pos = localAvatar.root.position;
     debugHUD.state.avatarPos = `${pos.x.toFixed(1)},${pos.y.toFixed(1)},${pos.z.toFixed(1)}`;
+    
+    // Log absolute world position of head to see where it actually is
+    if (localAvatar.head) {
+      localAvatar.head.computeWorldMatrix(true);
+      const worldPos = localAvatar.head.getAbsolutePosition();
+      debugHUD.state.avatarPos += ` head@${worldPos.x.toFixed(1)},${worldPos.y.toFixed(1)},${worldPos.z.toFixed(1)}`;
+    }
   }
   if (fpArmsRef) {
     const pos = fpArmsRef.root.position;
