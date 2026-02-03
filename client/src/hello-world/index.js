@@ -1,19 +1,21 @@
 /*
- * Fresh2 - noa hello-world (main game entry) - DIAGNOSTIC BASELINE
+ * Fresh2 - noa hello-world - Babylon runtime probe + pinned mesh
  *
- * Purpose:
- * - Run Babylon identity probe to detect duplicate Babylon runtimes.
- * - Create a pinned emissive sphere always in front of the NOA camera.
- * - Keep NOA voxel world generation.
- * - Keep Colyseus connect (optional).
+ * This file is designed to verify:
+ * - You are running a SINGLE Babylon runtime (v6.x) across NOA + your code
+ * - A diagnostic sphere renders in front of the camera
  *
- * If the sphere doesn't appear AND the probe shows mismatched Babylon instances,
- * you must dedupe Babylon in Vite (resolve.dedupe) and remove @babylonjs/* packages.
+ * IMPORTANT:
+ * - Requires: @babylonjs/core@6.49.0
+ * - Must NOT have: babylonjs (UMD) installed (that was v5.57.1 in your probe)
  */
 
 import { Engine } from "noa-engine";
 import { Client } from "@colyseus/sdk";
-import * as BABYLON from "babylonjs";
+
+import { MeshBuilder } from "@babylonjs/core/Meshes/meshBuilder";
+import { StandardMaterial } from "@babylonjs/core/Materials/standardMaterial";
+import { Color3 } from "@babylonjs/core/Maths/math.color";
 
 /* ============================================================
  * NOA init
@@ -29,7 +31,7 @@ const noa = new Engine({
 });
 
 /* ============================================================
- * Simple world
+ * World
  * ============================================================
  */
 
@@ -61,7 +63,7 @@ noa.world.on("worldDataNeeded", function (id, data, x, y, z) {
 });
 
 /* ============================================================
- * Helpers: access NOA scene + camera safely in JS
+ * Helpers: NOA scene/camera access
  * ============================================================
  */
 
@@ -76,61 +78,44 @@ function getNoaSceneAny() {
 function getNoaCameraAny() {
   try {
     const r = /** @type {any} */ (noa).rendering;
-    // In noa-engine v0.33.0, rendering.camera exists
-    if (r && r.camera) return r.camera;
+    return r && r.camera ? r.camera : null;
   } catch {}
   return null;
 }
 
 /* ============================================================
- * Babylon identity probe (detect duplicate runtimes)
+ * Babylon identity probe
  * ============================================================
  */
 
-function probeBabylonIdentity() {
+function probeBabylonIdentityV6() {
   const scene = getNoaSceneAny();
   const cam = getNoaCameraAny();
   const engine = scene && typeof scene.getEngine === "function" ? scene.getEngine() : null;
 
   console.log("========================================");
-  console.log("[Probe] START Babylon identity probe");
-  console.log("[Probe] imported BABYLON.Engine.Version =", BABYLON && BABYLON.Engine ? BABYLON.Engine.Version : "(missing)");
-
+  console.log("[Probe] START Babylon identity probe (core v6 expected)");
   console.log("[Probe] NOA scene exists?", !!scene);
   console.log("[Probe] NOA camera exists?", !!cam, "cameraType:", cam && cam.constructor ? cam.constructor.name : "(none)");
   console.log("[Probe] scene.constructor?.name =", scene && scene.constructor ? scene.constructor.name : "(none)");
   console.log("[Probe] engine.constructor?.name =", engine && engine.constructor ? engine.constructor.name : "(none)");
 
-  // Try to detect global BABYLON (sometimes present depending on build)
+  // If babylonjs UMD is still installed, it may set a global BABYLON (often v5)
   const globalB = /** @type {any} */ (globalThis).BABYLON;
   console.log("[Probe] globalThis.BABYLON exists?", !!globalB);
   if (globalB && globalB.Engine) {
     console.log("[Probe] global BABYLON.Engine.Version =", globalB.Engine.Version);
-    console.log("[Probe] imported BABYLON === global BABYLON ?", globalB === BABYLON);
   }
 
-  // Create a mesh using imported BABYLON, on NOA's scene
+  // Create a probe mesh using @babylonjs/core (MeshBuilder import)
   if (scene) {
     try {
-      const m = BABYLON.MeshBuilder.CreateBox("probeBox", { size: 1 }, scene);
-      console.log("[Probe] created mesh via imported BABYLON:", m && m.name);
-
-      // instanceof checks are strong evidence of single vs duplicate Babylon
-      const okImported = m instanceof BABYLON.AbstractMesh;
-      console.log("[Probe] m instanceof imported BABYLON.AbstractMesh =", okImported);
-
-      if (globalB && globalB.AbstractMesh) {
-        const okGlobal = m instanceof globalB.AbstractMesh;
-        console.log("[Probe] m instanceof global BABYLON.AbstractMesh =", okGlobal);
-      }
-
-      // scene ownership check
+      const m = MeshBuilder.CreateBox("probeBox", { size: 1 }, scene);
+      console.log("[Probe] created mesh via @babylonjs/core MeshBuilder:", m && m.name);
       console.log("[Probe] m.getScene() === scene =", m.getScene && m.getScene() === scene);
-
-      // clean up probe mesh quickly
       m.dispose(false, true);
     } catch (e) {
-      console.warn("[Probe] mesh creation failed:", e);
+      console.warn("[Probe] probe mesh creation failed:", e);
     }
   }
 
@@ -139,17 +124,17 @@ function probeBabylonIdentity() {
 }
 
 /* ============================================================
- * Visual diagnostic mesh (always in front of camera)
+ * Visual diagnostic sphere (pinned in front of camera)
  * ============================================================
  */
 
 let diagBall = null;
 
 function makeDiagBall(scene) {
-  const ball = BABYLON.MeshBuilder.CreateSphere("diagBall", { diameter: 2.5 }, scene);
+  const ball = MeshBuilder.CreateSphere("diagBall", { diameter: 2.5 }, scene);
 
-  const mat = new BABYLON.StandardMaterial("diagBallMat", scene);
-  mat.emissiveColor = new BABYLON.Color3(0, 1, 1); // bright cyan
+  const mat = new StandardMaterial("diagBallMat", scene);
+  mat.emissiveColor = new Color3(0, 1, 1); // cyan glow
   mat.disableLighting = true;
   mat.alpha = 1;
 
@@ -160,28 +145,27 @@ function makeDiagBall(scene) {
   ball.visibility = 1;
   ball.setEnabled(true);
 
-  // ensure it renders with the camera layer mask (belt-and-braces)
-  try {
-    ball.layerMask = 0x0fffffff;
-    if (scene.activeCamera) scene.activeCamera.layerMask = 0x0fffffff;
-  } catch {}
+  // keep rendering simple
+  ball.renderingGroupId = 0;
 
   console.log("[Diag] ball created");
   return ball;
 }
 
-function stickInFrontOfCamera(scene, cam, mesh, dist) {
+function stickInFrontOfCamera(cam, mesh, dist) {
+  // Critical: avoid constructing our own Vector3 from a different runtime.
+  // getForwardRay returns runtime-native direction vectors.
   try {
-    // Forward direction (Babylon cameras face +Z in local space)
-    const forward = cam.getDirection(new BABYLON.Vector3(0, 0, 1));
-    mesh.position.copyFrom(cam.position.add(forward.scale(dist)));
+    const ray = cam.getForwardRay(dist);
+    const p = ray.origin.add(ray.direction.scale(dist));
+    mesh.position.copyFrom(p);
   } catch (e) {
     console.warn("[Diag] stickInFrontOfCamera failed:", e);
   }
 }
 
 /* ============================================================
- * Run probe once scene exists, then maintain diagnostic ball
+ * Run probe once, pin sphere every frame
  * ============================================================
  */
 
@@ -192,12 +176,11 @@ noa.on("beforeRender", function () {
   const cam = getNoaCameraAny();
   if (!scene || !cam) return;
 
-  // Run identity probe once (first frame where scene+cam exist)
   if (!probed) {
     probed = true;
-    probeBabylonIdentity();
+    probeBabylonIdentityV6();
 
-    // Make camera clip planes generous (prevents clipping surprises)
+    // widen clip planes (avoid surprise clipping)
     try {
       if (scene.activeCamera) {
         scene.activeCamera.minZ = 0.01;
@@ -206,13 +189,12 @@ noa.on("beforeRender", function () {
     } catch {}
   }
 
-  // Create + pin the diagnostic sphere every frame
   if (!diagBall) diagBall = makeDiagBall(scene);
-  stickInFrontOfCamera(scene, cam, diagBall, 6);
+  stickInFrontOfCamera(cam, diagBall, 6);
 });
 
 /* ============================================================
- * Colyseus (keep minimal, no message spam)
+ * Colyseus (minimal)
  * ============================================================
  */
 
@@ -249,10 +231,6 @@ async function debugMatchmake(endpointWsOrHttp) {
   try {
     const room = await colyseusClient.joinOrCreate("my_room", { name: "Steve" });
     console.log("[Colyseus] connected, session:", room.sessionId);
-
-    // Avoid the "welcome not registered" warning by not subscribing to "*"
-    // You can register specific messages when you actually use them:
-    // room.onMessage("someType", (msg) => { ... });
 
     room.onLeave(() => console.warn("[Colyseus] left"));
   } catch (e) {
