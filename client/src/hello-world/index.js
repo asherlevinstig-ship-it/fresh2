@@ -1,15 +1,29 @@
 /*
- * Fresh2 - noa hello-world (main game entry) - FIXED V3
+ * Fresh2 - noa hello-world (main game entry) - FIXED V4
  *
- * Fixes:
- * - Proper TypeScript casts using `as unknown as`
- * - noa.entities methods accessed via bracket notation to avoid TS errors
- * - Manual arm positioning instead of camera parenting
+ * Changes included:
+ * - FIX: Avatar + FP arms were never visible because parent roots had `isVisible = false`
+ *        (in Babylon, a parent with isVisible=false hides all children)
+ * - Roots now start disabled via `setEnabled(false)` instead of invisible
+ * - Arms can optionally show in first-person even when not pointer-locked (debug toggle)
+ * - Minor safety: make sure root visibility tracks enable state
+ *
+ * Note on NOA/Babylon “compatibility”:
+ * - If you still see nothing AFTER this, it’s very likely you have two Babylon instances
+ *   (NOA using one, your app importing another). In that case, dedupe Babylon in your bundler
+ *   or standardize imports (see comment near imports).
  */
 
 import { Engine } from "noa-engine";
 import { Client } from "@colyseus/sdk";
 
+/**
+ * ⚠️ If you still get “ghost meshes” after this fix, consider switching to a single Babylon import:
+ *   - Option A: `import * as BABYLON from "babylonjs";` and use BABYLON.MeshBuilder, etc
+ *   - Option B (Vite): resolve.dedupe for @babylonjs/* so only one copy exists.
+ *
+ * For now, keeping your @babylonjs/core imports but fixing the visibility bug.
+ */
 import { MeshBuilder } from "@babylonjs/core/Meshes/meshBuilder";
 import { Mesh } from "@babylonjs/core/Meshes/mesh";
 import { Texture } from "@babylonjs/core/Materials/Textures/texture";
@@ -40,12 +54,18 @@ const noa = new Engine(opts);
 let viewMode = 0; // 0 first, 1 third-back, 2 third-front
 let forceCrosshair = false;
 
-let applyViewModeGlobal = null;
+/**
+ * Debug toggle: allow arms to show in first-person even when not pointer locked.
+ * Helpful for diagnosing pointer-lock issues. Toggle with F9.
+ */
+let armsRequirePointerLock = true;
 
-let fpArmsRef = null;
-let localAvatar = null;
+let applyViewModeGlobal: null | (() => void) = null;
 
-let debugSphere = null;
+let fpArmsRef: any = null;
+let localAvatar: any = null;
+
+let debugSphere: any = null;
 let debugSphereOn = false;
 
 /* ============================================================
@@ -53,11 +73,11 @@ let debugSphereOn = false;
  * ============================================================
  */
 
-function safeNum(v, fallback = 0) {
+function safeNum(v: any, fallback = 0) {
   return typeof v === "number" && Number.isFinite(v) ? v : fallback;
 }
 
-function clamp(v, a, b) {
+function clamp(v: number, a: number, b: number) {
   return Math.max(a, Math.min(b, v));
 }
 
@@ -71,7 +91,7 @@ function clamp(v, a, b) {
  */
 function getPointerLockTarget() {
   // noa.container is the #noa-container div
-  const noaAny = noa;
+  const noaAny = noa as any;
   const c = noaAny.container;
   if (c && typeof c === "object" && "requestPointerLock" in c) {
     return c;
@@ -112,7 +132,7 @@ function createDebugHUD() {
   });
   document.body.appendChild(el);
 
-  const state = {
+  const state: any = {
     viewMode: 0,
     locked: false,
 
@@ -125,6 +145,7 @@ function createDebugHUD() {
 
     armsEnabled: false,
     armsPos: "(none)",
+    armsRequireLock: true,
 
     debugSphere: false,
     debugSpherePos: "(none)",
@@ -136,18 +157,18 @@ function createDebugHUD() {
 
   function render() {
     el.textContent =
-      `Fresh2 Debug V3\n` +
+      `Fresh2 Debug V4\n` +
       `viewMode: ${state.viewMode} (${state.viewMode === 0 ? "first" : state.viewMode === 1 ? "third-back" : "third-front"})\n` +
       `locked: ${state.locked}\n` +
       `camPos: ${state.camPos}\n` +
       `camHeading: ${state.camHeading.toFixed(2)} pitch: ${state.camPitch.toFixed(2)}\n` +
       `avatar: enabled=${state.avatarEnabled} pos=${state.avatarPos}\n` +
-      `arms: enabled=${state.armsEnabled} pos=${state.armsPos}\n` +
+      `arms: enabled=${state.armsEnabled} pos=${state.armsPos} (requireLock=${state.armsRequireLock})\n` +
       `debugSphere (F8): ${state.debugSphere} pos=${state.debugSpherePos}\n` +
       `crosshair: ${state.crosshair}\n` +
       `last: ${state.last}\n` +
       `error: ${state.lastError}\n` +
-      `\nKeys: F5 view | F6 crosshair | F7 flip arms | F8 debug sphere\n`;
+      `\nKeys: F5 view | F6 crosshair | F7 flip arms | F8 debug sphere | F9 arms lock toggle\n`;
   }
 
   return { el, state, render };
@@ -177,7 +198,7 @@ function createCrosshairOverlay() {
     justifyContent: "center",
   });
 
-  const lineStyle = {
+  const lineStyle: any = {
     position: "absolute",
     backgroundColor: "rgba(255,255,255,0.95)",
     boxShadow: "0px 0px 3px rgba(0,0,0,0.95)",
@@ -220,26 +241,27 @@ const crosshairUI = createCrosshairOverlay();
     const target = getPointerLockTarget();
     if (!target) return;
     clearInterval(interval);
-    
-    // Cast to any to avoid TS errors with noa's Container type
-    const el = target;
-    if (typeof el.hasAttribute === 'function' && !el.hasAttribute("tabindex")) {
+
+    const el = target as any;
+
+    if (typeof el.hasAttribute === "function" && !el.hasAttribute("tabindex")) {
       el.setAttribute("tabindex", "1");
     }
     if (el.style) {
       el.style.outline = "none";
     }
-    
+
     el.addEventListener("click", () => {
       try {
         if (viewMode !== 0) return;
         if (document.pointerLockElement !== el) {
           el.requestPointerLock();
         }
-      } catch (e) {
-        debugHUD.state.lastError = String((e && typeof e === 'object' && 'message' in e) ? e.message : e);
+      } catch (e: any) {
+        debugHUD.state.lastError = String(e?.message || e);
       }
     });
+
     console.log("[PointerLock] handler attached");
   }, 100);
 })();
@@ -256,27 +278,27 @@ function getNoaCameraPosition() {
       return new Vector3(pos[0], pos[1], pos[2]);
     }
   } catch {}
-  
+
   // Fallback: player position + eye offset
   try {
-    const ent = noa.playerEntity;
-    const pos = noa.entities.getPosition(ent);
+    const ent = (noa as any).playerEntity;
+    const pos = (noa as any).entities.getPosition(ent);
     if (pos && pos.length >= 3) {
       return new Vector3(pos[0], pos[1] + 1.6, pos[2]);
     }
   } catch {}
-  
+
   return new Vector3(0, 10, 0);
 }
 
 function getNoaCameraRotation() {
-  const heading = safeNum(noa.camera.heading, 0);
-  const pitch = safeNum(noa.camera.pitch, 0);
+  const heading = safeNum((noa as any).camera.heading, 0);
+  const pitch = safeNum((noa as any).camera.pitch, 0);
   return { heading, pitch };
 }
 
 /* ============================================================
- * Key handlers: F5/F6/F7/F8
+ * Key handlers: F5/F6/F7/F8/F9
  * ============================================================
  */
 
@@ -285,9 +307,13 @@ document.addEventListener("keydown", (e) => {
     e.preventDefault();
     viewMode = (viewMode + 1) % 3;
     if (viewMode !== 0) {
-      try { document.exitPointerLock?.(); } catch {}
+      try {
+        (document as any).exitPointerLock?.();
+      } catch {}
     }
-    try { if (typeof applyViewModeGlobal === "function") applyViewModeGlobal(); } catch {}
+    try {
+      if (typeof applyViewModeGlobal === "function") applyViewModeGlobal();
+    } catch {}
     crosshairUI.refresh();
     console.log("[View] mode:", viewMode);
   }
@@ -311,10 +337,23 @@ document.addEventListener("keydown", (e) => {
     debugSphereOn = !debugSphereOn;
     if (debugSphere) {
       debugSphere.setEnabled(debugSphereOn);
+      debugSphere.isVisible = debugSphereOn;
     }
     debugHUD.state.debugSphere = debugSphereOn;
     debugHUD.render();
     console.log("[Debug] sphere:", debugSphereOn);
+  }
+
+  if (e.code === "F9") {
+    e.preventDefault();
+    armsRequirePointerLock = !armsRequirePointerLock;
+    debugHUD.state.armsRequireLock = armsRequirePointerLock;
+    debugHUD.state.last = "toggle armsRequirePointerLock";
+    debugHUD.render();
+    try {
+      if (typeof applyViewModeGlobal === "function") applyViewModeGlobal();
+    } catch {}
+    console.log("[Debug] armsRequirePointerLock:", armsRequirePointerLock);
   }
 });
 
@@ -325,17 +364,17 @@ document.addEventListener("keydown", (e) => {
 
 const DEFAULT_LOCAL_ENDPOINT = "ws://localhost:2567";
 let COLYSEUS_ENDPOINT =
-  import.meta.env && import.meta.env.VITE_COLYSEUS_ENDPOINT
-    ? import.meta.env.VITE_COLYSEUS_ENDPOINT
+  (import.meta as any).env && (import.meta as any).env.VITE_COLYSEUS_ENDPOINT
+    ? (import.meta as any).env.VITE_COLYSEUS_ENDPOINT
     : DEFAULT_LOCAL_ENDPOINT;
 
-function toHttpEndpoint(wsEndpoint) {
+function toHttpEndpoint(wsEndpoint: string) {
   if (wsEndpoint.startsWith("wss://")) return wsEndpoint.replace("wss://", "https://");
   if (wsEndpoint.startsWith("ws://")) return wsEndpoint.replace("ws://", "http://");
   return wsEndpoint;
 }
 
-async function debugMatchmake(endpointWsOrHttp) {
+async function debugMatchmake(endpointWsOrHttp: string) {
   const http = toHttpEndpoint(endpointWsOrHttp);
   console.log("[Colyseus][debug] http endpoint:", http);
   try {
@@ -347,7 +386,7 @@ async function debugMatchmake(endpointWsOrHttp) {
 }
 
 const colyseusClient = new Client(COLYSEUS_ENDPOINT);
-const noaAny = noa;
+const noaAny = noa as any;
 noaAny.colyseus = { endpoint: COLYSEUS_ENDPOINT, client: colyseusClient, room: null };
 
 /* ============================================================
@@ -355,7 +394,7 @@ noaAny.colyseus = { endpoint: COLYSEUS_ENDPOINT, client: colyseusClient, room: n
  * ============================================================
  */
 
-function getMcHeadsSkinUrl(identifier) {
+function getMcHeadsSkinUrl(identifier: string) {
   return `https://mc-heads.net/skin/${encodeURIComponent(identifier)}.png`;
 }
 
@@ -364,16 +403,17 @@ function getMcHeadsSkinUrl(identifier) {
  * ============================================================
  */
 
-function uvRect(px, py, pw, ph) {
-  const texW = 64, texH = 64;
+function uvRect(px: number, py: number, pw: number, ph: number) {
+  const texW = 64,
+    texH = 64;
   return new Vector4(px / texW, py / texH, (px + pw) / texW, (py + ph) / texH);
 }
 
-function makeFaceUV(front, back, right, left, top, bottom) {
+function makeFaceUV(front: Vector4, back: Vector4, right: Vector4, left: Vector4, top: Vector4, bottom: Vector4) {
   return [front, back, right, left, top, bottom];
 }
 
-function createSkinMaterial(scene, skinUrl, name) {
+function createSkinMaterial(scene: any, skinUrl: string, name: string) {
   const skinTexture = new Texture(skinUrl, scene, false, false, Texture.NEAREST_NEAREST);
   skinTexture.hasAlpha = true;
   skinTexture.wrapU = Texture.CLAMP_ADDRESSMODE;
@@ -394,49 +434,72 @@ function createSkinMaterial(scene, skinUrl, name) {
  * ============================================================
  */
 
-function createPlayerAvatar(scene, skinUrl) {
+function createPlayerAvatar(scene: any, skinUrl: string) {
   const root = new Mesh("mc-avatar-root", scene);
-  root.isVisible = false;
+
+  // ✅ FIX: Do NOT set root.isVisible=false (it hides children). Start disabled instead.
+  root.isVisible = true;
+  root.isPickable = false;
+  root.setEnabled(false);
 
   const mat = createSkinMaterial(scene, skinUrl, "mc-skin-mat");
 
   const headUV = makeFaceUV(
-    uvRect(8, 8, 8, 8), uvRect(24, 8, 8, 8), uvRect(16, 8, 8, 8),
-    uvRect(0, 8, 8, 8), uvRect(8, 0, 8, 8), uvRect(16, 0, 8, 8)
+    uvRect(8, 8, 8, 8),
+    uvRect(24, 8, 8, 8),
+    uvRect(16, 8, 8, 8),
+    uvRect(0, 8, 8, 8),
+    uvRect(8, 0, 8, 8),
+    uvRect(16, 0, 8, 8)
   );
   const bodyUV = makeFaceUV(
-    uvRect(20, 20, 8, 12), uvRect(32, 20, 8, 12), uvRect(28, 20, 4, 12),
-    uvRect(16, 20, 4, 12), uvRect(20, 16, 8, 4), uvRect(28, 16, 8, 4)
+    uvRect(20, 20, 8, 12),
+    uvRect(32, 20, 8, 12),
+    uvRect(28, 20, 4, 12),
+    uvRect(16, 20, 4, 12),
+    uvRect(20, 16, 8, 4),
+    uvRect(28, 16, 8, 4)
   );
   const armUV = makeFaceUV(
-    uvRect(44, 20, 4, 12), uvRect(52, 20, 4, 12), uvRect(48, 20, 4, 12),
-    uvRect(40, 20, 4, 12), uvRect(44, 16, 4, 4), uvRect(48, 16, 4, 4)
+    uvRect(44, 20, 4, 12),
+    uvRect(52, 20, 4, 12),
+    uvRect(48, 20, 4, 12),
+    uvRect(40, 20, 4, 12),
+    uvRect(44, 16, 4, 4),
+    uvRect(48, 16, 4, 4)
   );
   const legUV = makeFaceUV(
-    uvRect(4, 20, 4, 12), uvRect(12, 20, 4, 12), uvRect(8, 20, 4, 12),
-    uvRect(0, 20, 4, 12), uvRect(4, 16, 4, 4), uvRect(8, 16, 4, 4)
+    uvRect(4, 20, 4, 12),
+    uvRect(12, 20, 4, 12),
+    uvRect(8, 20, 4, 12),
+    uvRect(0, 20, 4, 12),
+    uvRect(4, 16, 4, 4),
+    uvRect(8, 16, 4, 4)
   );
 
   const headSize = { width: 1.0, height: 1.0, depth: 1.0 };
   const bodySize = { width: 1.0, height: 1.5, depth: 0.5 };
   const limbSize = { width: 0.5, height: 1.5, depth: 0.5 };
 
-  function makePart(name, size, uv) {
-    const mesh = MeshBuilder.CreateBox(name, { width: size.width, height: size.height, depth: size.depth, faceUV: uv }, scene);
+  function makePart(name: string, size: any, uv: any) {
+    const mesh = MeshBuilder.CreateBox(
+      name,
+      { width: size.width, height: size.height, depth: size.depth, faceUV: uv },
+      scene
+    );
     mesh.material = mat;
     mesh.parent = root;
     mesh.isVisible = true;
     mesh.isPickable = false;
-    
-    // CRITICAL: Disable frustum culling - noa's camera might have weird bounds
+
+    // Help avoid odd culling
     mesh.alwaysSelectAsActiveMesh = true;
-    // Force mesh to never be culled
     mesh.doNotSyncBoundingInfo = false;
     mesh.refreshBoundingInfo();
-    
+
     // Render AFTER terrain
     mesh.renderingGroupId = 1;
-    
+
     return mesh;
   }
 
@@ -461,11 +524,9 @@ function createPlayerAvatar(scene, skinUrl) {
   rightArm.position.set(-(bodySize.width / 2 + limbSize.width / 2), armY, 0);
   leftArm.position.set(bodySize.width / 2 + limbSize.width / 2, armY, 0);
 
-  // Also set on root
   root.alwaysSelectAsActiveMesh = true;
 
   console.log("[Avatar] created with 6 parts");
-
   return { root, head, body, rightArm, leftArm, rightLeg, leftLeg, material: mat };
 }
 
@@ -474,20 +535,32 @@ function createPlayerAvatar(scene, skinUrl) {
  * ============================================================
  */
 
-function createFirstPersonArms(scene, skinUrl) {
+function createFirstPersonArms(scene: any, skinUrl: string) {
   const root = new Mesh("fp-arms-root", scene);
-  root.isVisible = false;
+
+  // ✅ FIX: Do NOT set root.isVisible=false (it hides children). Start disabled instead.
+  root.isVisible = true;
+  root.isPickable = false;
+  root.setEnabled(false);
 
   const mat = createSkinMaterial(scene, skinUrl, "fp-skin-mat");
 
   const armUV = makeFaceUV(
-    uvRect(44, 20, 4, 12), uvRect(52, 20, 4, 12), uvRect(48, 20, 4, 12),
-    uvRect(40, 20, 4, 12), uvRect(44, 16, 4, 4), uvRect(48, 16, 4, 4)
+    uvRect(44, 20, 4, 12),
+    uvRect(52, 20, 4, 12),
+    uvRect(48, 20, 4, 12),
+    uvRect(40, 20, 4, 12),
+    uvRect(44, 16, 4, 4),
+    uvRect(48, 16, 4, 4)
   );
 
   const armSize = { width: 0.35, height: 0.9, depth: 0.35 };
 
-  const rightArm = MeshBuilder.CreateBox("fp-rightArm", { width: armSize.width, height: armSize.height, depth: armSize.depth, faceUV: armUV }, scene);
+  const rightArm = MeshBuilder.CreateBox(
+    "fp-rightArm",
+    { width: armSize.width, height: armSize.height, depth: armSize.depth, faceUV: armUV },
+    scene
+  );
   rightArm.material = mat;
   rightArm.parent = root;
   rightArm.isVisible = true;
@@ -495,7 +568,11 @@ function createFirstPersonArms(scene, skinUrl) {
   rightArm.alwaysSelectAsActiveMesh = true;
   rightArm.renderingGroupId = 1;
 
-  const leftArm = MeshBuilder.CreateBox("fp-leftArm", { width: armSize.width, height: armSize.height, depth: armSize.depth, faceUV: armUV }, scene);
+  const leftArm = MeshBuilder.CreateBox(
+    "fp-leftArm",
+    { width: armSize.width, height: armSize.height, depth: armSize.depth, faceUV: armUV },
+    scene
+  );
   leftArm.material = mat;
   leftArm.parent = root;
   leftArm.isVisible = true;
@@ -516,8 +593,12 @@ function createFirstPersonArms(scene, skinUrl) {
 
   const anim = { active: false, t: 0, duration: 0.18 };
   const base = {
-    rx: rightArm.rotation.x, ry: rightArm.rotation.y, rz: rightArm.rotation.z,
-    lx: leftArm.rotation.x, ly: leftArm.rotation.y, lz: leftArm.rotation.z,
+    rx: rightArm.rotation.x,
+    ry: rightArm.rotation.y,
+    rz: rightArm.rotation.z,
+    lx: leftArm.rotation.x,
+    ly: leftArm.rotation.y,
+    lz: leftArm.rotation.z,
   };
 
   let enabled = false;
@@ -528,11 +609,11 @@ function createFirstPersonArms(scene, skinUrl) {
     anim.t = 0;
   }
 
-  function easeInOutQuad(x) {
+  function easeInOutQuad(x: number) {
     return x < 0.5 ? 2 * x * x : 1 - Math.pow(-2 * x + 2, 2) / 2;
   }
 
-  function updateAnim(dt) {
+  function updateAnim(dt: number) {
     if (!anim.active) return;
     anim.t += dt;
     const p = clamp(anim.t / anim.duration, 0, 1);
@@ -559,7 +640,6 @@ function createFirstPersonArms(scene, skinUrl) {
 
     const camPos = getNoaCameraPosition();
     const { heading, pitch } = getNoaCameraRotation();
-
     const quat = Quaternion.RotationYawPitchRoll(heading, pitch, 0);
 
     const forwardDist = flipZ ? -0.6 : 0.6;
@@ -573,15 +653,19 @@ function createFirstPersonArms(scene, skinUrl) {
     root.rotationQuaternion = quat;
   }
 
-  function setEnabled(val) {
+  function setEnabled(val: boolean) {
     enabled = val;
     root.setEnabled(val);
+
+    // Keep visibility aligned with enabled (helps avoid accidental invisibility)
+    root.isVisible = val;
     rightArm.setEnabled(val);
     leftArm.setEnabled(val);
+    rightArm.isVisible = val;
+    leftArm.isVisible = val;
   }
 
   console.log("[FPArms] created (manual positioning)");
-
   return {
     root,
     rightArm,
@@ -590,9 +674,15 @@ function createFirstPersonArms(scene, skinUrl) {
     updateAnim,
     updatePosition,
     setEnabled,
-    get flipZ() { return flipZ; },
-    set flipZ(v) { flipZ = v; },
-    get enabled() { return enabled; },
+    get flipZ() {
+      return flipZ;
+    },
+    set flipZ(v: boolean) {
+      flipZ = v;
+    },
+    get enabled() {
+      return enabled;
+    },
   };
 }
 
@@ -601,7 +691,7 @@ function createFirstPersonArms(scene, skinUrl) {
  * ============================================================
  */
 
-function createDebugSphere(scene) {
+function createDebugSphere(scene: any) {
   const sphere = MeshBuilder.CreateSphere("debugSphere", { diameter: 1.5 }, scene);
   const mat = new StandardMaterial("debugSphereMat", scene);
   mat.diffuseColor = new Color3(1, 0, 1);
@@ -609,14 +699,14 @@ function createDebugSphere(scene) {
   mat.backFaceCulling = false;
   sphere.material = mat;
   sphere.isPickable = false;
-  
-  // CRITICAL: Disable frustum culling
+
   sphere.alwaysSelectAsActiveMesh = true;
   sphere.doNotSyncBoundingInfo = false;
   sphere.refreshBoundingInfo();
   sphere.renderingGroupId = 1;
-  
+
   sphere.setEnabled(false);
+  sphere.isVisible = false;
 
   console.log("[DebugSphere] created in world space, renderingGroupId:", sphere.renderingGroupId);
   return sphere;
@@ -625,37 +715,33 @@ function createDebugSphere(scene) {
 /**
  * Create a simple solid-color test cube to diagnose rendering issues
  */
-function createTestCube(scene) {
-  // Create a simple box with NO texture, just solid color
+function createTestCube(scene: any) {
   const cube = MeshBuilder.CreateBox("testCube", { size: 2 }, scene);
-  
+
   const mat = new StandardMaterial("testCubeMat", scene);
-  mat.diffuseColor = new Color3(1, 0, 0); // Bright red
-  mat.emissiveColor = new Color3(0.5, 0, 0); // Glow so it's visible in shadow
+  mat.diffuseColor = new Color3(1, 0, 0);
+  mat.emissiveColor = new Color3(0.5, 0, 0);
   mat.specularColor = new Color3(0, 0, 0);
   mat.backFaceCulling = false;
-  
+
   cube.material = mat;
   cube.isPickable = false;
   cube.isVisible = true;
-  
-  // Frustum culling fixes
+
   cube.alwaysSelectAsActiveMesh = true;
   cube.doNotSyncBoundingInfo = false;
   cube.refreshBoundingInfo();
-  
-  // Try rendering AFTER terrain (group 1 instead of default 0)
   cube.renderingGroupId = 1;
-  
-  // Position it at a fixed world location, high above terrain
-  cube.position.set(0, 15, 0);
-  
-  console.log("[TestCube] created at (0, 15, 0) - bright red, should be visible!");
+
+  // Put it somewhere the camera should be able to see easily
+  cube.position.set(0, 30, 6);
+
+  console.log("[TestCube] created at (0, 30, 6) - bright red, should be visible!");
   console.log("[TestCube] isVisible:", cube.isVisible, "isEnabled:", cube.isEnabled());
-  console.log("[TestCube] material:", cube.material?.name);
+  console.log("[TestCube] material:", (cube.material as any)?.name);
   console.log("[TestCube] position:", cube.position.toString());
   console.log("[TestCube] renderingGroupId:", cube.renderingGroupId);
-  
+
   return cube;
 }
 
@@ -678,14 +764,14 @@ const grassID = noa.registry.registerBlock(2, { material: "grass" });
  * ============================================================
  */
 
-function getVoxelID(x, y, z) {
+function getVoxelID(x: number, y: number, z: number) {
   if (y < -3) return dirtID;
   const height = 2 * Math.sin(x / 10) + 3 * Math.cos(z / 20);
   if (y < height) return grassID;
   return 0;
 }
 
-noa.world.on("worldDataNeeded", function (id, data, x, y, z) {
+noa.world.on("worldDataNeeded", function (id: any, data: any, x: number, y: number, z: number) {
   for (let i = 0; i < data.shape[0]; i++) {
     for (let j = 0; j < data.shape[1]; j++) {
       for (let k = 0; k < data.shape[2]; k++) {
@@ -703,15 +789,14 @@ noa.world.on("worldDataNeeded", function (id, data, x, y, z) {
  */
 
 let localAvatarAttached = false;
-let testCube = null;
+let testCube: any = null;
 
-function initLocalAvatarOnce(scene, playerIdentifier) {
+function initLocalAvatarOnce(scene: any, playerIdentifier: string) {
   if (localAvatarAttached) return;
 
   const skinUrl = getMcHeadsSkinUrl(playerIdentifier);
   console.log("[Skin] URL:", skinUrl);
 
-  // Create a simple test cube first - this will help diagnose rendering issues
   testCube = createTestCube(scene);
 
   localAvatar = createPlayerAvatar(scene, skinUrl);
@@ -719,15 +804,14 @@ function initLocalAvatarOnce(scene, playerIdentifier) {
   debugSphere = createDebugSphere(scene);
 
   // Attach avatar to player entity using bracket notation to avoid TS errors
-  const playerEntity = noa.playerEntity;
+  const playerEntity = (noa as any).playerEntity;
   try {
-    const entities = noa.entities;
+    const entities = (noa as any).entities;
     const meshCompName = entities.names?.mesh ?? "mesh";
-    
-    // Access methods via bracket notation to avoid TypeScript errors
+
     const hasComp = entities["hasComponent"];
     const addComp = entities["addComponent"];
-    
+
     if (typeof hasComp === "function" && typeof addComp === "function") {
       if (!hasComp.call(entities, playerEntity, meshCompName)) {
         addComp.call(entities, playerEntity, meshCompName, {
@@ -737,7 +821,6 @@ function initLocalAvatarOnce(scene, playerIdentifier) {
         console.log("[Avatar] attached to player entity");
       }
     } else {
-      // Fallback for older noa versions
       console.warn("[Avatar] hasComponent/addComponent not found, trying direct add");
       if (addComp) {
         addComp.call(entities, playerEntity, meshCompName, {
@@ -747,37 +830,41 @@ function initLocalAvatarOnce(scene, playerIdentifier) {
         console.log("[Avatar] attached (fallback)");
       }
     }
-  } catch (e) {
+  } catch (e: any) {
     console.error("[Avatar] attach failed:", e);
-    debugHUD.state.lastError = String((e && typeof e === 'object' && 'message' in e) ? e.message : e);
+    debugHUD.state.lastError = String(e?.message || e);
   }
 
   function applyViewMode() {
     const locked = isPointerLockedToNoa();
     const isFirst = viewMode === 0;
 
-    noa.camera.zoomDistance = isFirst ? 0 : 6;
+    (noa as any).camera.zoomDistance = isFirst ? 0 : 6;
 
     // Avatar: hidden in first person
-    localAvatar.root.setEnabled(!isFirst);
-    localAvatar.head.setEnabled(!isFirst);
-    localAvatar.body.setEnabled(!isFirst);
-    localAvatar.rightArm.setEnabled(!isFirst);
-    localAvatar.leftArm.setEnabled(!isFirst);
-    localAvatar.rightLeg.setEnabled(!isFirst);
-    localAvatar.leftLeg.setEnabled(!isFirst);
+    const avatarOn = !isFirst;
+    localAvatar.root.setEnabled(avatarOn);
+    localAvatar.root.isVisible = avatarOn;
 
-    // Arms: shown only in first person AND locked
-    const armsOn = isFirst && locked;
+    localAvatar.head.setEnabled(avatarOn);
+    localAvatar.body.setEnabled(avatarOn);
+    localAvatar.rightArm.setEnabled(avatarOn);
+    localAvatar.leftArm.setEnabled(avatarOn);
+    localAvatar.rightLeg.setEnabled(avatarOn);
+    localAvatar.leftLeg.setEnabled(avatarOn);
+
+    // Arms: shown only in first person, and (optionally) only when locked
+    const armsOn = isFirst && (!armsRequirePointerLock || locked);
     fpArmsRef.setEnabled(armsOn);
 
     debugHUD.state.viewMode = viewMode;
-    debugHUD.state.avatarEnabled = !isFirst;
+    debugHUD.state.avatarEnabled = avatarOn;
     debugHUD.state.armsEnabled = armsOn;
+    debugHUD.state.armsRequireLock = armsRequirePointerLock;
     debugHUD.state.last = "applyViewMode";
     debugHUD.render();
 
-    console.log("[applyViewMode] viewMode:", viewMode, "locked:", locked, "avatar:", !isFirst, "arms:", armsOn);
+    console.log("[applyViewMode] viewMode:", viewMode, "locked:", locked, "avatar:", avatarOn, "arms:", armsOn);
   }
 
   applyViewModeGlobal = applyViewMode;
@@ -793,15 +880,18 @@ function initLocalAvatarOnce(scene, playerIdentifier) {
  * ============================================================
  */
 
-function createRemotePlayersManager(scene, room) {
-  const remotes = new Map();
+function createRemotePlayersManager(scene: any, room: any) {
+  const remotes = new Map<string, any>();
 
-  function spawnRemote(sessionId, playerState) {
+  function spawnRemote(sessionId: string, playerState: any) {
     const name = playerState?.name || "Steve";
     const skinUrl = getMcHeadsSkinUrl(name);
     const avatar = createPlayerAvatar(scene, skinUrl);
-    
+
+    // Ensure enabled + visible
     avatar.root.setEnabled(true);
+    avatar.root.isVisible = true;
+
     avatar.head.setEnabled(true);
     avatar.body.setEnabled(true);
     avatar.rightArm.setEnabled(true);
@@ -818,14 +908,16 @@ function createRemotePlayersManager(scene, room) {
     console.log("[Remote] spawned", sessionId, name);
   }
 
-  function removeRemote(sessionId) {
+  function removeRemote(sessionId: string) {
     const r = remotes.get(sessionId);
     if (!r) return;
-    try { r.avatar.root.dispose(false, true); } catch {}
+    try {
+      r.avatar.root.dispose(false, true);
+    } catch {}
     remotes.delete(sessionId);
   }
 
-  function updateRemote(sessionId, playerState) {
+  function updateRemote(sessionId: string, playerState: any) {
     const r = remotes.get(sessionId);
     if (!r) return;
     r.tx = safeNum(playerState.x, r.tx);
@@ -848,12 +940,14 @@ function createRemotePlayersManager(scene, room) {
       const players = room?.state?.players;
       if (players) {
         clearInterval(interval);
-        players.onAdd = (playerState, sessionId) => {
+        players.onAdd = (playerState: any, sessionId: string) => {
           if (sessionId === room.sessionId) return;
           spawnRemote(sessionId, playerState);
-          try { playerState.onChange = () => updateRemote(sessionId, playerState); } catch {}
+          try {
+            playerState.onChange = () => updateRemote(sessionId, playerState);
+          } catch {}
         };
-        players.onRemove = (_ps, sessionId) => removeRemote(sessionId);
+        players.onRemove = (_ps: any, sessionId: string) => removeRemote(sessionId);
         console.log("[Remote] hooked");
       }
     }, 50);
@@ -868,7 +962,7 @@ function createRemotePlayersManager(scene, room) {
 
 function getLocalPlayerPosition() {
   try {
-    const p = noa.entities.getPosition(noa.playerEntity);
+    const p = (noa as any).entities.getPosition((noa as any).playerEntity);
     if (p?.length >= 3) return [p[0], p[1], p[2]];
   } catch {}
   return [0, 10, 0];
@@ -889,13 +983,20 @@ async function connectColyseus() {
 
     console.log("[Colyseus] connected, session:", room.sessionId);
 
-    room.onMessage("*", (type, message) => console.log("[Colyseus] msg:", type, message));
+    room.onMessage("*", (type: any, message: any) => console.log("[Colyseus] msg:", type, message));
     room.onLeave(() => {
       console.warn("[Colyseus] left");
       noaAny.colyseus.room = null;
     });
 
-    const scene = noa.rendering.getScene();
+    const scene = (noa as any).rendering.getScene();
+
+    // Quick sanity logs
+    try {
+      console.log("[Babylon] scene:", scene?.constructor?.name);
+      console.log("[Babylon] engine:", scene?.getEngine?.()?.constructor?.name);
+    } catch {}
+
     initLocalAvatarOnce(scene, "Steve");
     createRemotePlayersManager(scene, room);
 
@@ -906,12 +1007,11 @@ async function connectColyseus() {
       const { heading, pitch } = getNoaCameraRotation();
       activeRoom.send("move", { x, y, z, yaw: heading, pitch });
     }, 50);
-
-  } catch (err) {
+  } catch (err: any) {
     console.error("[Colyseus] failed:", err);
     debugHUD.state.lastError = String(err?.message || err);
 
-    const scene = noa.rendering.getScene();
+    const scene = (noa as any).rendering.getScene();
     initLocalAvatarOnce(scene, "Steve");
   }
 }
@@ -930,10 +1030,10 @@ noa.on("tick", function () {
     fpArmsRef.updateAnim(dt);
   }
 
-  const scroll = noa.inputs.pointerState.scrolly;
+  const scroll = (noa as any).inputs.pointerState.scrolly;
   if (scroll !== 0 && viewMode !== 0) {
-    noa.camera.zoomDistance += scroll > 0 ? 1 : -1;
-    noa.camera.zoomDistance = clamp(noa.camera.zoomDistance, 2, 12);
+    (noa as any).camera.zoomDistance += scroll > 0 ? 1 : -1;
+    (noa as any).camera.zoomDistance = clamp((noa as any).camera.zoomDistance, 2, 12);
   }
 });
 
@@ -945,25 +1045,27 @@ noa.on("beforeRender", function () {
   if (debugSphere && debugSphereOn) {
     const camPos = getNoaCameraPosition();
     const { heading } = getNoaCameraRotation();
-    
+
     const forwardX = Math.sin(heading) * 3;
     const forwardZ = Math.cos(heading) * 3;
     debugSphere.position.set(camPos.x + forwardX, camPos.y, camPos.z + forwardZ);
-    
-    debugHUD.state.debugSpherePos = `${debugSphere.position.x.toFixed(1)},${debugSphere.position.y.toFixed(1)},${debugSphere.position.z.toFixed(1)}`;
+
+    debugHUD.state.debugSpherePos = `${debugSphere.position.x.toFixed(1)},${debugSphere.position.y.toFixed(
+      1
+    )},${debugSphere.position.z.toFixed(1)}`;
   }
 
   if (localAvatar) {
     const pos = localAvatar.root.position;
     debugHUD.state.avatarPos = `${pos.x.toFixed(1)},${pos.y.toFixed(1)},${pos.z.toFixed(1)}`;
-    
-    // Log absolute world position of head to see where it actually is
+
     if (localAvatar.head) {
       localAvatar.head.computeWorldMatrix(true);
       const worldPos = localAvatar.head.getAbsolutePosition();
       debugHUD.state.avatarPos += ` head@${worldPos.x.toFixed(1)},${worldPos.y.toFixed(1)},${worldPos.z.toFixed(1)}`;
     }
   }
+
   if (fpArmsRef) {
     const pos = fpArmsRef.root.position;
     debugHUD.state.armsPos = `${pos.x.toFixed(1)},${pos.y.toFixed(1)},${pos.z.toFixed(1)}`;
@@ -984,17 +1086,17 @@ noa.on("beforeRender", function () {
 
 noa.inputs.down.on("fire", function () {
   if (fpArmsRef && viewMode === 0) fpArmsRef.startSwing();
-  if (noa.targetedBlock) {
-    const pos = noa.targetedBlock.position;
-    noa.setBlock(0, pos[0], pos[1], pos[2]);
+  if ((noa as any).targetedBlock) {
+    const pos = (noa as any).targetedBlock.position;
+    (noa as any).setBlock(0, pos[0], pos[1], pos[2]);
   }
 });
 
 noa.inputs.down.on("alt-fire", function () {
   if (fpArmsRef && viewMode === 0) fpArmsRef.startSwing();
-  if (noa.targetedBlock) {
-    const pos = noa.targetedBlock.adjacent;
-    noa.setBlock(grassID, pos[0], pos[1], pos[2]);
+  if ((noa as any).targetedBlock) {
+    const pos = (noa as any).targetedBlock.adjacent;
+    (noa as any).setBlock(grassID, pos[0], pos[1], pos[2]);
   }
 });
 
