@@ -11,6 +11,7 @@
  * - uninstall old UMD runtime:
  *     npm remove babylonjs
  */
+console.log("=== RUNNING HELLO-WORLD INDEX.JS :: TEST-A-FORCED v1 ===");
 
 import { Engine } from "noa-engine";
 import { Client } from "@colyseus/sdk";
