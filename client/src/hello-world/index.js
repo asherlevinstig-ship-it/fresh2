@@ -1,20 +1,13 @@
 /*
- * Fresh2 - noa hello-world (main game entry)
- * Diagnostic build focused on:
- *  - Crosshair + pointer lock
- *  - TestA scene clearColor (magenta) so you KNOW the file is running
- *  - PROOF meshes (frontCube, avatarCube, fpArms) that should be visible
- *  - ✅ Render Pipeline Truth Test (customRenderFunction probe + optional disable)
- *  - ✅ beforeRender camera sanity + frustum diagnostics
+ * Fix: VSCode/TS errors in .js because Babylon d.ts doesn't expose customRenderFunction on Scene/RenderingManager.
+ * Solution: access via any-cast (sAny.customRenderFunction / rmAny.customRenderFunction).
  *
- * IMPORTANT:
- * This is plain JS. To keep VSCode/TS happy in a .js file, I use /** @type {any} *\/ casts.
+ * This is the same file as before, but with the RenderProbe block edited so TS stops complaining.
  */
 
 import { Engine as NoaEngine } from "noa-engine";
 import { Client } from "@colyseus/sdk";
 
-// Babylon (same runtime NOA uses in your build)
 import {
   Engine as BEngine,
   MeshBuilder,
@@ -62,7 +55,6 @@ let viewMode = 0; // 0 first, 1 third
 let forceCrosshair = false;
 
 function getPointerLockTarget() {
-  // Prefer noa.container if present
   const c = noaAny.container;
   if (c) return c;
 
@@ -148,13 +140,11 @@ const crosshairUI = createCrosshairOverlay();
     /** @type {any} */
     const el = target;
 
-    // Make it focusable if it looks like an element
     if (typeof el.setAttribute === "function" && typeof el.hasAttribute === "function") {
       if (!el.hasAttribute("tabindex")) el.setAttribute("tabindex", "1");
     }
     if (el.style) el.style.outline = "none";
 
-    // Attach click handler if it supports it
     const addEvt = el.addEventListener || el.addListener;
     if (typeof addEvt === "function") {
       addEvt.call(el, "click", () => {
@@ -301,7 +291,6 @@ function initVisualsOnce() {
   const cam = scene.activeCamera;
   if (!cam) return;
 
-  // prove runtime
   console.log("[Babylon] imported Engine.Version:", BEngine.Version);
   console.log(
     "[NOA] scene exists? true activeCamera exists? true cameraType:",
@@ -311,12 +300,9 @@ function initVisualsOnce() {
   // TestA: magenta sky
   try {
     scene.clearColor = new (/** @type {any} */ (scene.clearColor).constructor)(1, 0, 1, 1);
-  } catch {
-    // fallback: Color4 might not be available from here; ignore if it fails
-  }
+  } catch {}
   console.log("[TestA] magenta clearColor set");
 
-  // Unfreeze meshes if NOA did something unusual
   console.log("[Diag] scene _activeMeshesFrozen:", scene._activeMeshesFrozen);
   try {
     if (typeof scene.unfreezeActiveMeshes === "function") {
@@ -327,7 +313,7 @@ function initVisualsOnce() {
     console.warn("[Diag] unfreezeActiveMeshes failed:", e);
   }
 
-  // Create a VERY visible proof cube in world space
+  // Proof cube: shoved in front of camera each frame
   frontCube = MeshBuilder.CreateBox("frontCube", { size: 1.2 }, scene);
   const frontMat = new StandardMaterial("frontMat", scene);
   frontMat.diffuseColor = new Color3(0, 0.5, 1);
@@ -337,10 +323,9 @@ function initVisualsOnce() {
   frontCube.isPickable = false;
   frontCube.isVisible = true;
   frontCube.setEnabled(true);
-
   console.log("[PROOF] frontCube created (will be moved in front of camera each frame)");
 
-  // Simple “avatar” cube that follows player position (third-person proof)
+  // Avatar cube follows player
   avatarCube = MeshBuilder.CreateBox("avatarCube", { size: 1.0 }, scene);
   const avatarMat = new StandardMaterial("avatarMat", scene);
   avatarMat.diffuseColor = new Color3(1, 1, 0);
@@ -351,7 +336,7 @@ function initVisualsOnce() {
   avatarCube.isVisible = true;
   avatarCube.setEnabled(true);
 
-  // FP arms proof (two small cubes) – we’ll just use one for now
+  // FP arms proof cube
   fpArms = MeshBuilder.CreateBox("fpArms", { width: 0.35, height: 0.35, depth: 0.8 }, scene);
   const armsMat = new StandardMaterial("armsMat", scene);
   armsMat.diffuseColor = new Color3(1, 0.2, 0.2);
@@ -360,35 +345,40 @@ function initVisualsOnce() {
   fpArms.material = armsMat;
   fpArms.isPickable = false;
   fpArms.isVisible = true;
-  fpArms.setEnabled(false); // enabled only when locked + first
+  fpArms.setEnabled(false);
 
   console.log("[Avatar] created (manual follow)");
   console.log("[FPArms] created (manual in-front-of-camera)");
 
   // ============================================================
-  // ✅ RENDER PIPELINE TRUTH TEST (exactly once, right here)
+  // ✅ RENDER PIPELINE TRUTH TEST (TS-safe via any-cast)
   // ============================================================
   // ===== RENDER PIPELINE TRUTH TEST =====
   (function probeRenderPipeline() {
     const s = scene;
     const rm = s.renderingManager;
 
+    /** @type {any} */
+    const sAny = s;
+    /** @type {any} */
+    const rmAny = rm;
+
     console.log("========== [RenderProbe] ==========");
-    console.log("[RenderProbe] scene.customRenderFunction =", typeof s.customRenderFunction);
-    console.log("[RenderProbe] renderingManager.customRenderFunction =", typeof rm?.customRenderFunction);
+    console.log("[RenderProbe] scene.customRenderFunction =", typeof sAny.customRenderFunction);
+    console.log("[RenderProbe] renderingManager.customRenderFunction =", typeof rmAny?.customRenderFunction);
     console.log("[RenderProbe] scene.meshes.length =", s.meshes.length);
     console.log("[RenderProbe] scene.activeCamera.layerMask =", s.activeCamera?.layerMask);
     console.log("[RenderProbe] =================================");
 
     // Optional HARD TEST:
     // Disable custom render function if present (just to prove the hypothesis)
-    if (typeof s.customRenderFunction === "function") {
+    if (typeof sAny.customRenderFunction === "function") {
       console.warn("[RenderProbe] DISABLING scene.customRenderFunction for test");
-      s.customRenderFunction = null;
+      sAny.customRenderFunction = null;
     }
-    if (rm && typeof rm.customRenderFunction === "function") {
+    if (rmAny && typeof rmAny.customRenderFunction === "function") {
       console.warn("[RenderProbe] DISABLING renderingManager.customRenderFunction for test");
-      rm.customRenderFunction = null;
+      rmAny.customRenderFunction = null;
     }
   })();
 
@@ -403,16 +393,14 @@ function initVisualsOnce() {
 
 function applyViewMode() {
   if (!visualsInited) return;
+
   const locked = isPointerLockedToNoa();
   const isFirst = viewMode === 0;
 
-  // noa camera zoom distance controls 3rd person
   noa.camera.zoomDistance = isFirst ? 0 : 6;
 
-  // show avatar only in third
   if (avatarCube) avatarCube.setEnabled(!isFirst);
 
-  // show arms only in first AND locked
   const armsOn = isFirst && locked;
   if (fpArms) fpArms.setEnabled(armsOn);
 
@@ -436,7 +424,6 @@ function applyViewMode() {
 noa.on("tick", function () {
   initVisualsOnce();
 
-  // zoom scroll in third
   const scroll = noa.inputs.pointerState.scrolly;
   if (scroll !== 0 && viewMode !== 0) {
     noa.camera.zoomDistance += scroll > 0 ? 1 : -1;
@@ -452,22 +439,15 @@ noa.on("beforeRender", function () {
   const cam = scene.activeCamera;
   if (!cam) return;
 
-  // ============================================================
-  // ✅ camera sanity (exactly as requested + required vars)
-  // ============================================================
-
   // force far clip huge (some engines clamp maxZ and you won't see objects)
   if (typeof cam.maxZ === "number" && cam.maxZ < 500) cam.maxZ = 5000;
 
-  // Put frontCube directly in front of camera every frame
-  // so it MUST be visible if Babylon is rendering arbitrary meshes.
   if (frontCube) {
     const fwd = cam.getDirection ? cam.getDirection(new Vector3(0, 0, 1)) : new Vector3(0, 0, 1);
     const camPos = cam.position ? cam.position.clone() : getNoaCameraPositionVec3();
     frontCube.position.copyFrom(camPos.add(fwd.scale(2.0)));
   }
 
-  // Follow player for third-person proof
   if (avatarCube) {
     let px = 0, py = 10, pz = 0;
     try {
@@ -477,7 +457,6 @@ noa.on("beforeRender", function () {
     avatarCube.position.set(px, py + 0.6, pz);
   }
 
-  // Put fpArms slightly lower and closer than frontCube
   if (fpArms && fpArms.isEnabled()) {
     const fwd = cam.getDirection ? cam.getDirection(new Vector3(0, 0, 1)) : new Vector3(0, 0, 1);
     const right = cam.getDirection ? cam.getDirection(new Vector3(1, 0, 0)) : new Vector3(1, 0, 0);
@@ -539,7 +518,7 @@ document.addEventListener("pointerlockchange", () => {
 });
 
 /* ============================================================
- * Connect Colyseus (optional, doesn’t block visuals)
+ * Connect Colyseus (optional)
  * ============================================================
  */
 
@@ -559,20 +538,21 @@ document.addEventListener("pointerlockchange", () => {
       noaAny.colyseus.room = null;
     });
 
-    // send movement occasionally (optional)
     setInterval(() => {
       const activeRoom = noaAny.colyseus.room;
       if (!activeRoom) return;
+
       let x = 0, y = 10, z = 0;
       try {
         const p = noa.entities.getPosition(noa.playerEntity);
         x = p[0]; y = p[1]; z = p[2];
       } catch {}
+
       const yaw = safeNum(noa.camera.heading, 0);
       const pitch = safeNum(noa.camera.pitch, 0);
+
       activeRoom.send("move", { x, y, z, yaw, pitch });
     }, 100);
-
   } catch (err) {
     console.error("[Colyseus] failed:", err);
   }
