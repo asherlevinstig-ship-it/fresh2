@@ -1,3 +1,17 @@
+/*
+ * Fresh2 - noa hello-world (single Babylon runtime via "babylonjs" alias)
+ *
+ * This version adds:
+ *   ✅ Test A: force the scene clearColor to MAGENTA to prove we're editing the rendered scene
+ *
+ * IMPORTANT SETUP:
+ * - vite.config.js:
+ *     alias: { babylonjs: '@babylonjs/core/Legacy/legacy' }
+ *     dedupe: ['@babylonjs/core']
+ * - uninstall old UMD runtime:
+ *     npm remove babylonjs
+ */
+
 import { Engine } from "noa-engine";
 import { Client } from "@colyseus/sdk";
 import * as BABYLON from "babylonjs";
@@ -120,7 +134,7 @@ function forceMeshVisible(mesh) {
   mesh.setEnabled(true);
   mesh.alwaysSelectAsActiveMesh = true;
 
-  // Render after terrain chunks
+  // Render after terrain chunks (defensive)
   mesh.renderingGroupId = 2;
 
   // Ensure camera can see it regardless of layer mask
@@ -274,7 +288,7 @@ function createThirdPersonAvatar(scene) {
   legL.position.set(0.25, 0.6, 0);
   forceMeshVisible(legL);
 
-  // Start enabled so we can see it immediately if in view
+  // Start enabled (we may still disable in applyViewMode)
   root.setEnabled(true);
 
   console.log("[Avatar] created (solid color)");
@@ -323,11 +337,7 @@ function updateAvatarFollowPlayer() {
   if (!avatarRoot) return;
 
   const [x, y, z] = getPlayerPosition();
-
-  // Put avatar at player position (add a small lift so it's not inside ground)
   avatarRoot.position.set(x, y, z);
-
-  // Force visibility every frame (defensive)
   forceMeshVisible(avatarRoot);
 }
 
@@ -351,7 +361,6 @@ function updateArmsFollowCamera(cam) {
       armsRoot.rotation.copyFrom(cam.rotation);
     }
 
-    // Force visibility (defensive)
     forceMeshVisible(armsRoot);
   } catch (e) {
     console.warn("[FPArms] update failed:", e);
@@ -359,7 +368,7 @@ function updateArmsFollowCamera(cam) {
 }
 
 /* ============================================================
- * Build meshes once scene exists
+ * Build meshes once scene exists (includes TEST A)
  * ============================================================
  */
 
@@ -370,10 +379,28 @@ function ensureMeshes() {
   const cam = getNoaCamera();
   if (!scene || !cam) return;
 
-  console.log("[Babylon] imported Engine.Version:", BABYLON.Engine && BABYLON.Engine.Version ? BABYLON.Engine.Version : "(unknown)");
-  console.log("[NOA] scene exists?", !!scene, "camera exists?", !!cam, "cameraType:", cam && cam.getClassName ? cam.getClassName() : "(unknown)");
+  console.log(
+    "[Babylon] imported Engine.Version:",
+    BABYLON.Engine && BABYLON.Engine.Version ? BABYLON.Engine.Version : "(unknown)"
+  );
+  console.log(
+    "[NOA] scene exists?",
+    !!scene,
+    "camera exists?",
+    !!cam,
+    "cameraType:",
+    cam && cam.getClassName ? cam.getClassName() : "(unknown)"
+  );
 
-  // Force activeCamera to see ALL layers
+  // TEST A: if you do NOT see a magenta background, you're not editing the rendered scene.
+  try {
+    scene.clearColor = new BABYLON.Color4(1, 0, 1, 1);
+    console.log("[Diag][TestA] set scene.clearColor = magenta");
+  } catch (e) {
+    console.warn("[Diag][TestA] failed to set clearColor:", e);
+  }
+
+  // Defensive camera settings
   try {
     if (scene.activeCamera) {
       scene.activeCamera.layerMask = 0xFFFFFFFF;
@@ -418,7 +445,7 @@ noa.on("beforeRender", function () {
     if (scene.activeCamera) scene.activeCamera.layerMask = 0xFFFFFFFF;
   } catch {}
 
-  // Avatar follows player regardless of NOA mesh component
+  // Avatar follows player
   updateAvatarFollowPlayer();
 
   // Arms follow camera
