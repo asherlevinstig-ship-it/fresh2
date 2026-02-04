@@ -1,11 +1,11 @@
 /*
- * Fresh2 - noa hello-world (main game entry) - VISIBILITY FIX v6
+ * Fresh2 - noa hello-world (main game entry) - VISIBILITY FIX v7
  *
- * Fixes:
- * - Place proofPlane / arms using activeCamera forward vector (works in RH or LH)
- * - Also place a "frontCube" directly in front of camera in WORLD space (cannot miss)
- * - Third-person avatar follows player (simple emissive cube)
- * - Crosshair + pointer lock
+ * Core fix:
+ * - NOA likely uses a non-default camera.layerMask and/or renderingGroupId for chunks.
+ * - Meshes can exist but NEVER render if they don't match those filters.
+ * - This version detects NOA's active camera layerMask + a "terrain-ish" mesh renderingGroupId
+ *   and forces ALL debug/arms/avatar meshes to match.
  */
 
 import { Engine } from "noa-engine";
@@ -37,10 +37,10 @@ let forceCrosshair = false;
 
 let inited = false;
 
-let proofPlane = null;  // camera-facing proof plane (should appear dead center)
-let fpArmsMesh = null;  // first person arms (simple box)
-let frontCube = null;   // world-space cube placed in front of camera each frame
-let avatarCube = null;  // third-person avatar cube
+let proofPlane = null;   // yellow plane in front of camera (proof)
+let fpArmsMesh = null;   // arms box
+let frontCube = null;    // green cube in front of camera (proof)
+let avatarCube = null;   // blue cube following player in 3rd person
 
 let frameCounter = 0;
 
@@ -75,36 +75,78 @@ function makeEmissiveMat(scene, name, color3) {
   return mat;
 }
 
-function forceMeshVisible(mesh) {
-  mesh.isVisible = true;
-  mesh.setEnabled(true);
-  mesh.isPickable = false;
-  mesh.alwaysSelectAsActiveMesh = true;
-  mesh.visibility = 1;
-  mesh.layerMask = 0xFFFFFFFF;
-  mesh.renderingGroupId = 0;
+/**
+ * Find a mesh that NOA is definitely rendering (terrain chunk / any nontrivial mesh).
+ * We use it to copy renderingGroupId and layerMask behavior.
+ */
+function findNoaRenderedMesh(scene) {
+  if (!scene || !scene.meshes || scene.meshes.length === 0) return null;
+
+  // Try obvious chunk-ish names first
+  const byName =
+    scene.meshes.find((m) => typeof m.name === "string" && /chunk|terrain|world|vox/i.test(m.name));
+  if (byName) return byName;
+
+  // Otherwise pick a mesh that looks "real" (has geometry + is enabled)
+  const candidate = scene.meshes.find((m) => {
+    try {
+      return m && m.isEnabled?.() && m.isVisible && m.getTotalVertices?.() > 0;
+    } catch {
+      return false;
+    }
+  });
+  return candidate || scene.meshes[0];
 }
 
 /**
- * Return a normalized WORLD forward vector for the camera.
- * This works for RH and LH scenes because it uses Babylon's direction transform.
+ * HARD FORCE: make our meshes match NOA's camera + rendering group filters.
  */
-function getCameraForwardWorld(cam) {
-  // Axis.Z is "forward" in Babylon's convention for direction transforms.
-  const fwd = cam.getDirection(BABYLON.Axis.Z);
-  // normalize defensively
-  const len = Math.sqrt(fwd.x * fwd.x + fwd.y * fwd.y + fwd.z * fwd.z) || 1;
-  return new BABYLON.Vector3(fwd.x / len, fwd.y / len, fwd.z / len);
+function syncMeshToNoaRenderFilters(mesh, scene, cam) {
+  if (!mesh || !scene || !cam) return;
+
+  const sample = findNoaRenderedMesh(scene);
+
+  // Copy camera layer mask EXACTLY
+  const camMask = typeof cam.layerMask === "number" ? cam.layerMask : 0x0FFFFFFF;
+
+  // Copy renderingGroupId from a sample NOA-rendered mesh if possible
+  const groupId =
+    sample && typeof sample.renderingGroupId === "number"
+      ? sample.renderingGroupId
+      : 0;
+
+  mesh.layerMask = camMask;
+  mesh.renderingGroupId = groupId;
+
+  // Also try to ensure it isn't being ignored by ordering
+  mesh.alphaIndex = 100000;
+
+  // Visibility flags
+  mesh.isPickable = false;
+  mesh.isVisible = true;
+  mesh.setEnabled(true);
+  mesh.visibility = 1;
+
+  // Reduce culling surprises
+  mesh.alwaysSelectAsActiveMesh = true;
+
+  // Debug log (once in a while)
+  if (frameCounter % 240 === 0) {
+    console.log(
+      `[Sync] ${mesh.name} -> layerMask=${mesh.layerMask} group=${mesh.renderingGroupId} (sample=${sample?.name || "none"})`
+    );
+  }
 }
 
 /* ============================================================
- * Pointer lock target
+ * Pointer lock element
  * ============================================================
  */
 
 function getPointerLockElement() {
   const c = /** @type {any} */ (noa && noa.container);
 
+  // If it's a real DOM element
   if (c && typeof c === "object" && typeof c.addEventListener === "function") {
     return /** @type {HTMLElement} */ (c);
   }
@@ -209,7 +251,7 @@ const crosshairUI = createCrosshairOverlay();
 })();
 
 /* ============================================================
- * Key handlers
+ * View mode toggle
  * ============================================================
  */
 
@@ -234,6 +276,11 @@ function applyViewMode() {
   );
 }
 
+document.addEventListener("pointerlockchange", () => {
+  applyViewMode();
+  crosshairUI.refresh();
+});
+
 document.addEventListener("keydown", (e) => {
   if (e.code === "F5") {
     e.preventDefault();
@@ -254,13 +301,8 @@ document.addEventListener("keydown", (e) => {
   }
 });
 
-document.addEventListener("pointerlockchange", () => {
-  applyViewMode();
-  crosshairUI.refresh();
-});
-
 /* ============================================================
- * Blocks + world gen
+ * Blocks + world generation
  * ============================================================
  */
 
@@ -312,7 +354,7 @@ function getNoaHeadingPitch() {
 }
 
 /* ============================================================
- * Init visuals (PROOF + arms + avatar)
+ * Init visuals
  * ============================================================
  */
 
@@ -323,12 +365,12 @@ function initVisualsOnce() {
   const scene = getNoaScene();
   console.log("[Babylon] imported Engine.Version:", BABYLON.Engine?.Version);
 
-  const cam0 = scene ? getActiveCamera(scene) : null;
-  console.log("[NOA] scene exists?", !!scene, "activeCamera exists?", !!cam0, "cameraType:", cam0?.getClassName?.());
+  const cam = scene ? getActiveCamera(scene) : null;
+  console.log("[NOA] scene exists?", !!scene, "activeCamera exists?", !!cam, "cameraType:", cam?.getClassName?.());
 
   if (!scene) return;
 
-  // Make sky magenta so we know this code is live
+  // Prove code is live
   scene.autoClear = true;
   scene.clearColor = new BABYLON.Color4(1, 0, 1, 1);
   console.log("[TestA] magenta clearColor set");
@@ -345,37 +387,34 @@ function initVisualsOnce() {
     console.warn("[Diag] unfreeze probe failed:", e);
   }
 
-  // Proof plane (bright yellow)
+  // Proof plane (yellow)
   proofPlane = BABYLON.MeshBuilder.CreatePlane("proofPlane", { size: 0.8 }, scene);
   const ppMat = makeEmissiveMat(scene, "ppMat", new BABYLON.Color3(1, 1, 0));
   ppMat.disableDepthWrite = true;
   proofPlane.material = ppMat;
-  forceMeshVisible(proofPlane);
 
-  // Arms mesh (skin tone)
+  // Arms (skin tone)
   fpArmsMesh = BABYLON.MeshBuilder.CreateBox("fpArms", { height: 0.25, width: 0.8, depth: 0.25 }, scene);
   const armsMat = makeEmissiveMat(scene, "armsMat", new BABYLON.Color3(1.0, 0.85, 0.65));
   armsMat.disableDepthWrite = true;
   fpArmsMesh.material = armsMat;
-  forceMeshVisible(fpArmsMesh);
 
-  // World-space cube that we move in front of camera each frame (bright green)
+  // Proof cube in front of camera (green)
   frontCube = BABYLON.MeshBuilder.CreateBox("frontCube", { size: 0.6 }, scene);
   frontCube.material = makeEmissiveMat(scene, "frontCubeMat", new BABYLON.Color3(0, 1, 0));
-  forceMeshVisible(frontCube);
   console.log("[PROOF] frontCube created (will be moved in front of camera each frame)");
 
-  // Third-person avatar cube (blue)
+  // 3rd person avatar (blue)
   avatarCube = BABYLON.MeshBuilder.CreateBox("avatarCube", { height: 1.8, width: 0.8, depth: 0.4 }, scene);
   avatarCube.material = makeEmissiveMat(scene, "avatarMat", new BABYLON.Color3(0.2, 0.6, 1.0));
-  forceMeshVisible(avatarCube);
   console.log("[Avatar] created (manual follow)");
 
+  // Initial enable/disable
   applyViewMode();
 }
 
 /* ============================================================
- * Colyseus connect
+ * Colyseus
  * ============================================================
  */
 
@@ -433,7 +472,7 @@ async function connectColyseus() {
 connectColyseus();
 
 /* ============================================================
- * Main hooks
+ * Render hook (THE IMPORTANT PART)
  * ============================================================
  */
 
@@ -443,19 +482,21 @@ noa.on("beforeRender", function () {
   const scene = getNoaScene();
   if (!scene) return;
 
-  // keep magenta background as a live indicator
+  // keep magenta background as live indicator
   scene.autoClear = true;
   scene.clearColor = new BABYLON.Color4(1, 0, 1, 1);
 
   const cam = getActiveCamera(scene);
-
   frameCounter++;
+
   if (frameCounter % 120 === 0) {
     console.log(
       "[Diag] activeCamera:",
       cam ? `${cam.name} (${cam.getClassName?.()})` : "(none)",
       "| useRightHandedSystem:",
       !!scene.useRightHandedSystem,
+      "| cam.layerMask:",
+      cam ? cam.layerMask : "(none)",
       "| meshes:",
       scene.meshes?.length
     );
@@ -463,41 +504,45 @@ noa.on("beforeRender", function () {
 
   if (!cam) return;
 
-  // Ensure minZ isn't clipping camera children
+  // Ensure near clip isn't huge
   if (typeof cam.minZ === "number" && cam.minZ > 0.05) cam.minZ = 0.05;
 
-  // Get camera world forward direction (works RH/LH)
-  const fwd = getCameraForwardWorld(cam);
+  // 🔥 CRITICAL: match NOA render filters every frame (cheap + decisive)
+  syncMeshToNoaRenderFilters(proofPlane, scene, cam);
+  syncMeshToNoaRenderFilters(fpArmsMesh, scene, cam);
+  syncMeshToNoaRenderFilters(frontCube, scene, cam);
+  syncMeshToNoaRenderFilters(avatarCube, scene, cam);
 
-  // Place a WORLD cube directly in front of camera (cannot be behind)
-  if (frontCube) {
-    const worldPos = cam.position.add(fwd.scale(4));
-    frontCube.position.copyFrom(worldPos);
-    frontCube.rotation.y += 0.03;
-  }
+  // Put proofPlane + arms as CAMERA CHILDREN
+  // For LH system (your log says false -> LH), +Z is forward in camera local space.
+  const forwardSign = scene.useRightHandedSystem ? -1 : 1;
 
-  // Parent proofPlane + arms to camera, but position them using FORWARD vector
-  // (we don't trust local +Z/-Z, we compute real forward and convert into parent space)
   if (proofPlane) {
     if (proofPlane.parent !== cam) proofPlane.parent = cam;
-
-    // Put it forward, centered
-    // Since it's parented, we can just use "local" offsets,
-    // but we still need the correct sign. We derive it from fwd.z in camera space.
-    // Simple robust approach: use scene RH flag.
-    const forwardSign = scene.useRightHandedSystem ? -1 : 1;
     proofPlane.position.set(0, 0, forwardSign * 2.0);
   }
 
   if (fpArmsMesh) {
     if (fpArmsMesh.parent !== cam) fpArmsMesh.parent = cam;
-    const forwardSign = scene.useRightHandedSystem ? -1 : 1;
     fpArmsMesh.position.set(0.35, -0.35, forwardSign * 1.2);
   }
 
-  // Third-person avatar follow (world space)
+  // Place world-space cube in front of camera too (even if parenting fails)
+  if (frontCube) {
+    const fwd = cam.getDirection(BABYLON.Axis.Z); // works with engine's handedness
+    const len = Math.sqrt(fwd.x * fwd.x + fwd.y * fwd.y + fwd.z * fwd.z) || 1;
+    const nf = new BABYLON.Vector3(fwd.x / len, fwd.y / len, fwd.z / len);
+
+    const worldPos = cam.position.add(nf.scale(4));
+    frontCube.parent = null;
+    frontCube.position.copyFrom(worldPos);
+    frontCube.rotation.y += 0.03;
+  }
+
+  // Third-person avatar follow
   if (avatarCube) {
     const [x, y, z] = getLocalPlayerPosition();
+    avatarCube.parent = null;
     avatarCube.position.set(x, y + 0.9, z);
     const { heading } = getNoaHeadingPitch();
     avatarCube.rotation.y = heading;
