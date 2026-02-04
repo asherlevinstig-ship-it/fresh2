@@ -1,13 +1,11 @@
 /*
- * Fresh2 - noa hello-world (main game entry) - VISIBILITY FIX v5 (Test A+)
+ * Fresh2 - noa hello-world (main game entry) - VISIBILITY FIX v6
  *
- * What this version does differently:
- * - Uses scene.activeCamera as the source-of-truth (NOA may swap cameras)
- * - Creates an "impossible-to-miss" camera-parented emissive plane (TEST A+)
- * - Forces layerMask = 0xFFFFFFFF and renderingGroupId = 0 (most compatible)
- * - Keeps unfreezing active meshes if needed
- * - Keeps crosshair + pointer lock
- * - Adds a simple third-person avatar box (world space)
+ * Fixes:
+ * - Place proofPlane / arms using activeCamera forward vector (works in RH or LH)
+ * - Also place a "frontCube" directly in front of camera in WORLD space (cannot miss)
+ * - Third-person avatar follows player (simple emissive cube)
+ * - Crosshair + pointer lock
  */
 
 import { Engine } from "noa-engine";
@@ -39,10 +37,10 @@ let forceCrosshair = false;
 
 let inited = false;
 
-let proofPlane = null;      // TEST A+ (camera-parented plane)
-let proofCube = null;       // World proof cube
-let localAvatarMesh = null; // third-person avatar box
-let fpArmsMesh = null;      // first-person arms box
+let proofPlane = null;  // camera-facing proof plane (should appear dead center)
+let fpArmsMesh = null;  // first person arms (simple box)
+let frontCube = null;   // world-space cube placed in front of camera each frame
+let avatarCube = null;  // third-person avatar cube
 
 let frameCounter = 0;
 
@@ -59,15 +57,54 @@ function safeNum(v, fallback = 0) {
   return typeof v === "number" && Number.isFinite(v) ? v : fallback;
 }
 
+function getNoaScene() {
+  try { return noa.rendering.getScene(); } catch { return null; }
+}
+
+function getActiveCamera(scene) {
+  if (!scene) return null;
+  return scene.activeCamera || null;
+}
+
+function makeEmissiveMat(scene, name, color3) {
+  const mat = new BABYLON.StandardMaterial(name, scene);
+  mat.emissiveColor = color3;
+  mat.diffuseColor = color3;
+  mat.specularColor = new BABYLON.Color3(0, 0, 0);
+  mat.disableLighting = true;
+  return mat;
+}
+
+function forceMeshVisible(mesh) {
+  mesh.isVisible = true;
+  mesh.setEnabled(true);
+  mesh.isPickable = false;
+  mesh.alwaysSelectAsActiveMesh = true;
+  mesh.visibility = 1;
+  mesh.layerMask = 0xFFFFFFFF;
+  mesh.renderingGroupId = 0;
+}
+
+/**
+ * Return a normalized WORLD forward vector for the camera.
+ * This works for RH and LH scenes because it uses Babylon's direction transform.
+ */
+function getCameraForwardWorld(cam) {
+  // Axis.Z is "forward" in Babylon's convention for direction transforms.
+  const fwd = cam.getDirection(BABYLON.Axis.Z);
+  // normalize defensively
+  const len = Math.sqrt(fwd.x * fwd.x + fwd.y * fwd.y + fwd.z * fwd.z) || 1;
+  return new BABYLON.Vector3(fwd.x / len, fwd.y / len, fwd.z / len);
+}
+
 /* ============================================================
- * Pointer lock target (TS-safe in JS)
+ * Pointer lock target
  * ============================================================
  */
 
 function getPointerLockElement() {
   const c = /** @type {any} */ (noa && noa.container);
 
-  // If it's a real DOM element, it will have addEventListener
   if (c && typeof c === "object" && typeof c.addEventListener === "function") {
     return /** @type {HTMLElement} */ (c);
   }
@@ -131,7 +168,7 @@ function createCrosshairOverlay() {
   }
 
   document.addEventListener("pointerlockchange", refresh);
-  setInterval(refresh, 300);
+  setInterval(refresh, 250);
 
   return { refresh };
 }
@@ -176,15 +213,34 @@ const crosshairUI = createCrosshairOverlay();
  * ============================================================
  */
 
+function applyViewMode() {
+  const locked = isPointerLockedToNoa();
+  const isFirst = viewMode === 0;
+
+  noa.camera.zoomDistance = isFirst ? 0 : 6;
+
+  if (avatarCube) avatarCube.setEnabled(!isFirst);
+  if (fpArmsMesh) fpArmsMesh.setEnabled(isFirst && locked);
+
+  console.log(
+    "[applyViewMode] viewMode:",
+    isFirst ? "first" : "third",
+    "locked:",
+    locked,
+    "avatar:",
+    !isFirst,
+    "arms:",
+    !!(isFirst && locked)
+  );
+}
+
 document.addEventListener("keydown", (e) => {
   if (e.code === "F5") {
     e.preventDefault();
     viewMode = viewMode === 0 ? 1 : 0;
-
     if (viewMode !== 0) {
       try { document.exitPointerLock?.(); } catch {}
     }
-
     applyViewMode();
     crosshairUI.refresh();
     console.log("[View] mode:", viewMode === 0 ? "first" : "third");
@@ -202,37 +258,6 @@ document.addEventListener("pointerlockchange", () => {
   applyViewMode();
   crosshairUI.refresh();
 });
-
-/* ============================================================
- * Colyseus
- * ============================================================
- */
-
-const DEFAULT_LOCAL_ENDPOINT = "ws://localhost:2567";
-
-let COLYSEUS_ENDPOINT =
-  import.meta.env && import.meta.env.VITE_COLYSEUS_ENDPOINT
-    ? import.meta.env.VITE_COLYSEUS_ENDPOINT
-    : DEFAULT_LOCAL_ENDPOINT;
-
-function toHttpEndpoint(wsEndpoint) {
-  if (wsEndpoint.startsWith("wss://")) return wsEndpoint.replace("wss://", "https://");
-  if (wsEndpoint.startsWith("ws://")) return wsEndpoint.replace("ws://", "http://");
-  return wsEndpoint;
-}
-
-async function debugMatchmake(endpointWsOrHttp) {
-  const http = toHttpEndpoint(endpointWsOrHttp);
-  console.log("[Colyseus][debug] http endpoint:", http);
-  try {
-    const r1 = await fetch(`${http}/hi`, { method: "GET" });
-    console.log("[Colyseus][debug] GET /hi status:", r1.status);
-  } catch (e) {
-    console.error("[Colyseus][debug] GET /hi failed:", e);
-  }
-}
-
-const colyseusClient = new Client(COLYSEUS_ENDPOINT);
 
 /* ============================================================
  * Blocks + world gen
@@ -268,145 +293,6 @@ noa.world.on("worldDataNeeded", function (id, data, x, y, z) {
 });
 
 /* ============================================================
- * Babylon accessors
- * ============================================================
- */
-
-function getNoaScene() {
-  try {
-    return noa.rendering.getScene();
-  } catch {
-    return null;
-  }
-}
-
-function getActiveCamera(scene) {
-  if (!scene) return null;
-  return scene.activeCamera || null;
-}
-
-function makeEmissiveMat(scene, name, color3) {
-  const mat = new BABYLON.StandardMaterial(name, scene);
-  mat.emissiveColor = color3;
-  mat.diffuseColor = color3;
-  mat.specularColor = new BABYLON.Color3(0, 0, 0);
-  mat.disableLighting = true;
-  return mat;
-}
-
-function forceMeshVisible(mesh) {
-  mesh.isVisible = true;
-  mesh.setEnabled(true);
-  mesh.isPickable = false;
-  mesh.alwaysSelectAsActiveMesh = true;
-  mesh.visibility = 1;
-
-  // Most compatible: do not rely on mask matching, just allow everything
-  mesh.layerMask = 0xFFFFFFFF;
-
-  // Most compatible: default render group
-  mesh.renderingGroupId = 0;
-}
-
-/* ============================================================
- * INIT visuals: Test A+ plane + cube + avatar + arms
- * ============================================================
- */
-
-function initVisualsOnce() {
-  if (inited) return;
-  inited = true;
-
-  const scene = getNoaScene();
-
-  console.log("[Babylon] imported Engine.Version:", BABYLON.Engine?.Version);
-
-  const cam0 = scene ? getActiveCamera(scene) : null;
-  console.log("[NOA] scene exists?", !!scene, "activeCamera exists?", !!cam0, "cameraType:", cam0?.getClassName?.());
-
-  if (!scene) return;
-
-  // TEST A: set magenta clearColor (you already see this working)
-  scene.autoClear = true;
-  scene.clearColor = new BABYLON.Color4(1, 0, 1, 1);
-  console.log("[TestA] magenta clearColor set");
-
-  // If NOA ever freezes, unfreeze anyway
-  try {
-    const frozen = !!/** @type {any} */ (scene)._activeMeshesFrozen;
-    console.log("[Diag] scene _activeMeshesFrozen:", frozen);
-    if (typeof scene.unfreezeActiveMeshes === "function") {
-      scene.unfreezeActiveMeshes();
-      console.log("[Diag] scene.unfreezeActiveMeshes() called");
-    }
-  } catch (e) {
-    console.warn("[Diag] unfreezeActiveMeshes probe failed:", e);
-  }
-
-  // TEST A+ : Camera-parented plane that MUST appear if we're in the rendered scene/camera
-  proofPlane = BABYLON.MeshBuilder.CreatePlane("proofPlane", { size: 0.6 }, scene);
-  const proofPlaneMat = makeEmissiveMat(scene, "proofPlaneMat", new BABYLON.Color3(1, 1, 0)); // bright yellow
-  proofPlaneMat.disableDepthWrite = true; // draw on top
-  proofPlane.material = proofPlaneMat;
-  forceMeshVisible(proofPlane);
-
-  // Put it in front of camera once parented
-  proofPlane.position.set(0.0, 0.0, 2.0);
-
-  console.log("[TestA+] proofPlane created (yellow, camera-parented once activeCamera is known)");
-
-  // World proof cube
-  proofCube = BABYLON.MeshBuilder.CreateBox("proofCube", { size: 2 }, scene);
-  proofCube.material = makeEmissiveMat(scene, "proofCubeMat", new BABYLON.Color3(0, 1, 0));
-  proofCube.position.set(0, 14, 0);
-  forceMeshVisible(proofCube);
-  console.log("[PROOF] green cube created at (0,14,0)");
-
-  // Third-person avatar
-  localAvatarMesh = BABYLON.MeshBuilder.CreateBox("localAvatar", { height: 1.8, width: 0.8, depth: 0.4 }, scene);
-  localAvatarMesh.material = makeEmissiveMat(scene, "avatarMat", new BABYLON.Color3(0.2, 0.6, 1.0));
-  forceMeshVisible(localAvatarMesh);
-  console.log("[Avatar] created (manual follow)");
-
-  // First-person arms (camera-parented)
-  fpArmsMesh = BABYLON.MeshBuilder.CreateBox("fpArms", { height: 0.25, width: 0.8, depth: 0.25 }, scene);
-  const armsMat = makeEmissiveMat(scene, "armsMat", new BABYLON.Color3(1.0, 0.85, 0.65));
-  armsMat.disableDepthWrite = true;
-  fpArmsMesh.material = armsMat;
-  forceMeshVisible(fpArmsMesh);
-  fpArmsMesh.position.set(0.35, -0.35, 1.2);
-  console.log("[FPArms] created (will be parented to scene.activeCamera)");
-
-  applyViewMode();
-}
-
-/* ============================================================
- * View mode
- * ============================================================
- */
-
-function applyViewMode() {
-  const locked = isPointerLockedToNoa();
-  const isFirst = viewMode === 0;
-
-  noa.camera.zoomDistance = isFirst ? 0 : 6;
-
-  if (localAvatarMesh) localAvatarMesh.setEnabled(!isFirst);
-  if (fpArmsMesh) fpArmsMesh.setEnabled(isFirst && locked);
-
-  console.log(
-    "[applyViewMode] viewMode:",
-    isFirst ? "first" : "third",
-    "locked:",
-    locked,
-    "avatar:",
-    !isFirst,
-    "arms:",
-    !!(isFirst && locked)
-  );
-}
-
-/* ============================================================
  * Player position
  * ============================================================
  */
@@ -426,9 +312,97 @@ function getNoaHeadingPitch() {
 }
 
 /* ============================================================
- * Connect Colyseus
+ * Init visuals (PROOF + arms + avatar)
  * ============================================================
  */
+
+function initVisualsOnce() {
+  if (inited) return;
+  inited = true;
+
+  const scene = getNoaScene();
+  console.log("[Babylon] imported Engine.Version:", BABYLON.Engine?.Version);
+
+  const cam0 = scene ? getActiveCamera(scene) : null;
+  console.log("[NOA] scene exists?", !!scene, "activeCamera exists?", !!cam0, "cameraType:", cam0?.getClassName?.());
+
+  if (!scene) return;
+
+  // Make sky magenta so we know this code is live
+  scene.autoClear = true;
+  scene.clearColor = new BABYLON.Color4(1, 0, 1, 1);
+  console.log("[TestA] magenta clearColor set");
+
+  // Unfreeze if needed
+  try {
+    const sAny = /** @type {any} */ (scene);
+    console.log("[Diag] scene _activeMeshesFrozen:", !!sAny._activeMeshesFrozen);
+    if (typeof scene.unfreezeActiveMeshes === "function") {
+      scene.unfreezeActiveMeshes();
+      console.log("[Diag] scene.unfreezeActiveMeshes() called");
+    }
+  } catch (e) {
+    console.warn("[Diag] unfreeze probe failed:", e);
+  }
+
+  // Proof plane (bright yellow)
+  proofPlane = BABYLON.MeshBuilder.CreatePlane("proofPlane", { size: 0.8 }, scene);
+  const ppMat = makeEmissiveMat(scene, "ppMat", new BABYLON.Color3(1, 1, 0));
+  ppMat.disableDepthWrite = true;
+  proofPlane.material = ppMat;
+  forceMeshVisible(proofPlane);
+
+  // Arms mesh (skin tone)
+  fpArmsMesh = BABYLON.MeshBuilder.CreateBox("fpArms", { height: 0.25, width: 0.8, depth: 0.25 }, scene);
+  const armsMat = makeEmissiveMat(scene, "armsMat", new BABYLON.Color3(1.0, 0.85, 0.65));
+  armsMat.disableDepthWrite = true;
+  fpArmsMesh.material = armsMat;
+  forceMeshVisible(fpArmsMesh);
+
+  // World-space cube that we move in front of camera each frame (bright green)
+  frontCube = BABYLON.MeshBuilder.CreateBox("frontCube", { size: 0.6 }, scene);
+  frontCube.material = makeEmissiveMat(scene, "frontCubeMat", new BABYLON.Color3(0, 1, 0));
+  forceMeshVisible(frontCube);
+  console.log("[PROOF] frontCube created (will be moved in front of camera each frame)");
+
+  // Third-person avatar cube (blue)
+  avatarCube = BABYLON.MeshBuilder.CreateBox("avatarCube", { height: 1.8, width: 0.8, depth: 0.4 }, scene);
+  avatarCube.material = makeEmissiveMat(scene, "avatarMat", new BABYLON.Color3(0.2, 0.6, 1.0));
+  forceMeshVisible(avatarCube);
+  console.log("[Avatar] created (manual follow)");
+
+  applyViewMode();
+}
+
+/* ============================================================
+ * Colyseus connect
+ * ============================================================
+ */
+
+const DEFAULT_LOCAL_ENDPOINT = "ws://localhost:2567";
+let COLYSEUS_ENDPOINT =
+  import.meta.env && import.meta.env.VITE_COLYSEUS_ENDPOINT
+    ? import.meta.env.VITE_COLYSEUS_ENDPOINT
+    : DEFAULT_LOCAL_ENDPOINT;
+
+function toHttpEndpoint(wsEndpoint) {
+  if (wsEndpoint.startsWith("wss://")) return wsEndpoint.replace("wss://", "https://");
+  if (wsEndpoint.startsWith("ws://")) return wsEndpoint.replace("ws://", "http://");
+  return wsEndpoint;
+}
+
+async function debugMatchmake(endpointWsOrHttp) {
+  const http = toHttpEndpoint(endpointWsOrHttp);
+  console.log("[Colyseus][debug] http endpoint:", http);
+  try {
+    const r1 = await fetch(`${http}/hi`, { method: "GET" });
+    console.log("[Colyseus][debug] GET /hi status:", r1.status);
+  } catch (e) {
+    console.error("[Colyseus][debug] GET /hi failed:", e);
+  }
+}
+
+const colyseusClient = new Client(COLYSEUS_ENDPOINT);
 
 async function connectColyseus() {
   console.log("[Colyseus] connecting to:", COLYSEUS_ENDPOINT);
@@ -469,55 +443,64 @@ noa.on("beforeRender", function () {
   const scene = getNoaScene();
   if (!scene) return;
 
-  // keep magenta background
+  // keep magenta background as a live indicator
   scene.autoClear = true;
   scene.clearColor = new BABYLON.Color4(1, 0, 1, 1);
 
-  // keep unfreezing if NOA re-freezes
-  try {
-    const sAny = /** @type {any} */ (scene);
-    if (sAny._activeMeshesFrozen && typeof scene.unfreezeActiveMeshes === "function") {
-      scene.unfreezeActiveMeshes();
-    }
-  } catch {}
-
-  const activeCam = getActiveCamera(scene);
+  const cam = getActiveCamera(scene);
 
   frameCounter++;
   if (frameCounter % 120 === 0) {
     console.log(
       "[Diag] activeCamera:",
-      activeCam ? `${activeCam.name} (${activeCam.getClassName?.()})` : "(none)",
+      cam ? `${cam.name} (${cam.getClassName?.()})` : "(none)",
+      "| useRightHandedSystem:",
+      !!scene.useRightHandedSystem,
       "| meshes:",
       scene.meshes?.length
     );
   }
 
-  // This is the key:
-  // Parent proofPlane and fpArms to the *actual* active camera (even if it changes)
-  if (activeCam) {
-    // reduce chance of near-plane clipping for camera children
-    if (typeof activeCam.minZ === "number" && activeCam.minZ > 0.05) activeCam.minZ = 0.05;
+  if (!cam) return;
 
-    if (proofPlane && proofPlane.parent !== activeCam) {
-      proofPlane.parent = activeCam;
-      proofPlane.position.set(0.0, 0.0, 2.0);
-      console.log("[TestA+] proofPlane re-parented to activeCamera");
-    }
+  // Ensure minZ isn't clipping camera children
+  if (typeof cam.minZ === "number" && cam.minZ > 0.05) cam.minZ = 0.05;
 
-    if (fpArmsMesh && fpArmsMesh.parent !== activeCam) {
-      fpArmsMesh.parent = activeCam;
-      fpArmsMesh.position.set(0.35, -0.35, 1.2);
-      console.log("[FPArms] re-parented to activeCamera");
-    }
+  // Get camera world forward direction (works RH/LH)
+  const fwd = getCameraForwardWorld(cam);
+
+  // Place a WORLD cube directly in front of camera (cannot be behind)
+  if (frontCube) {
+    const worldPos = cam.position.add(fwd.scale(4));
+    frontCube.position.copyFrom(worldPos);
+    frontCube.rotation.y += 0.03;
   }
 
-  // Third-person avatar follow
-  if (localAvatarMesh) {
+  // Parent proofPlane + arms to camera, but position them using FORWARD vector
+  // (we don't trust local +Z/-Z, we compute real forward and convert into parent space)
+  if (proofPlane) {
+    if (proofPlane.parent !== cam) proofPlane.parent = cam;
+
+    // Put it forward, centered
+    // Since it's parented, we can just use "local" offsets,
+    // but we still need the correct sign. We derive it from fwd.z in camera space.
+    // Simple robust approach: use scene RH flag.
+    const forwardSign = scene.useRightHandedSystem ? -1 : 1;
+    proofPlane.position.set(0, 0, forwardSign * 2.0);
+  }
+
+  if (fpArmsMesh) {
+    if (fpArmsMesh.parent !== cam) fpArmsMesh.parent = cam;
+    const forwardSign = scene.useRightHandedSystem ? -1 : 1;
+    fpArmsMesh.position.set(0.35, -0.35, forwardSign * 1.2);
+  }
+
+  // Third-person avatar follow (world space)
+  if (avatarCube) {
     const [x, y, z] = getLocalPlayerPosition();
-    localAvatarMesh.position.set(x, y + 0.9, z);
+    avatarCube.position.set(x, y + 0.9, z);
     const { heading } = getNoaHeadingPitch();
-    localAvatarMesh.rotation.y = heading;
+    avatarCube.rotation.y = heading;
   }
 });
 
