@@ -1,19 +1,13 @@
 /*
- * Fresh2 - noa hello-world (main game entry) - VISIBILITY FIX v4
+ * Fresh2 - noa hello-world (main game entry) - VISIBILITY FIX v5 (Test A+)
  *
- * Key change:
- * - If NOA/Babylon freezes active meshes, NEW meshes will NEVER render.
- *   So we explicitly unfreeze active meshes once we have the scene.
- *
- * Also:
- * - Avatar is updated manually every frame (no NOA mesh component dependency)
- * - Arms are parented to NOA camera with correct layerMask + top render group
- * - Crosshair kept
- *
- * Controls:
- * - Click canvas to pointer-lock (only in first-person)
- * - F5 toggle view: first-person <-> third-person
- * - F6 toggle crosshair forced
+ * What this version does differently:
+ * - Uses scene.activeCamera as the source-of-truth (NOA may swap cameras)
+ * - Creates an "impossible-to-miss" camera-parented emissive plane (TEST A+)
+ * - Forces layerMask = 0xFFFFFFFF and renderingGroupId = 0 (most compatible)
+ * - Keeps unfreezing active meshes if needed
+ * - Keeps crosshair + pointer lock
+ * - Adds a simple third-person avatar box (world space)
  */
 
 import { Engine } from "noa-engine";
@@ -43,14 +37,17 @@ const noa = new Engine(opts);
 let viewMode = 0; // 0 first, 1 third
 let forceCrosshair = false;
 
-let localAvatarMesh = null; // Babylon mesh updated manually each frame
-let fpArmsMesh = null;      // Babylon mesh parented to camera
-let proofCube = null;       // always-visible debug cube
-
 let inited = false;
 
+let proofPlane = null;      // TEST A+ (camera-parented plane)
+let proofCube = null;       // World proof cube
+let localAvatarMesh = null; // third-person avatar box
+let fpArmsMesh = null;      // first-person arms box
+
+let frameCounter = 0;
+
 /* ============================================================
- * Small helpers
+ * Helpers
  * ============================================================
  */
 
@@ -63,20 +60,16 @@ function safeNum(v, fallback = 0) {
 }
 
 /* ============================================================
- * Pointer lock helpers (TS-safe in .js)
+ * Pointer lock target (TS-safe in JS)
  * ============================================================
  */
 
-/**
- * @returns {HTMLElement|HTMLCanvasElement|null}
- */
 function getPointerLockElement() {
   const c = /** @type {any} */ (noa && noa.container);
 
-  if (c && typeof c === "object") {
-    if (typeof c.addEventListener === "function") {
-      return /** @type {HTMLElement} */ (c);
-    }
+  // If it's a real DOM element, it will have addEventListener
+  if (c && typeof c === "object" && typeof c.addEventListener === "function") {
+    return /** @type {HTMLElement} */ (c);
   }
 
   const div = document.getElementById("noa-container");
@@ -146,7 +139,7 @@ function createCrosshairOverlay() {
 const crosshairUI = createCrosshairOverlay();
 
 /* ============================================================
- * Click-to-lock pointer (TS-safe in .js)
+ * Click-to-lock pointer
  * ============================================================
  */
 
@@ -242,7 +235,7 @@ async function debugMatchmake(endpointWsOrHttp) {
 const colyseusClient = new Client(COLYSEUS_ENDPOINT);
 
 /* ============================================================
- * Register voxel types
+ * Blocks + world gen
  * ============================================================
  */
 
@@ -254,11 +247,6 @@ noa.registry.registerMaterial("grass", { color: greenish });
 
 const dirtID = noa.registry.registerBlock(1, { material: "dirt" });
 const grassID = noa.registry.registerBlock(2, { material: "grass" });
-
-/* ============================================================
- * World generation
- * ============================================================
- */
 
 function getVoxelID(x, y, z) {
   if (y < -3) return dirtID;
@@ -280,7 +268,7 @@ noa.world.on("worldDataNeeded", function (id, data, x, y, z) {
 });
 
 /* ============================================================
- * Babylon helpers
+ * Babylon accessors
  * ============================================================
  */
 
@@ -292,10 +280,9 @@ function getNoaScene() {
   }
 }
 
-function getNoaCamera() {
-  // NOA keeps Babylon camera on noa.rendering.camera
-  const cam = noa && noa.rendering && noa.rendering.camera;
-  return cam || null;
+function getActiveCamera(scene) {
+  if (!scene) return null;
+  return scene.activeCamera || null;
 }
 
 function makeEmissiveMat(scene, name, color3) {
@@ -307,22 +294,22 @@ function makeEmissiveMat(scene, name, color3) {
   return mat;
 }
 
-function forceMeshVisible(mesh, cam) {
+function forceMeshVisible(mesh) {
   mesh.isVisible = true;
   mesh.setEnabled(true);
   mesh.isPickable = false;
   mesh.alwaysSelectAsActiveMesh = true;
+  mesh.visibility = 1;
 
-  // Match whatever camera NOA is using
-  if (cam && typeof cam.layerMask === "number") {
-    mesh.layerMask = cam.layerMask;
-  } else {
-    mesh.layerMask = 0xFFFFFFFF;
-  }
+  // Most compatible: do not rely on mask matching, just allow everything
+  mesh.layerMask = 0xFFFFFFFF;
+
+  // Most compatible: default render group
+  mesh.renderingGroupId = 0;
 }
 
 /* ============================================================
- * Core init: unfreeze + create avatar + create arms
+ * INIT visuals: Test A+ plane + cube + avatar + arms
  * ============================================================
  */
 
@@ -331,88 +318,70 @@ function initVisualsOnce() {
   inited = true;
 
   const scene = getNoaScene();
-  const cam = getNoaCamera();
 
   console.log("[Babylon] imported Engine.Version:", BABYLON.Engine?.Version);
-  console.log("[NOA] scene exists?", !!scene, "camera exists?", !!cam, "cameraType:", cam?.getClassName?.());
+
+  const cam0 = scene ? getActiveCamera(scene) : null;
+  console.log("[NOA] scene exists?", !!scene, "activeCamera exists?", !!cam0, "cameraType:", cam0?.getClassName?.());
 
   if (!scene) return;
 
-  // TEST A: magenta sky = prove deployed entry runs
+  // TEST A: set magenta clearColor (you already see this working)
   scene.autoClear = true;
   scene.clearColor = new BABYLON.Color4(1, 0, 1, 1);
   console.log("[TestA] magenta clearColor set");
 
-  // CRITICAL: unfreeze active meshes (if NOA froze them)
+  // If NOA ever freezes, unfreeze anyway
   try {
-    const sAny = /** @type {any} */ (scene);
-    const frozen = !!sAny._activeMeshesFrozen;
+    const frozen = !!/** @type {any} */ (scene)._activeMeshesFrozen;
     console.log("[Diag] scene _activeMeshesFrozen:", frozen);
-
     if (typeof scene.unfreezeActiveMeshes === "function") {
       scene.unfreezeActiveMeshes();
       console.log("[Diag] scene.unfreezeActiveMeshes() called");
     }
-
-    // If NOA re-freezes each frame, we will keep unfreezing in beforeRender as well
   } catch (e) {
     console.warn("[Diag] unfreezeActiveMeshes probe failed:", e);
   }
 
-  // PROOF CUBE (world) - should be visible in third-person at least
-  proofCube = BABYLON.MeshBuilder.CreateBox("proofBox", { size: 2 }, scene);
+  // TEST A+ : Camera-parented plane that MUST appear if we're in the rendered scene/camera
+  proofPlane = BABYLON.MeshBuilder.CreatePlane("proofPlane", { size: 0.6 }, scene);
+  const proofPlaneMat = makeEmissiveMat(scene, "proofPlaneMat", new BABYLON.Color3(1, 1, 0)); // bright yellow
+  proofPlaneMat.disableDepthWrite = true; // draw on top
+  proofPlane.material = proofPlaneMat;
+  forceMeshVisible(proofPlane);
+
+  // Put it in front of camera once parented
+  proofPlane.position.set(0.0, 0.0, 2.0);
+
+  console.log("[TestA+] proofPlane created (yellow, camera-parented once activeCamera is known)");
+
+  // World proof cube
+  proofCube = BABYLON.MeshBuilder.CreateBox("proofCube", { size: 2 }, scene);
+  proofCube.material = makeEmissiveMat(scene, "proofCubeMat", new BABYLON.Color3(0, 1, 0));
   proofCube.position.set(0, 14, 0);
-  proofCube.material = makeEmissiveMat(scene, "proofMat", new BABYLON.Color3(0, 1, 0));
-  forceMeshVisible(proofCube, cam);
+  forceMeshVisible(proofCube);
   console.log("[PROOF] green cube created at (0,14,0)");
 
-  // THIRD PERSON AVATAR (manual follow)
-  localAvatarMesh = BABYLON.MeshBuilder.CreateBox(
-    "localAvatar",
-    { height: 1.8, width: 0.8, depth: 0.4 },
-    scene
-  );
+  // Third-person avatar
+  localAvatarMesh = BABYLON.MeshBuilder.CreateBox("localAvatar", { height: 1.8, width: 0.8, depth: 0.4 }, scene);
   localAvatarMesh.material = makeEmissiveMat(scene, "avatarMat", new BABYLON.Color3(0.2, 0.6, 1.0));
-  forceMeshVisible(localAvatarMesh, cam);
-  localAvatarMesh.renderingGroupId = 1;
+  forceMeshVisible(localAvatarMesh);
   console.log("[Avatar] created (manual follow)");
 
-  // FIRST PERSON ARMS (camera-parented overlay)
-  if (cam) {
-    fpArmsMesh = BABYLON.MeshBuilder.CreateBox(
-      "fpArms",
-      { height: 0.35, width: 0.75, depth: 0.35 },
-      scene
-    );
-
-    // arms material: emissive + no depth write so it draws on top
-    const armsMat = makeEmissiveMat(scene, "armsMat", new BABYLON.Color3(1.0, 0.85, 0.65));
-    armsMat.disableDepthWrite = true;
-    fpArmsMesh.material = armsMat;
-
-    forceMeshVisible(fpArmsMesh, cam);
-
-    // Draw after terrain
-    fpArmsMesh.renderingGroupId = 2;
-
-    // Parent to camera so it can't be "somewhere else"
-    fpArmsMesh.parent = cam;
-    fpArmsMesh.position.set(0.35, -0.35, 1.0);
-    fpArmsMesh.scaling.set(1.2, 1.0, 1.0);
-
-    // Some Babylon cameras ignore children unless this is set; harmless otherwise
-    fpArmsMesh.infiniteDistance = true;
-
-    console.log("[FPArms] created + parented to camera, renderingGroupId=2");
-  } else {
-    console.warn("[FPArms] camera missing - cannot parent arms");
-  }
+  // First-person arms (camera-parented)
+  fpArmsMesh = BABYLON.MeshBuilder.CreateBox("fpArms", { height: 0.25, width: 0.8, depth: 0.25 }, scene);
+  const armsMat = makeEmissiveMat(scene, "armsMat", new BABYLON.Color3(1.0, 0.85, 0.65));
+  armsMat.disableDepthWrite = true;
+  fpArmsMesh.material = armsMat;
+  forceMeshVisible(fpArmsMesh);
+  fpArmsMesh.position.set(0.35, -0.35, 1.2);
+  console.log("[FPArms] created (will be parented to scene.activeCamera)");
 
   applyViewMode();
 }
 
 /* ============================================================
- * View mode application
+ * View mode
  * ============================================================
  */
 
@@ -420,11 +389,7 @@ function applyViewMode() {
   const locked = isPointerLockedToNoa();
   const isFirst = viewMode === 0;
 
-  if (isFirst) {
-    noa.camera.zoomDistance = 0;
-  } else {
-    noa.camera.zoomDistance = clamp(6, 2, 12);
-  }
+  noa.camera.zoomDistance = isFirst ? 0 : 6;
 
   if (localAvatarMesh) localAvatarMesh.setEnabled(!isFirst);
   if (fpArmsMesh) fpArmsMesh.setEnabled(isFirst && locked);
@@ -442,7 +407,7 @@ function applyViewMode() {
 }
 
 /* ============================================================
- * Position helpers
+ * Player position
  * ============================================================
  */
 
@@ -477,7 +442,6 @@ async function connectColyseus() {
       console.log("[Colyseus] welcome:", msg);
     });
 
-    // init visuals once the renderer is ready
     initVisualsOnce();
 
     setInterval(() => {
@@ -495,7 +459,7 @@ async function connectColyseus() {
 connectColyseus();
 
 /* ============================================================
- * Main tick hooks
+ * Main hooks
  * ============================================================
  */
 
@@ -503,40 +467,61 @@ noa.on("beforeRender", function () {
   initVisualsOnce();
 
   const scene = getNoaScene();
-  const cam = getNoaCamera();
+  if (!scene) return;
 
-  if (scene) {
-    // keep Test A magenta
-    scene.autoClear = true;
-    scene.clearColor = new BABYLON.Color4(1, 0, 1, 1);
+  // keep magenta background
+  scene.autoClear = true;
+  scene.clearColor = new BABYLON.Color4(1, 0, 1, 1);
 
-    // If NOA re-freezes, keep unfreezing
-    try {
-      const sAny = /** @type {any} */ (scene);
-      if (sAny._activeMeshesFrozen && typeof scene.unfreezeActiveMeshes === "function") {
-        scene.unfreezeActiveMeshes();
-      }
-    } catch {}
+  // keep unfreezing if NOA re-freezes
+  try {
+    const sAny = /** @type {any} */ (scene);
+    if (sAny._activeMeshesFrozen && typeof scene.unfreezeActiveMeshes === "function") {
+      scene.unfreezeActiveMeshes();
+    }
+  } catch {}
+
+  const activeCam = getActiveCamera(scene);
+
+  frameCounter++;
+  if (frameCounter % 120 === 0) {
+    console.log(
+      "[Diag] activeCamera:",
+      activeCam ? `${activeCam.name} (${activeCam.getClassName?.()})` : "(none)",
+      "| meshes:",
+      scene.meshes?.length
+    );
   }
 
-  // Manual-follow avatar (THIS is your 3rd person)
+  // This is the key:
+  // Parent proofPlane and fpArms to the *actual* active camera (even if it changes)
+  if (activeCam) {
+    // reduce chance of near-plane clipping for camera children
+    if (typeof activeCam.minZ === "number" && activeCam.minZ > 0.05) activeCam.minZ = 0.05;
+
+    if (proofPlane && proofPlane.parent !== activeCam) {
+      proofPlane.parent = activeCam;
+      proofPlane.position.set(0.0, 0.0, 2.0);
+      console.log("[TestA+] proofPlane re-parented to activeCamera");
+    }
+
+    if (fpArmsMesh && fpArmsMesh.parent !== activeCam) {
+      fpArmsMesh.parent = activeCam;
+      fpArmsMesh.position.set(0.35, -0.35, 1.2);
+      console.log("[FPArms] re-parented to activeCamera");
+    }
+  }
+
+  // Third-person avatar follow
   if (localAvatarMesh) {
     const [x, y, z] = getLocalPlayerPosition();
     localAvatarMesh.position.set(x, y + 0.9, z);
-
-    // Optional: rotate avatar with camera heading so you can see it clearly
     const { heading } = getNoaHeadingPitch();
     localAvatarMesh.rotation.y = heading;
-  }
-
-  // Keep arms matched to camera mask in case NOA changes it
-  if (fpArmsMesh && cam && typeof cam.layerMask === "number") {
-    fpArmsMesh.layerMask = cam.layerMask;
   }
 });
 
 noa.on("tick", function () {
-  // third-person zoom scroll
   const scroll = noa.inputs.pointerState.scrolly;
   if (scroll !== 0 && viewMode !== 0) {
     noa.camera.zoomDistance += scroll > 0 ? 1 : -1;
@@ -545,7 +530,7 @@ noa.on("tick", function () {
 });
 
 /* ============================================================
- * Interactivity (blocks)
+ * Block interactions
  * ============================================================
  */
 
