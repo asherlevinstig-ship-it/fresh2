@@ -1,22 +1,3 @@
-/*
- * Fresh2 - noa hello-world (single Babylon runtime via "babylonjs" alias)
- *
- * IMPORTANT SETUP:
- * - vite.config.js:
- *     alias: { babylonjs: '@babylonjs/core/Legacy/legacy' }
- *     dedupe: ['@babylonjs/core']
- * - uninstall old UMD runtime:
- *     npm remove babylonjs
- *
- * This file (plain JS):
- * - Break blocks (LMB) + Place blocks (E)
- * - Click-to-pointer-lock (first-person only)
- * - F5 cycles view: first, third-back, third-front
- * - Solid-color third-person avatar (attached to NOA player entity)
- * - Solid-color first-person arms (camera-relative, no parenting)
- * - Magenta diagnostic cube at (0,10,0) always enabled
- */
-
 import { Engine } from "noa-engine";
 import { Client } from "@colyseus/sdk";
 import * as BABYLON from "babylonjs";
@@ -42,12 +23,11 @@ const noaAny = /** @type {any} */ (noa);
  */
 
 let viewMode = 0; // 0 = first, 1 = third-back, 2 = third-front
+let meshesBuilt = false;
 
 let avatarRoot = null;
 let armsRoot = null;
 let diagCube = null;
-
-let meshesBuilt = false;
 
 /* ============================================================
  * World generation
@@ -125,7 +105,7 @@ function isPointerLockedToNoa() {
 function makeEmissiveMat(scene, name, color3) {
   const mat = new BABYLON.StandardMaterial(name, scene);
   mat.diffuseColor = color3.clone();
-  mat.emissiveColor = color3.scale(0.35);
+  mat.emissiveColor = color3.scale(0.6);
   mat.specularColor = new BABYLON.Color3(0, 0, 0);
   mat.backFaceCulling = false;
   mat.disableLighting = true;
@@ -133,13 +113,18 @@ function makeEmissiveMat(scene, name, color3) {
   return mat;
 }
 
-function ensureCameraClipPlanes(scene) {
-  try {
-    if (scene && scene.activeCamera) {
-      scene.activeCamera.minZ = 0.01;
-      scene.activeCamera.maxZ = 5000;
-    }
-  } catch {}
+function forceMeshVisible(mesh) {
+  if (!mesh) return;
+  mesh.isVisible = true;
+  mesh.visibility = 1;
+  mesh.setEnabled(true);
+  mesh.alwaysSelectAsActiveMesh = true;
+
+  // Render after terrain chunks
+  mesh.renderingGroupId = 2;
+
+  // Ensure camera can see it regardless of layer mask
+  mesh.layerMask = 0xFFFFFFFF;
 }
 
 /* ============================================================
@@ -221,8 +206,10 @@ function applyViewMode() {
 
   noa.camera.zoomDistance = isFirst ? 0 : 6;
 
+  // Avatar visible in third-person always
   if (avatarRoot) avatarRoot.setEnabled(!isFirst);
 
+  // Arms only in first-person + locked
   const armsOn = isFirst && locked;
   if (armsRoot) armsRoot.setEnabled(armsOn);
 }
@@ -233,14 +220,11 @@ function applyViewMode() {
  */
 
 function createDiagnosticCube(scene) {
-  const cube = BABYLON.MeshBuilder.CreateBox("diagCube", { size: 6 }, scene);
+  const cube = BABYLON.MeshBuilder.CreateBox("diagCube", { size: 8 }, scene);
   cube.material = makeEmissiveMat(scene, "diagCubeMat", new BABYLON.Color3(1, 0, 1)); // magenta
   cube.position.set(0, 10, 0);
   cube.isPickable = false;
-  cube.isVisible = true;
-  cube.visibility = 1;
-  cube.alwaysSelectAsActiveMesh = true;
-  cube.setEnabled(true);
+  forceMeshVisible(cube);
   console.log("[Diag] Magenta cube created at (0,10,0)");
   return cube;
 }
@@ -248,8 +232,7 @@ function createDiagnosticCube(scene) {
 function createThirdPersonAvatar(scene) {
   const root = new BABYLON.Mesh("avatarRoot", scene);
   root.isPickable = false;
-  root.alwaysSelectAsActiveMesh = true;
-  root.setEnabled(false);
+  forceMeshVisible(root);
 
   const matBody = makeEmissiveMat(scene, "avBodyMat", new BABYLON.Color3(0.2, 0.9, 0.2));
   const matHead = makeEmissiveMat(scene, "avHeadMat", new BABYLON.Color3(0.9, 0.85, 0.2));
@@ -259,31 +242,40 @@ function createThirdPersonAvatar(scene) {
   head.material = matHead;
   head.parent = root;
   head.position.set(0, 2.6, 0);
+  forceMeshVisible(head);
 
   const body = BABYLON.MeshBuilder.CreateBox("avBody", { width: 1, height: 1.5, depth: 0.5 }, scene);
   body.material = matBody;
   body.parent = root;
   body.position.set(0, 1.6, 0);
+  forceMeshVisible(body);
 
   const armR = BABYLON.MeshBuilder.CreateBox("avArmR", { width: 0.35, height: 1.2, depth: 0.35 }, scene);
   armR.material = matLimb;
   armR.parent = root;
   armR.position.set(-0.8, 1.7, 0);
+  forceMeshVisible(armR);
 
   const armL = BABYLON.MeshBuilder.CreateBox("avArmL", { width: 0.35, height: 1.2, depth: 0.35 }, scene);
   armL.material = matLimb;
   armL.parent = root;
   armL.position.set(0.8, 1.7, 0);
+  forceMeshVisible(armL);
 
   const legR = BABYLON.MeshBuilder.CreateBox("avLegR", { width: 0.4, height: 1.2, depth: 0.4 }, scene);
   legR.material = matLimb;
   legR.parent = root;
   legR.position.set(-0.25, 0.6, 0);
+  forceMeshVisible(legR);
 
   const legL = BABYLON.MeshBuilder.CreateBox("avLegL", { width: 0.4, height: 1.2, depth: 0.4 }, scene);
   legL.material = matLimb;
   legL.parent = root;
   legL.position.set(0.25, 0.6, 0);
+  forceMeshVisible(legL);
+
+  // Start enabled so we can see it immediately if in view
+  root.setEnabled(true);
 
   console.log("[Avatar] created (solid color)");
   return root;
@@ -292,8 +284,7 @@ function createThirdPersonAvatar(scene) {
 function createFirstPersonArms(scene) {
   const root = new BABYLON.Mesh("armsRoot", scene);
   root.isPickable = false;
-  root.alwaysSelectAsActiveMesh = true;
-  root.setEnabled(false);
+  forceMeshVisible(root);
 
   const matArms = makeEmissiveMat(scene, "fpArmsMat", new BABYLON.Color3(1.0, 0.1, 0.1));
 
@@ -302,58 +293,45 @@ function createFirstPersonArms(scene) {
   armR.parent = root;
   armR.position.set(0.35, -0.25, 0.8);
   armR.rotation.set(0.15, 0.2, 0.15);
+  forceMeshVisible(armR);
 
   const armL = BABYLON.MeshBuilder.CreateBox("fpArmL", { width: 0.25, height: 0.8, depth: 0.25 }, scene);
   armL.material = matArms;
   armL.parent = root;
   armL.position.set(-0.35, -0.3, 0.75);
   armL.rotation.set(0.05, -0.2, -0.05);
+  forceMeshVisible(armL);
 
   console.log("[FPArms] created (solid color)");
   return root;
 }
 
 /* ============================================================
- * Attach avatar to player entity (NOA mesh component)
+ * Update transforms
  * ============================================================
  */
 
-let attached = false;
-
-function attachAvatarToPlayer() {
-  if (attached) return;
-  if (!avatarRoot) return;
-
+function getPlayerPosition() {
   try {
-    const entities = noaAny.entities;
-    const player = noa.playerEntity;
-    const meshCompName = (entities && entities.names && entities.names.mesh) ? entities.names.mesh : "mesh";
-
-    if (entities && typeof entities.addComponent === "function") {
-      if (!entities.hasComponent || !entities.hasComponent(player, meshCompName)) {
-        entities.addComponent(player, meshCompName, {
-          mesh: avatarRoot,
-          offset: [0, 0, 0],
-        });
-        console.log("[Avatar] attached to player entity via NOA mesh component");
-      } else {
-        console.log("[Avatar] mesh component already exists on player");
-      }
-      attached = true;
-    } else {
-      console.warn("[Avatar] entities.addComponent not found (NOA API mismatch)");
-    }
-  } catch (e) {
-    console.warn("[Avatar] attach failed:", e);
-  }
+    const p = noa.entities.getPosition(noa.playerEntity);
+    if (p && p.length >= 3) return [p[0], p[1], p[2]];
+  } catch {}
+  return [0, 10, 0];
 }
 
-/* ============================================================
- * Arms positioning update (camera-relative)
- * ============================================================
- */
+function updateAvatarFollowPlayer() {
+  if (!avatarRoot) return;
 
-function updateArms(cam) {
+  const [x, y, z] = getPlayerPosition();
+
+  // Put avatar at player position (add a small lift so it's not inside ground)
+  avatarRoot.position.set(x, y, z);
+
+  // Force visibility every frame (defensive)
+  forceMeshVisible(avatarRoot);
+}
+
+function updateArmsFollowCamera(cam) {
   if (!armsRoot || !armsRoot.isEnabled()) return;
 
   try {
@@ -372,6 +350,9 @@ function updateArms(cam) {
       armsRoot.rotationQuaternion = null;
       armsRoot.rotation.copyFrom(cam.rotation);
     }
+
+    // Force visibility (defensive)
+    forceMeshVisible(armsRoot);
   } catch (e) {
     console.warn("[FPArms] update failed:", e);
   }
@@ -392,15 +373,20 @@ function ensureMeshes() {
   console.log("[Babylon] imported Engine.Version:", BABYLON.Engine && BABYLON.Engine.Version ? BABYLON.Engine.Version : "(unknown)");
   console.log("[NOA] scene exists?", !!scene, "camera exists?", !!cam, "cameraType:", cam && cam.getClassName ? cam.getClassName() : "(unknown)");
 
-  ensureCameraClipPlanes(scene);
+  // Force activeCamera to see ALL layers
+  try {
+    if (scene.activeCamera) {
+      scene.activeCamera.layerMask = 0xFFFFFFFF;
+      scene.activeCamera.minZ = 0.01;
+      scene.activeCamera.maxZ = 5000;
+    }
+  } catch {}
 
   diagCube = createDiagnosticCube(scene);
   avatarRoot = createThirdPersonAvatar(scene);
   armsRoot = createFirstPersonArms(scene);
 
-  attachAvatarToPlayer();
   applyViewMode();
-
   document.addEventListener("pointerlockchange", applyViewMode);
 
   meshesBuilt = true;
@@ -412,6 +398,7 @@ function ensureMeshes() {
  */
 
 noa.on("tick", function () {
+  // Third-person scroll zoom
   const scroll = noa.inputs.pointerState.scrolly;
   if (scroll !== 0 && viewMode !== 0) {
     noa.camera.zoomDistance += scroll > 0 ? 1 : -1;
@@ -422,10 +409,20 @@ noa.on("tick", function () {
 noa.on("beforeRender", function () {
   ensureMeshes();
 
+  const scene = getNoaScene();
   const cam = getNoaCamera();
-  if (!cam) return;
+  if (!scene || !cam) return;
 
-  updateArms(cam);
+  // Keep camera layer mask wide open
+  try {
+    if (scene.activeCamera) scene.activeCamera.layerMask = 0xFFFFFFFF;
+  } catch {}
+
+  // Avatar follows player regardless of NOA mesh component
+  updateAvatarFollowPlayer();
+
+  // Arms follow camera
+  updateArmsFollowCamera(cam);
 });
 
 /* ============================================================
