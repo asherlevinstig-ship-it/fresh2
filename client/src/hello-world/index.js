@@ -1,8 +1,16 @@
 /*
- * Fix: VSCode/TS errors in .js because Babylon d.ts doesn't expose customRenderFunction on Scene/RenderingManager.
- * Solution: access via any-cast (sAny.customRenderFunction / rmAny.customRenderFunction).
+ * Fresh2 - noa hello-world (main entry)
+ * Rewritten in full (NO OMITS) with:
+ * - Crosshair overlay
+ * - Pointer lock click handler (TS-safe in .js)
+ * - TestA magenta clearColor
+ * - Render Pipeline Truth Test (RenderProbe) with TS-safe any-casts
+ * - PROOF frontCube that is moved in front of the active camera EACH FRAME
+ * - Safe frustum diagnostic (uses cam.getFrustumPlanes() instead of passing camera)
+ * - Simple "avatar cube" for 3rd person and "fp arms cube" for 1st person
+ * - Block break/place stays intact
  *
- * This is the same file as before, but with the RenderProbe block edited so TS stops complaining.
+ * NOTE: This file is plain JS. No TS type annotations.
  */
 
 import { Engine as NoaEngine } from "noa-engine";
@@ -34,7 +42,24 @@ const noa = new NoaEngine(opts);
 const noaAny = noa;
 
 /* ============================================================
- * Simple helpers
+ * State
+ * ============================================================
+ */
+
+let viewMode = 0; // 0 first, 1 third
+let forceCrosshair = false;
+
+let visualsInited = false;
+let scene = null;
+
+let frontCube = null;   // proof object always in front of camera
+let avatarCube = null;  // third-person marker at player
+let fpArms = null;      // first-person marker near camera
+
+let frameCounter = 0;
+
+/* ============================================================
+ * Small helpers
  * ============================================================
  */
 
@@ -50,9 +75,6 @@ function safeNum(v, fallback = 0) {
  * Crosshair overlay
  * ============================================================
  */
-
-let viewMode = 0; // 0 first, 1 third
-let forceCrosshair = false;
 
 function getPointerLockTarget() {
   const c = noaAny.container;
@@ -127,7 +149,7 @@ function createCrosshairOverlay() {
 const crosshairUI = createCrosshairOverlay();
 
 /* ============================================================
- * Click-to-lock pointer (VSCode TS-safe via any-cast)
+ * Click-to-lock pointer (TS-safe in .js)
  * ============================================================
  */
 
@@ -140,11 +162,13 @@ const crosshairUI = createCrosshairOverlay();
     /** @type {any} */
     const el = target;
 
+    // make focusable
     if (typeof el.setAttribute === "function" && typeof el.hasAttribute === "function") {
       if (!el.hasAttribute("tabindex")) el.setAttribute("tabindex", "1");
     }
     if (el.style) el.style.outline = "none";
 
+    // event hook that works for DOM elements, and won't upset TS if target typed weird
     const addEvt = el.addEventListener || el.addListener;
     if (typeof addEvt === "function") {
       addEvt.call(el, "click", () => {
@@ -172,7 +196,7 @@ const crosshairUI = createCrosshairOverlay();
 document.addEventListener("keydown", (e) => {
   if (e.code === "F5") {
     e.preventDefault();
-    viewMode = (viewMode + 1) % 2; // first/third
+    viewMode = (viewMode + 1) % 2; // first/third toggle
     if (viewMode !== 0) {
       try {
         document.exitPointerLock?.();
@@ -191,7 +215,7 @@ document.addEventListener("keydown", (e) => {
 });
 
 /* ============================================================
- * Colyseus (optional)
+ * Colyseus
  * ============================================================
  */
 
@@ -255,32 +279,9 @@ noa.world.on("worldDataNeeded", function (id, data, x, y, z) {
 });
 
 /* ============================================================
- * Babylon / Visual diagnostics
+ * Visuals init
  * ============================================================
  */
-
-let visualsInited = false;
-let scene = null;
-let frontCube = null;
-let avatarCube = null;
-let fpArms = null;
-
-let frameCounter = 0;
-
-function getNoaCameraPositionVec3() {
-  try {
-    const p = noa.camera.getPosition();
-    return new Vector3(p[0], p[1], p[2]);
-  } catch {
-    try {
-      const ent = noa.playerEntity;
-      const pos = noa.entities.getPosition(ent);
-      return new Vector3(pos[0], pos[1] + 1.6, pos[2]);
-    } catch {
-      return new Vector3(0, 10, 0);
-    }
-  }
-}
 
 function initVisualsOnce() {
   if (visualsInited) return;
@@ -299,10 +300,20 @@ function initVisualsOnce() {
 
   // TestA: magenta sky
   try {
-    scene.clearColor = new (/** @type {any} */ (scene.clearColor).constructor)(1, 0, 1, 1);
+    // safest possible: set a BABYLON Color4 if present, else fallback won't crash
+    /** @type {any} */
+    const sAny = scene;
+    if (sAny.clearColor && typeof sAny.clearColor === "object") {
+      // Many Babylon builds use Color4 here; forcing values directly is ok
+      sAny.clearColor.r = 1;
+      sAny.clearColor.g = 0;
+      sAny.clearColor.b = 1;
+      sAny.clearColor.a = 1;
+    }
   } catch {}
   console.log("[TestA] magenta clearColor set");
 
+  // Active meshes frozen?
   console.log("[Diag] scene _activeMeshesFrozen:", scene._activeMeshesFrozen);
   try {
     if (typeof scene.unfreezeActiveMeshes === "function") {
@@ -313,46 +324,52 @@ function initVisualsOnce() {
     console.warn("[Diag] unfreezeActiveMeshes failed:", e);
   }
 
-  // Proof cube: shoved in front of camera each frame
+  // PROOF cube: moved in front of camera each frame
   frontCube = MeshBuilder.CreateBox("frontCube", { size: 1.2 }, scene);
-  const frontMat = new StandardMaterial("frontMat", scene);
-  frontMat.diffuseColor = new Color3(0, 0.5, 1);
-  frontMat.emissiveColor = new Color3(0, 0.5, 1);
-  frontMat.specularColor = new Color3(0, 0, 0);
-  frontCube.material = frontMat;
-  frontCube.isPickable = false;
-  frontCube.isVisible = true;
-  frontCube.setEnabled(true);
+  {
+    const m = new StandardMaterial("frontMat", scene);
+    m.diffuseColor = new Color3(0, 0.5, 1);
+    m.emissiveColor = new Color3(0, 0.5, 1);
+    m.specularColor = new Color3(0, 0, 0);
+    frontCube.material = m;
+    frontCube.isPickable = false;
+    frontCube.isVisible = true;
+    frontCube.setEnabled(true);
+  }
   console.log("[PROOF] frontCube created (will be moved in front of camera each frame)");
 
-  // Avatar cube follows player
+  // Third-person cube follows player position
   avatarCube = MeshBuilder.CreateBox("avatarCube", { size: 1.0 }, scene);
-  const avatarMat = new StandardMaterial("avatarMat", scene);
-  avatarMat.diffuseColor = new Color3(1, 1, 0);
-  avatarMat.emissiveColor = new Color3(0.6, 0.6, 0);
-  avatarMat.specularColor = new Color3(0, 0, 0);
-  avatarCube.material = avatarMat;
-  avatarCube.isPickable = false;
-  avatarCube.isVisible = true;
-  avatarCube.setEnabled(true);
-
-  // FP arms proof cube
-  fpArms = MeshBuilder.CreateBox("fpArms", { width: 0.35, height: 0.35, depth: 0.8 }, scene);
-  const armsMat = new StandardMaterial("armsMat", scene);
-  armsMat.diffuseColor = new Color3(1, 0.2, 0.2);
-  armsMat.emissiveColor = new Color3(0.6, 0.1, 0.1);
-  armsMat.specularColor = new Color3(0, 0, 0);
-  fpArms.material = armsMat;
-  fpArms.isPickable = false;
-  fpArms.isVisible = true;
-  fpArms.setEnabled(false);
-
+  {
+    const m = new StandardMaterial("avatarMat", scene);
+    m.diffuseColor = new Color3(1, 1, 0);
+    m.emissiveColor = new Color3(0.6, 0.6, 0);
+    m.specularColor = new Color3(0, 0, 0);
+    avatarCube.material = m;
+    avatarCube.isPickable = false;
+    avatarCube.isVisible = true;
+    avatarCube.setEnabled(false); // enabled only in 3rd
+  }
   console.log("[Avatar] created (manual follow)");
+
+  // First-person arms marker (red) near camera
+  fpArms = MeshBuilder.CreateBox(
+    "fpArms",
+    { width: 0.35, height: 0.35, depth: 0.8 },
+    scene
+  );
+  {
+    const m = new StandardMaterial("armsMat", scene);
+    m.diffuseColor = new Color3(1, 0.2, 0.2);
+    m.emissiveColor = new Color3(0.6, 0.1, 0.1);
+    m.specularColor = new Color3(0, 0, 0);
+    fpArms.material = m;
+    fpArms.isPickable = false;
+    fpArms.isVisible = true;
+    fpArms.setEnabled(false); // enabled only in 1st+locked
+  }
   console.log("[FPArms] created (manual in-front-of-camera)");
 
-  // ============================================================
-  // ✅ RENDER PIPELINE TRUTH TEST (TS-safe via any-cast)
-  // ============================================================
   // ===== RENDER PIPELINE TRUTH TEST =====
   (function probeRenderPipeline() {
     const s = scene;
@@ -365,13 +382,15 @@ function initVisualsOnce() {
 
     console.log("========== [RenderProbe] ==========");
     console.log("[RenderProbe] scene.customRenderFunction =", typeof sAny.customRenderFunction);
-    console.log("[RenderProbe] renderingManager.customRenderFunction =", typeof rmAny?.customRenderFunction);
+    console.log(
+      "[RenderProbe] renderingManager.customRenderFunction =",
+      typeof rmAny?.customRenderFunction
+    );
     console.log("[RenderProbe] scene.meshes.length =", s.meshes.length);
     console.log("[RenderProbe] scene.activeCamera.layerMask =", s.activeCamera?.layerMask);
     console.log("[RenderProbe] =================================");
 
     // Optional HARD TEST:
-    // Disable custom render function if present (just to prove the hypothesis)
     if (typeof sAny.customRenderFunction === "function") {
       console.warn("[RenderProbe] DISABLING scene.customRenderFunction for test");
       sAny.customRenderFunction = null;
@@ -387,7 +406,7 @@ function initVisualsOnce() {
 }
 
 /* ============================================================
- * View mode application (first vs third)
+ * View mode
  * ============================================================
  */
 
@@ -417,7 +436,7 @@ function applyViewMode() {
 }
 
 /* ============================================================
- * NOA tick / beforeRender
+ * Main tick / beforeRender
  * ============================================================
  */
 
@@ -432,7 +451,7 @@ noa.on("tick", function () {
 });
 
 noa.on("beforeRender", function () {
-  if (!visualsInited) return;
+  if (!visualsInited || !scene) return;
 
   frameCounter++;
 
@@ -442,27 +461,45 @@ noa.on("beforeRender", function () {
   // force far clip huge (some engines clamp maxZ and you won't see objects)
   if (typeof cam.maxZ === "number" && cam.maxZ < 500) cam.maxZ = 5000;
 
+  // Move frontCube in front of camera EACH FRAME (2 units forward)
   if (frontCube) {
-    const fwd = cam.getDirection ? cam.getDirection(new Vector3(0, 0, 1)) : new Vector3(0, 0, 1);
-    const camPos = cam.position ? cam.position.clone() : getNoaCameraPositionVec3();
+    let fwd = null;
+    try {
+      fwd = typeof cam.getDirection === "function" ? cam.getDirection(new Vector3(0, 0, 1)) : null;
+    } catch {}
+    if (!fwd) fwd = new Vector3(0, 0, 1);
+
+    const camPos = cam.position ? cam.position.clone() : new Vector3(0, 10, 0);
     frontCube.position.copyFrom(camPos.add(fwd.scale(2.0)));
   }
 
+  // Avatar cube follows NOA player entity
   if (avatarCube) {
     let px = 0, py = 10, pz = 0;
     try {
       const p = noa.entities.getPosition(noa.playerEntity);
-      px = p[0]; py = p[1]; pz = p[2];
+      px = p[0];
+      py = p[1];
+      pz = p[2];
     } catch {}
     avatarCube.position.set(px, py + 0.6, pz);
   }
 
+  // FP arms sits near camera if enabled
   if (fpArms && fpArms.isEnabled()) {
-    const fwd = cam.getDirection ? cam.getDirection(new Vector3(0, 0, 1)) : new Vector3(0, 0, 1);
-    const right = cam.getDirection ? cam.getDirection(new Vector3(1, 0, 0)) : new Vector3(1, 0, 0);
-    const up = cam.getDirection ? cam.getDirection(new Vector3(0, 1, 0)) : new Vector3(0, 1, 0);
+    let fwd = null, right = null, up = null;
+    try {
+      if (typeof cam.getDirection === "function") {
+        fwd = cam.getDirection(new Vector3(0, 0, 1));
+        right = cam.getDirection(new Vector3(1, 0, 0));
+        up = cam.getDirection(new Vector3(0, 1, 0));
+      }
+    } catch {}
+    if (!fwd) fwd = new Vector3(0, 0, 1);
+    if (!right) right = new Vector3(1, 0, 0);
+    if (!up) up = new Vector3(0, 1, 0);
 
-    const camPos = cam.position ? cam.position.clone() : getNoaCameraPositionVec3();
+    const camPos = cam.position ? cam.position.clone() : new Vector3(0, 10, 0);
     fpArms.position.copyFrom(
       camPos
         .add(fwd.scale(1.1))
@@ -471,8 +508,16 @@ noa.on("beforeRender", function () {
     );
   }
 
-  // make sure our meshes are actually in the scene mesh array
-  if (frameCounter % 120 === 0) {
+  // Diagnostic: prove mesh is in scene.meshes and frustum check WITHOUT crashing
+  if (frameCounter % 120 === 0 && frontCube) {
+    let inFrustum = "(skip)";
+    try {
+      const planes = typeof cam.getFrustumPlanes === "function" ? cam.getFrustumPlanes() : null;
+      inFrustum = planes ? frontCube.isInFrustum(planes) : frontCube.isInFrustum();
+    } catch (e) {
+      inFrustum = "ERR:" + (e?.message || String(e));
+    }
+
     console.log(
       "[Diag2] frontCube in scene.meshes?",
       scene.meshes.includes(frontCube),
@@ -481,9 +526,19 @@ noa.on("beforeRender", function () {
       "visible?",
       frontCube?.isVisible,
       "inFrustum?",
-      frontCube?.isInFrustum?.(cam)
+      inFrustum
     );
   }
+});
+
+/* ============================================================
+ * Pointer lock change triggers view mode update
+ * ============================================================
+ */
+
+document.addEventListener("pointerlockchange", () => {
+  applyViewMode();
+  crosshairUI.refresh();
 });
 
 /* ============================================================
@@ -506,16 +561,6 @@ noa.inputs.down.on("alt-fire", function () {
 });
 
 noa.inputs.bind("alt-fire", "KeyE");
-
-/* ============================================================
- * Pointer lock change triggers view mode update
- * ============================================================
- */
-
-document.addEventListener("pointerlockchange", () => {
-  applyViewMode();
-  crosshairUI.refresh();
-});
 
 /* ============================================================
  * Connect Colyseus (optional)
@@ -542,10 +587,14 @@ document.addEventListener("pointerlockchange", () => {
       const activeRoom = noaAny.colyseus.room;
       if (!activeRoom) return;
 
-      let x = 0, y = 10, z = 0;
+      let x = 0,
+        y = 10,
+        z = 0;
       try {
         const p = noa.entities.getPosition(noa.playerEntity);
-        x = p[0]; y = p[1]; z = p[2];
+        x = p[0];
+        y = p[1];
+        z = p[2];
       } catch {}
 
       const yaw = safeNum(noa.camera.heading, 0);
