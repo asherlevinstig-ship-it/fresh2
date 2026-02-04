@@ -495,3 +495,4 @@ async function debugMatchmake(endpointWsOrHttp) {
     console.warn("[Colyseus] connect failed (ok for now):", e);
   }
 })();
+console.log("=== HELLO-WORLD INDEX.JS LOADED :: TEST-A v1 ===");
