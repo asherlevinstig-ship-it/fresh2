@@ -16,16 +16,21 @@ export default defineConfig(({ command, mode, ssrBuild }) => {
         // Module resolution rules
         resolve: {
             extensions: ['.js'],
+
             alias: {
                 // Force Vite/Rollup to NOT pick the Node build of httpie
                 '@colyseus/httpie/node': '@colyseus/httpie',
-
-                // Sometimes packages import explicit file paths
                 '@colyseus/httpie/node/index.mjs': '@colyseus/httpie',
+
+                // ------------------------------------------------------------
+                // CRITICAL: ensure ALL "babylonjs" namespace imports resolve to
+                // Babylon 6 core legacy build (single runtime)
+                // ------------------------------------------------------------
+                babylonjs: '@babylonjs/core/Legacy/legacy',
             },
+
             dedupe: [
-                // Needed if importing noa-engine from local filesystem,
-                // safe even when importing normally
+                // Ensure single copy in the bundle graph
                 '@babylonjs/core',
             ],
 
@@ -46,26 +51,17 @@ export default defineConfig(({ command, mode, ssrBuild }) => {
         // Production build configuration
         build: {
             target: 'es2020',
-
-            // IMPORTANT:
-            // Because `root` is "./src", outDir is relative to that.
-            // "../dist" places output at "client/dist" (what Vercel expects).
             outDir: '../dist',
-
-            // ok because build output is outside root dir
             emptyOutDir: true,
-
-            // Babylon chunk for these demos is ~1.1MB
             chunkSizeWarningLimit: 1200,
-
             minify: true,
 
             rollupOptions: {
-                 input: resolve(__dirname, 'src/index.html'),
+                input: resolve(__dirname, 'src/index.html'),
 
                 // keep babylon in its own chunk
                 manualChunks: (id) => {
-                    if (id.includes('@babylon')) return 'babylon'
+                    if (id.includes('@babylon') || id.includes('babylonjs')) return 'babylon'
                 },
             },
         },
