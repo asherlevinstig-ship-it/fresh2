@@ -8,9 +8,10 @@
  * - 3rd Person Rig: Blocky Avatar (Walk/Swing)
  * - Multiplayer: Colyseus SDK (STATE-DIFF SYNC, no MapSchema hooks needed)
  * - Fixes:
- *    - "n.onAdd is not a function" (we no longer use onAdd/onRemove at all)
+ *    - "n.onAdd is not a function" (no onAdd/onRemove usage)
  *    - "onMessage() not registered for type 'welcome'" (register handler)
- *    - Jump invisibility in 3rd person (force world matrix + bounding refresh)
+ *    - Jump invisibility in 3rd person (force bounds refresh)
+ *    - Extreme jump (spam space) -> NaN/Infinity position guard + clamp + last valid pos cache
  */
 
 import { Engine } from "noa-engine";
@@ -71,6 +72,9 @@ const STATE = {
 
   swingT: 999,
   swingDuration: 0.22,
+
+  // CRITICAL: last valid player pos cache to prevent NaN transforms
+  lastValidPlayerPos: [0, 2, 0],
 };
 
 const MESH = {
@@ -138,6 +142,38 @@ function createSolidMat(scene, name, color3) {
 function setEnabled(meshOrNode, on) {
   if (!meshOrNode) return;
   if (meshOrNode.setEnabled) meshOrNode.setEnabled(!!on);
+}
+
+function isFinite3(p) {
+  return (
+    p &&
+    p.length >= 3 &&
+    Number.isFinite(p[0]) &&
+    Number.isFinite(p[1]) &&
+    Number.isFinite(p[2])
+  );
+}
+
+/**
+ * CRITICAL: returns a safe, finite player position for rendering/network.
+ * - caches last valid value
+ * - clamps Y so Babylon never receives extreme values
+ */
+function getSafePlayerPos() {
+  let p = null;
+  try {
+    p = noa.entities.getPosition(noa.playerEntity);
+  } catch (e) {}
+
+  if (isFinite3(p)) {
+    const x = p[0];
+    const y = clamp(p[1], -1000, 1000);
+    const z = p[2];
+    STATE.lastValidPlayerPos = [x, y, z];
+    return STATE.lastValidPlayerPos;
+  }
+
+  return STATE.lastValidPlayerPos;
 }
 
 /**
@@ -573,7 +609,7 @@ function getLocalPhysics(dt) {
     }
   } catch (e) {}
 
-  const p = noa.entities.getPosition(noa.playerEntity);
+  const p = getSafePlayerPos();
   if (!speed && STATE.lastPlayerPos && p) {
     const dx = p[0] - STATE.lastPlayerPos[0];
     const dz = p[2] - STATE.lastPlayerPos[2];
@@ -591,24 +627,18 @@ function getLocalPhysics(dt) {
  */
 
 function getPlayersSnapshot(players) {
-  // Handles plain objects and Map-like structures
   const out = {};
-
   if (!players) return out;
 
-  // Map-like (has forEach)
   if (typeof players.forEach === "function") {
     try {
       players.forEach((player, sessionId) => {
         out[sessionId] = player;
       });
       return out;
-    } catch (e) {
-      // fallthrough to object scan
-    }
+    } catch (e) {}
   }
 
-  // Plain object
   try {
     for (const k of Object.keys(players)) {
       out[k] = players[k];
@@ -686,21 +716,18 @@ function syncPlayersFromState(state) {
   const playersObj = getPlayersSnapshot(state.players);
   const newKeys = new Set(Object.keys(playersObj));
 
-  // Added
   for (const k of newKeys) {
     if (!lastPlayersKeys.has(k)) {
       spawnRemotePlayer(k, playersObj[k]);
     }
   }
 
-  // Removed
   for (const k of lastPlayersKeys) {
     if (!newKeys.has(k)) {
       removeRemotePlayer(k);
     }
   }
 
-  // Updated targets
   updateRemoteTargetsFromState(playersObj);
 
   lastPlayersKeys = newKeys;
@@ -723,9 +750,9 @@ noa.on("beforeRender", function () {
 
   updateFpsRig(dt, speed);
 
-  // Local avatar update
+  // Local avatar update (safe pos + clamp + bounds refresh)
   if (MESH.avatarRoot) {
-    const p = noa.entities.getPosition(noa.playerEntity);
+    const p = getSafePlayerPos();
 
     MESH.avatarRoot.position.set(p[0], p[1] + 0.075, p[2]);
     MESH.avatarRoot.rotation.y = safeNum(noa.camera.heading, 0);
@@ -749,7 +776,6 @@ noa.on("beforeRender", function () {
 
     rp.mesh.rotation.y = lerp(rp.mesh.rotation.y, rp.targetRot, t);
 
-    // keep bounds fresh to avoid jump invis / frustum cull bugs
     forceRigBounds(rp.parts);
 
     const dx = rp.mesh.position.x - rp.lastPos.x;
@@ -845,19 +871,17 @@ async function connectColyseus() {
       console.log("[server] welcome:", msg);
     });
 
-    // Initial sync (in case state already there)
     if (room.state) syncPlayersFromState(room.state);
 
-    // State change sync (DIFF)
     room.onStateChange((state) => {
       syncPlayersFromState(state);
     });
 
-    // Send loop
+    // Send loop (uses safe pos cache)
     setInterval(() => {
       if (!colyRoom) return;
 
-      const p = noa.entities.getPosition(noa.playerEntity);
+      const p = getSafePlayerPos();
       const yaw = noa.camera.heading;
       const pitch = noa.camera.pitch;
 
