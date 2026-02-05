@@ -5,12 +5,12 @@
  * - NOA controller (movement/physics/world)
  * - FPS Rig: Arms + Tool (Sway/Bob/Swing)
  * - 3rd Person Rig: Blocky Avatar (Walk/Swing)
- * - Multiplayer: Updated to Colyseus 0.17 SDK
- * - Fixes: Avatar feet aligned, jumping visibility, version mismatch fixed
+ * - Multiplayer: Colyseus 0.17 SDK (Defensive Syncing)
+ * - Fixes: "players" undefined error, floating feet, jump visibility
  */
 
 import { Engine } from "noa-engine";
-import { Client } from "@colyseus/sdk"; // CHANGED: Using new SDK
+import { Client } from "@colyseus/sdk"; 
 import * as BABYLON from "babylonjs";
 
 /* ============================================================
@@ -701,49 +701,70 @@ async function connectColyseus() {
     colyRoom = room;
     console.log("Colyseus Connected. Session ID:", room.sessionId);
 
-    // 1. On Player Joined
-    room.state.players.onAdd = (player, sessionId) => {
-      if (sessionId === room.sessionId) return; // Ignore self
+    // LOGIC: Handle "players" map synchronization defensively
+    function initPlayersMap(playersMap) {
+      if (!playersMap) return;
 
-      console.log("Remote player joined:", sessionId);
-      
-      if (!ensureSceneReady()) return;
+      console.log("Players map found, hooking listeners...");
 
-      const rig = createAvatarRig(STATE.scene, "remote_" + sessionId);
-      
-      remotePlayers[sessionId] = {
-        mesh: rig.root,
-        parts: rig,
-        targetPos: { x: player.x, y: player.y, z: player.z },
-        targetRot: player.yaw,
-        lastPos: { x: player.x, y: player.y, z: player.z },
-      };
+      // 1. On Player Joined
+      playersMap.onAdd = (player, sessionId) => {
+        if (sessionId === room.sessionId) return; // Ignore self
 
-      // Set Initial Pos
-      rig.root.position.set(player.x, player.y + 0.075, player.z);
-
-      player.onChange = (changes) => {
-        const rp = remotePlayers[sessionId];
-        if (!rp) return;
+        console.log("Remote player joined:", sessionId);
         
-        changes.forEach(change => {
-          if (change.field === "x") rp.targetPos.x = change.value;
-          if (change.field === "y") rp.targetPos.y = change.value;
-          if (change.field === "z") rp.targetPos.z = change.value;
-          if (change.field === "yaw") rp.targetRot = change.value;
-        });
-      };
-    };
+        if (!ensureSceneReady()) return;
 
-    // 2. On Player Left
-    room.state.players.onRemove = (player, sessionId) => {
-      console.log("Remote player left:", sessionId);
-      const rp = remotePlayers[sessionId];
-      if (rp && rp.mesh) {
-        rp.mesh.dispose(); 
-      }
-      delete remotePlayers[sessionId];
-    };
+        const rig = createAvatarRig(STATE.scene, "remote_" + sessionId);
+        
+        remotePlayers[sessionId] = {
+          mesh: rig.root,
+          parts: rig,
+          targetPos: { x: player.x, y: player.y, z: player.z },
+          targetRot: player.yaw,
+          lastPos: { x: player.x, y: player.y, z: player.z },
+        };
+
+        // Set Initial Pos
+        rig.root.position.set(player.x, player.y + 0.075, player.z);
+
+        player.onChange = (changes) => {
+          const rp = remotePlayers[sessionId];
+          if (!rp) return;
+          
+          changes.forEach(change => {
+            if (change.field === "x") rp.targetPos.x = change.value;
+            if (change.field === "y") rp.targetPos.y = change.value;
+            if (change.field === "z") rp.targetPos.z = change.value;
+            if (change.field === "yaw") rp.targetRot = change.value;
+          });
+        };
+      };
+
+      // 2. On Player Left
+      playersMap.onRemove = (player, sessionId) => {
+        console.log("Remote player left:", sessionId);
+        const rp = remotePlayers[sessionId];
+        if (rp && rp.mesh) {
+          rp.mesh.dispose(); 
+        }
+        delete remotePlayers[sessionId];
+      };
+    }
+
+    // Try to init immediately if players exist
+    if (room.state.players) {
+        initPlayersMap(room.state.players);
+    } else {
+        // Fallback: If 'players' isn't there yet, wait for the first state patch
+        console.warn("Room state 'players' not yet available. Waiting for patch...");
+        const detach = room.onStateChange((state) => {
+            if (state.players) {
+                initPlayersMap(state.players);
+                detach(); // Stop listening once found
+            }
+        });
+    }
 
     // 3. Send Loop
     setInterval(() => {
