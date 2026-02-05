@@ -10,7 +10,7 @@
  * - Fixes:
  *    - "n.onAdd is not a function" (supports BOTH listener styles)
  *    - "onMessage() not registered for type 'welcome'" (register handler)
- *    - feet alignment / jump visibility (alwaysSelectAsActiveMesh)
+ *    - Jump invisibility in 3rd person (force world matrix + bounding refresh)
  */
 
 import { Engine } from "noa-engine";
@@ -143,6 +143,36 @@ function createSolidMat(scene, name, color3) {
 function setEnabled(meshOrNode, on) {
   if (!meshOrNode) return;
   if (meshOrNode.setEnabled) meshOrNode.setEnabled(!!on);
+}
+
+/**
+ * CRITICAL FIX (3rd person jump invisibility):
+ * Force computeWorldMatrix + refreshBoundingInfo for all avatar meshes.
+ * Babylon can frustum-cull meshes incorrectly when parent TransformNode
+ * moves quickly (jump), if bounds don't update in time.
+ */
+function forceRigBounds(parts) {
+  if (!parts) return;
+
+  if (parts.root && parts.root.computeWorldMatrix) {
+    parts.root.computeWorldMatrix(true);
+  }
+
+  const meshes = [
+    parts.head,
+    parts.body,
+    parts.armL,
+    parts.armR,
+    parts.legL,
+    parts.legR,
+    parts.tool,
+  ].filter(Boolean);
+
+  for (const m of meshes) {
+    m.computeWorldMatrix(true);
+    m.refreshBoundingInfo(true);
+    if (m._updateSubMeshesBoundingInfo) m._updateSubMeshesBoundingInfo();
+  }
 }
 
 /* ============================================================
@@ -370,7 +400,11 @@ function createAvatarRig(scene, namePrefix) {
 
     // Force always render (prevents culling on jump)
     m.alwaysSelectAsActiveMesh = true;
-    m.cullingStrategy = BABYLON.AbstractMesh.CULLINGSTRATEGY_OPTIMISTIC_INCLUSION;
+    m.isVisible = true;
+    m.visibility = 1;
+
+    // Less aggressive culling strategy
+    m.cullingStrategy = BABYLON.AbstractMesh.CULLINGSTRATEGY_BOUNDINGSPHERE_ONLY;
   });
 
   return {
@@ -666,6 +700,9 @@ noa.on("beforeRender", function () {
     // Force matrix update to prevent laggy visual bounding box updates
     MESH.avatarRoot.computeWorldMatrix(true);
 
+    // CRITICAL: force fresh bounding for jump visibility
+    forceRigBounds(MESH.avParts);
+
     updateAvatarAnim(MESH.avParts, speed, grounded, STATE.swingT < STATE.swingDuration);
   }
 
@@ -681,6 +718,9 @@ noa.on("beforeRender", function () {
     rp.mesh.position.z = lerp(rp.mesh.position.z, rp.targetPos.z, t);
 
     rp.mesh.rotation.y = lerp(rp.mesh.rotation.y, rp.targetRot, t);
+
+    // CRITICAL: force fresh bounding for jump visibility (remote too)
+    forceRigBounds(rp.parts);
 
     // Calculate velocity for animation
     const dx = rp.mesh.position.x - rp.lastPos.x;
@@ -822,6 +862,9 @@ function attachPlayersMapListeners(playersMap, room) {
       safeNum(player.y, 0) + 0.075,
       safeNum(player.z, 0)
     );
+
+    // Force bounding now (prevents 1-frame invisible on spawn)
+    forceRigBounds(rig);
 
     // Player change listener: again support both styles
     const onPlayerChange = () => {
