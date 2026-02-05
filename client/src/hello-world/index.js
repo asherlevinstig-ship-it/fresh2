@@ -1,24 +1,16 @@
 // @ts-nocheck
 /*
- * Fresh2 - hello-world (NOA main entry) - FULL REWRITE
- *
- * Features:
+ * Fresh2 - hello-world (NOA main entry) - FINAL FIXED VERSION
+ * * Features:
  * - NOA controller (movement/physics/world)
  * - FPS Rig: Arms + Tool (Sway/Bob/Swing)
  * - 3rd Person Rig: Blocky Avatar (Walk/Swing)
- * - Multiplayer: Renders remote players using the same 3rd person rig
- * - Networking: Connects to Colyseus, syncs Position/Rotation, interpolates movement
- *
- * Controls:
- * - V : toggle first/third person
- * - C : toggle forced crosshair
- * - P : toggle debug proof meshes
- * - Mouse1 (fire): break block + swing
- * - E (alt-fire): place block + swing
+ * - Multiplayer: Colyseus syncing with correct interpolation
+ * - Fixes: Avatar feet aligned to ground (no floating)
  */
 
 import { Engine } from "noa-engine";
-import { Client } from "colyseus.js"; // Ensure you have: npm install colyseus.js
+import { Client } from "colyseus.js"; 
 import * as BABYLON from "babylonjs";
 
 /* ============================================================
@@ -38,7 +30,6 @@ const opts = {
   zoomSpeed: 0.25,
 };
 
-// Initialize Engine
 const noa = new Engine(opts);
 const noaAny = /** @type {any} */ (noa);
 
@@ -122,14 +113,10 @@ function resolveScene() {
   return null;
 }
 
-/**
- * Registers a mesh with NOA so it renders and follows chunks correctly.
- */
 function noaAddMesh(mesh, isStatic = false, pos = null) {
   try {
     noa.rendering.addMeshToScene(mesh, !!isStatic, pos || null);
-    // Ensure it doesn't get culled aggressively
-    mesh.alwaysSelectAsActiveMesh = true;
+    mesh.alwaysSelectAsActiveMesh = true; // Prevent aggressive culling
   } catch (e) {
     console.warn("[NOA_RENDER] addMeshToScene failed:", e);
   }
@@ -192,7 +179,6 @@ function createCrosshairOverlay() {
     div.style.display = show ? "block" : "none";
   }
   
-  // Hook into pointer lock changes
   document.addEventListener("pointerlockchange", refresh);
   setInterval(refresh, 500);
 
@@ -245,13 +231,11 @@ function ensureSceneReady() {
   if (!scene) return false;
   STATE.scene = scene;
 
-  // Setup camera clipping
   if (scene.activeCamera) {
     scene.activeCamera.minZ = 0.05;
     scene.activeCamera.maxZ = 5000;
   }
   
-  // Capture default camera follow offset for zooming logic
   try {
     const st = noa.ents.getState(noa.camera.cameraTarget, "followsEntity");
     if (st && st.offset) {
@@ -265,7 +249,6 @@ function ensureSceneReady() {
 
 /**
  * Creates a "Steve" style blocky avatar mesh hierarchy.
- * Returns the root node and references to limbs for animation.
  */
 function createAvatarRig(scene, namePrefix) {
   const root = new BABYLON.TransformNode(namePrefix + "_root", scene);
@@ -276,7 +259,7 @@ function createAvatarRig(scene, namePrefix) {
   const pantsMat = createSolidMat(scene, "mat_pants", new BABYLON.Color3(0.1, 0.1, 0.2));
   const toolMat = createSolidMat(scene, "mat_av_tool", new BABYLON.Color3(0.9, 0.9, 0.95));
 
-  // Mesh Parts (Dimensions approx Minecraft)
+  // Mesh Parts
   const head = BABYLON.MeshBuilder.CreateBox(namePrefix + "_head", { size: 0.6 }, scene);
   head.material = skinMat;
   head.parent = root;
@@ -313,7 +296,7 @@ function createAvatarRig(scene, namePrefix) {
   tool.position.set(0.72, 0.85, 0.18);
   tool.rotation.set(0.2, 0.2, 0.2);
 
-  // Register all meshes with NOA
+  // Register all meshes
   [head, body, armL, armR, legL, legR, tool].forEach(m => {
     m.isPickable = false;
     noaAddMesh(m, false);
@@ -418,7 +401,7 @@ function applyViewMode() {
   noa.camera.zoomDistance = z;
   noa.camera.currentZoom = z;
 
-  // 2. Camera Offset (Shoulder view in 3rd person)
+  // 2. Camera Offset
   try {
     const st = STATE.camFollowState;
     if (st && st.offset) {
@@ -427,7 +410,7 @@ function applyViewMode() {
             st.offset[1] = STATE.baseFollowOffset[1];
             st.offset[2] = STATE.baseFollowOffset[2];
         } else {
-            st.offset[0] = STATE.baseFollowOffset[0] + 0.5; // Shift right
+            st.offset[0] = STATE.baseFollowOffset[0] + 0.5; // Shoulder offset
             st.offset[1] = STATE.baseFollowOffset[1];
             st.offset[2] = STATE.baseFollowOffset[2];
         }
@@ -456,7 +439,6 @@ function updateFpsRig(dt, speed) {
   let dHeading = heading - STATE.lastHeading;
   let dPitch = pitch - STATE.lastPitch;
 
-  // Wrap angles
   if (dHeading > Math.PI) dHeading -= Math.PI * 2;
   if (dHeading < -Math.PI) dHeading += Math.PI * 2;
 
@@ -482,7 +464,7 @@ function updateFpsRig(dt, speed) {
 
   // Apply to Weapon Root
   const wr = MESH.weaponRoot;
-  const s = clamp(dt * 12, 0, 1); // Smooth factor
+  const s = clamp(dt * 12, 0, 1);
 
   const targetPos = new BABYLON.Vector3(
     bobX + swayX * 0.8,
@@ -499,7 +481,7 @@ function updateFpsRig(dt, speed) {
   wr.position.copyFrom(BABYLON.Vector3.Lerp(wr.position, targetPos, s));
   wr.rotation.copyFrom(BABYLON.Vector3.Lerp(wr.rotation, targetRot, s));
 
-  // Extra tool rotation
+  // Tool specific rotation
   if (MESH.tool) {
     MESH.tool.rotation.x = 0.25 + swingAmt * 1.2;
     MESH.tool.rotation.y = 0.1 + swingAmt * 0.15;
@@ -507,9 +489,6 @@ function updateFpsRig(dt, speed) {
   }
 }
 
-/**
- * Shared animation logic for Local and Remote avatars.
- */
 function updateAvatarAnim(parts, speed, grounded, isSwing) {
   if (!parts.root.isEnabled()) return;
 
@@ -519,14 +498,10 @@ function updateAvatarAnim(parts, speed, grounded, isSwing) {
   const legSwing = Math.sin(walkPhase) * 0.7 * walkAmp;
   const armSwing = Math.sin(walkPhase + Math.PI) * 0.55 * walkAmp;
 
-  // Leg movement
   if (parts.legL) parts.legL.rotation.x = legSwing;
   if (parts.legR) parts.legR.rotation.x = -legSwing;
-  
-  // Left arm movement
   if (parts.armL) parts.armL.rotation.x = armSwing;
 
-  // Right arm (Swing overrides walk)
   let swingAmt = 0;
   if (isSwing) {
     const t = clamp(STATE.swingT / STATE.swingDuration, 0, 1);
@@ -560,12 +535,10 @@ function getLocalPhysics(dt) {
         const v = body.velocity;
         speed = Math.sqrt(v[0] * v[0] + v[2] * v[2]);
         vy = v[1];
-        // Check if resting on something
         if (body.resting[1] < 0) grounded = true;
     }
   } catch(e) {}
 
-  // Fallback speed calculation if physics fail
   const p = noa.entities.getPosition(noa.playerEntity);
   if (!speed && STATE.lastPlayerPos && p) {
       const dx = p[0] - STATE.lastPlayerPos[0];
@@ -591,7 +564,7 @@ noa.on("beforeRender", function () {
   STATE.lastTime = now;
   STATE.swingT += dt;
 
-  // 1. Get Local Physics/State
+  // 1. Local Player Physics
   const { speed, grounded } = getLocalPhysics(dt);
   
   // 2. Update Local FPS Rig
@@ -600,7 +573,8 @@ noa.on("beforeRender", function () {
   // 3. Update Local Avatar (3rd Person)
   if (MESH.avatarRoot) {
     const p = noa.entities.getPosition(noa.playerEntity);
-    MESH.avatarRoot.position.set(p[0], p[1] + 0.9, p[2]);
+    // Corrected Offset: +0.075 to align feet to ground
+    MESH.avatarRoot.position.set(p[0], p[1] + 0.075, p[2]);
     MESH.avatarRoot.rotation.y = safeNum(noa.camera.heading, 0);
     
     updateAvatarAnim(
@@ -616,16 +590,15 @@ noa.on("beforeRender", function () {
     const rp = remotePlayers[sid];
     if (!rp.mesh) continue;
 
-    // Linear Interpolation for smooth movement
     const t = 0.2; 
     rp.mesh.position.x = lerp(rp.mesh.position.x, rp.targetPos.x, t);
-    rp.mesh.position.y = lerp(rp.mesh.position.y, rp.targetPos.y + 0.9, t);
+    // Corrected Offset: +0.075 to align feet to ground
+    rp.mesh.position.y = lerp(rp.mesh.position.y, rp.targetPos.y + 0.075, t);
     rp.mesh.position.z = lerp(rp.mesh.position.z, rp.targetPos.z, t);
     
-    // Rotation Interpolation
     rp.mesh.rotation.y = lerp(rp.mesh.rotation.y, rp.targetRot, t);
 
-    // Calculate speed for animation
+    // Calculate velocity for animation
     const dx = rp.mesh.position.x - rp.lastPos.x;
     const dz = rp.mesh.position.z - rp.lastPos.z;
     const dist = Math.sqrt(dx*dx + dz*dz);
@@ -666,7 +639,6 @@ document.addEventListener("keydown", (e) => {
   }
 });
 
-// Scroll to zoom in 3rd person
 noa.on("tick", function () {
   const scroll = noa.inputs.pointerState.scrolly;
   if (scroll !== 0 && viewMode === 1) {
@@ -675,7 +647,6 @@ noa.on("tick", function () {
   }
 });
 
-// Mining / Placing
 function triggerSwing() {
   STATE.swingT = 0;
 }
@@ -703,7 +674,6 @@ noa.inputs.bind("alt-fire", "KeyE");
  * ============================================================
  */
 
-// Define endpoint (default to localhost if not env var)
 const ENDPOINT = (import.meta.env && import.meta.env.VITE_COLYSEUS_ENDPOINT) 
   ? import.meta.env.VITE_COLYSEUS_ENDPOINT 
   : "ws://localhost:2567";
@@ -724,10 +694,8 @@ async function connectColyseus() {
 
       console.log("Remote player joined:", sessionId);
       
-      // Attempt to ensure scene is ready, though it might take a split second on fresh load
       if (!ensureSceneReady()) return;
 
-      // Spawn remote avatar
       const rig = createAvatarRig(STATE.scene, "remote_" + sessionId);
       
       remotePlayers[sessionId] = {
@@ -738,10 +706,9 @@ async function connectColyseus() {
         lastPos: { x: player.x, y: player.y, z: player.z },
       };
 
-      // Set initial pos
-      rig.root.position.set(player.x, player.y + 0.9, player.z);
+      // Corrected Offset: +0.075 to align feet to ground
+      rig.root.position.set(player.x, player.y + 0.075, player.z);
 
-      // Listen for updates on this specific player schema
       player.onChange = (changes) => {
         const rp = remotePlayers[sessionId];
         if (!rp) return;
@@ -760,12 +727,12 @@ async function connectColyseus() {
       console.log("Remote player left:", sessionId);
       const rp = remotePlayers[sessionId];
       if (rp && rp.mesh) {
-        rp.mesh.dispose(); // Babylon dispose removes it from scene
+        rp.mesh.dispose(); 
       }
       delete remotePlayers[sessionId];
     };
 
-    // 3. Send Loop (Client -> Server)
+    // 3. Send Loop
     setInterval(() => {
       if (!colyRoom) return;
       
@@ -777,21 +744,20 @@ async function connectColyseus() {
         x: p[0], y: p[1], z: p[2], 
         yaw: yaw, pitch: pitch 
       });
-    }, 100); // 10hz update rate
+    }, 100);
 
   } catch (err) {
     console.error("Colyseus Connection Failed:", err);
   }
 }
 
-// Start Multiplayer
 connectColyseus();
 
-// Force scene init check loop (safe startup)
+// Force scene init check loop
 const bootInterval = setInterval(() => {
     if (ensureSceneReady()) {
         clearInterval(bootInterval);
-        applyViewMode(); // Initialize default view
+        applyViewMode(); 
         console.log("Scene Ready.");
     }
 }, 100);
