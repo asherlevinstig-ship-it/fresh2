@@ -3,16 +3,19 @@
  * Fresh2 - hello-world (NOA main entry) - FULL REWRITE (NO OMITS)
  *
  * Fixes:
- *  - Vite build: noa-engine has NO default export -> use named export { Engine }
- *  - Custom meshes not visible: MUST register with NOA via noa.rendering.addMeshToScene(mesh,...)
- *    (NOA uses its own selection/octree render list)
+ * - Vite build: noa-engine has NO default export -> use named export { Engine }
+ * - Custom meshes not visible: MUST register with NOA via noa.rendering.addMeshToScene(mesh,...)
+ * (NOA uses its own selection/octree render list)
  *
  * Features:
- *  - Crosshair overlay + click-to-pointerlock
- *  - F5 toggles first/third person
- *  - TEST A: "Truth cubes" in the actual rendering scene + a "frontCube" forced in front of camera
- *  - Minimal avatar + minimal arms (cubes)
- *  - Colyseus connect (unchanged conceptually)
+ * - Crosshair overlay + click-to-pointerlock
+ * - F5 toggles first/third person
+ * - TEST A: "Truth cubes" in the actual rendering scene + a "frontCube" forced in front of camera
+ * - Minimal avatar + minimal arms (cubes)
+ * - Colyseus connect (unchanged conceptually)
+ * * UPDATES (Fixes applied):
+ * - Arms now parented to camera (Fixes 1st person visibility/rotation)
+ * - Avatar manual sync improved (Fixes 3rd person visibility)
  */
 
 import { Engine } from "noa-engine";
@@ -393,7 +396,7 @@ function initMinimalAvatarOnce() {
   const scene = getScene();
   if (!scene) return;
 
-  // Avatar cube (visible in third person)
+  // 1. Avatar cube (visible in third person)
   const avatar = MeshBuilder.CreateBox("avatarCube", { size: 1.5 }, scene);
   avatar.material = createSolidMat(scene, "mat_avatar", new Color3(1, 0, 0));
   avatar.position.set(0, 12, 0);
@@ -401,30 +404,43 @@ function initMinimalAvatarOnce() {
   avatar.alwaysSelectAsActiveMesh = true;
   avatar.isVisible = true;
 
-  // Arms root (visible in first person)
+  // 2. Arms root (visible in first person)
   const armsRoot = new Mesh("fpArmsRoot", scene);
+  
+  // FIX: Parent the arms to the active camera. 
+  // This is the correct way to make UI/arms follow the view (rotation included).
+  if (scene.activeCamera) {
+    armsRoot.parent = scene.activeCamera;
+  }
+  
+  // FIX: Render on top of geometry so they don't clip into walls
+  armsRoot.renderingGroupId = 1;
+
   armsRoot.isPickable = false;
   armsRoot.alwaysSelectAsActiveMesh = true;
   armsRoot.isVisible = true;
 
+  // Position children relative to the camera parent
+  // (0,0,0) is the camera lens. +Z is forward. -Y is down.
   const armL = MeshBuilder.CreateBox("armL", { size: 0.6 }, scene);
   armL.parent = armsRoot;
   armL.material = createSolidMat(scene, "mat_armL", new Color3(0.2, 0.8, 0.2));
-  armL.position.set(-0.6, -0.4, 1.4);
+  armL.position.set(-0.6, -0.6, 1.5); // Left, Down, Forward
   armL.isPickable = false;
   armL.alwaysSelectAsActiveMesh = true;
+  armL.renderingGroupId = 1; // Ensure child inherits sort order
 
   const armR = MeshBuilder.CreateBox("armR", { size: 0.6 }, scene);
   armR.parent = armsRoot;
   armR.material = createSolidMat(scene, "mat_armR", new Color3(0.2, 0.8, 0.2));
-  armR.position.set(0.6, -0.4, 1.4);
+  armR.position.set(0.6, -0.6, 1.5); // Right, Down, Forward
   armR.isPickable = false;
   armR.alwaysSelectAsActiveMesh = true;
+  armR.renderingGroupId = 1;
 
   // CRITICAL: register with NOA renderer
   noaRegisterMesh(avatar, false);
   noaRegisterMesh(armsRoot, false);
-  // (children are in the scene; registering the root is typically enough for NOA’s selection list)
 
   // Best-effort attach avatar to player entity mesh component
   try {
@@ -449,7 +465,6 @@ function initMinimalAvatarOnce() {
     const isFirst = viewMode === 0;
 
     // NOA camera zoomDistance is the correct third-person distance knob
-    // Snap harder by also writing currentZoom (NOA overwrites it each tick, but it helps transition)
     try {
       const z = isFirst ? 0 : 6;
       noa.camera.zoomDistance = z;
@@ -460,8 +475,6 @@ function initMinimalAvatarOnce() {
     avatar.setEnabled(!isFirst);
 
     // Arms visible only in first person
-    // IMPORTANT: show them even if not pointerlocked, so you can verify they exist.
-    // If you want lock-only, change this to: const armsOn = isFirst && isPointerLockedToNoa();
     const armsOn = isFirst;
     armsRoot.setEnabled(armsOn);
 
@@ -497,9 +510,8 @@ function initMinimalAvatarOnce() {
 
 /* ============================================================
  * beforeRender loop
- *  - force frontCube in front of camera
- *  - position arms in front of camera
- *  - failsafe: position avatar at player location (even if mesh component fails)
+ * - force frontCube in front of camera
+ * - position avatar at player location (backup logic)
  * ============================================================
  */
 
@@ -534,26 +546,28 @@ noa.on("beforeRender", function () {
     DIAG.frontCube.isVisible = true;
   }
 
-  // Place arms root in front of camera (first-person only)
-  if (cam && DIAG.armsRoot && DIAG.armsRoot.isEnabled()) {
-    let fwd = null;
-    try {
-      if (typeof cam.getForwardRay === "function") fwd = cam.getForwardRay(1).direction;
-      else if (typeof cam.getDirection === "function") fwd = cam.getDirection(new Vector3(0, 0, 1));
-    } catch {}
-
-    DIAG.armsRoot.position.copyFrom(cam.position);
-    if (fwd) DIAG.armsRoot.position.addInPlace(fwd.scale(1.2));
-  }
+  // --- ARMS LOGIC REMOVED ---
+  // The arms are now parented to the camera in initMinimalAvatarOnce. 
+  // We do NOT manually position them here, or it will conflict with the parent transform.
 
   // Failsafe: keep avatar at player position (third-person only)
+  // Also sync rotation from the player entity mesh data if available
   if (DIAG.avatar && DIAG.avatar.isEnabled()) {
     try {
       const p = noa.entities.getPosition(noa.playerEntity);
       if (p && p.length >= 3) {
-        DIAG.avatar.position.set(p[0], p[1] + 0.9, p[2]);
+        // Position: Add small offset so it stands on ground, not in it
+        DIAG.avatar.position.set(p[0], p[1] + 0.75, p[2]);
+        
+        // Rotation: Attempt to read rotation from entity data to make 3rd person model turn
+        const meshDat = noa.entities.getMeshData(noa.playerEntity);
+        if (meshDat && meshDat.mesh && meshDat.mesh.rotation) {
+             DIAG.avatar.rotation.y = meshDat.mesh.rotation.y;
+        }
       }
-    } catch {}
+    } catch (e) {
+      // ignore
+    }
   }
 
   // periodic diagnostics
