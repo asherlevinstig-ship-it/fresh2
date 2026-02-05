@@ -6,7 +6,9 @@
  * - FPS Rig: Arms + Tool (Sway/Bob/Swing)
  * - 3rd Person Rig: Blocky Avatar (Walk/Swing)
  * - Multiplayer: Colyseus syncing with correct interpolation
- * - Fixes: Avatar feet aligned to ground (no floating)
+ * - Fixes:
+ * - Avatar feet aligned to ground (+0.075 offset)
+ * - Jumping no longer makes player invisible (Picking/Culling fixes)
  */
 
 import { Engine } from "noa-engine";
@@ -116,7 +118,10 @@ function resolveScene() {
 function noaAddMesh(mesh, isStatic = false, pos = null) {
   try {
     noa.rendering.addMeshToScene(mesh, !!isStatic, pos || null);
-    mesh.alwaysSelectAsActiveMesh = true; // Prevent aggressive culling
+    
+    // CRITICAL FIX: Prevent aggressive culling (disappearing when jumping)
+    mesh.alwaysSelectAsActiveMesh = true; 
+    
   } catch (e) {
     console.warn("[NOA_RENDER] addMeshToScene failed:", e);
   }
@@ -232,7 +237,8 @@ function ensureSceneReady() {
   STATE.scene = scene;
 
   if (scene.activeCamera) {
-    scene.activeCamera.minZ = 0.05;
+    // Reduce minZ to prevent clipping when camera is very close
+    scene.activeCamera.minZ = 0.01;
     scene.activeCamera.maxZ = 5000;
   }
   
@@ -298,8 +304,15 @@ function createAvatarRig(scene, namePrefix) {
 
   // Register all meshes
   [head, body, armL, armR, legL, legR, tool].forEach(m => {
+    // CRITICAL: Set isPickable false so the camera raycast passes THROUGH the player
+    // This prevents the camera from snapping inside the player's head
     m.isPickable = false;
+    
     noaAddMesh(m, false);
+    
+    // Force always render (prevents culling on jump)
+    m.alwaysSelectAsActiveMesh = true;
+    m.cullingStrategy = BABYLON.AbstractMesh.CULLINGSTRATEGY_OPTIMISTIC_INCLUSION_F;
   });
 
   return {
@@ -573,9 +586,13 @@ noa.on("beforeRender", function () {
   // 3. Update Local Avatar (3rd Person)
   if (MESH.avatarRoot) {
     const p = noa.entities.getPosition(noa.playerEntity);
-    // Corrected Offset: +0.075 to align feet to ground
+    
+    // Position Update
     MESH.avatarRoot.position.set(p[0], p[1] + 0.075, p[2]);
     MESH.avatarRoot.rotation.y = safeNum(noa.camera.heading, 0);
+
+    // FIX: Force matrix update to prevent laggy visual bounding box updates
+    MESH.avatarRoot.computeWorldMatrix(true);
     
     updateAvatarAnim(
         MESH.avParts, 
@@ -592,7 +609,6 @@ noa.on("beforeRender", function () {
 
     const t = 0.2; 
     rp.mesh.position.x = lerp(rp.mesh.position.x, rp.targetPos.x, t);
-    // Corrected Offset: +0.075 to align feet to ground
     rp.mesh.position.y = lerp(rp.mesh.position.y, rp.targetPos.y + 0.075, t);
     rp.mesh.position.z = lerp(rp.mesh.position.z, rp.targetPos.z, t);
     
@@ -706,7 +722,7 @@ async function connectColyseus() {
         lastPos: { x: player.x, y: player.y, z: player.z },
       };
 
-      // Corrected Offset: +0.075 to align feet to ground
+      // Set Initial Pos
       rig.root.position.set(player.x, player.y + 0.075, player.z);
 
       player.onChange = (changes) => {
