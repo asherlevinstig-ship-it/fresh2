@@ -18,6 +18,12 @@ export default defineConfig(({ command, mode, ssrBuild }) => {
             extensions: ['.js'],
 
             alias: {
+                // ------------------------------------------------------------
+                // FIX: Force Colyseus to use the browser distribution
+                // This prevents the "parse is not exported" / Node module errors
+                // ------------------------------------------------------------
+                'colyseus.js': 'colyseus.js/dist/colyseus.js',
+
                 // Force Vite/Rollup to NOT pick the Node build of httpie
                 '@colyseus/httpie/node': '@colyseus/httpie',
                 '@colyseus/httpie/node/index.mjs': '@colyseus/httpie',
