@@ -2,20 +2,26 @@
 /*
  * Fresh2 - hello-world (NOA main entry) - FULL REWRITE (NO OMITS)
  *
- * Fixes:
- * - Vite build: noa-engine has NO default export -> use named export { Engine }
- * - Custom meshes not visible: MUST register with NOA via noa.rendering.addMeshToScene(mesh,...)
- * (NOA uses its own selection/octree render list)
+ * Hard facts from your logs + docs:
+ * - Your build exposes: NOA_MOD.Engine is a function (constructor) and there is NO default export.
+ * - NOA Rendering docs: you MUST call `noa.rendering.addMeshToScene(mesh, ...)`
+ *   or custom Babylon meshes can exist (enabled/visible/in scene.meshes) yet still NOT render.
  *
- * Features:
- * - Crosshair overlay + click-to-pointerlock
- * - F5 toggles first/third person
- * - TEST A: "Truth cubes" in the actual rendering scene + a "frontCube" forced in front of camera
- * - Minimal avatar + minimal arms (cubes)
- * - Colyseus connect (unchanged conceptually)
- * * UPDATES (Fixes applied):
- * - Arms now parented to camera (Fixes 1st person visibility/rotation)
- * - Avatar manual sync improved (Fixes 3rd person visibility)
+ * Goals:
+ * 1) Fix boot reliably for your export shape: `import { Engine } from "noa-engine"` + `new Engine(opts)`
+ * 2) Add Crosshair + PointerLock (click-to-lock).
+ * 3) TEST A: Scene/Render truth tests that MUST be visible:
+ *    - Create big proof cubes
+ *    - Create a frontCube that is forced in front of camera each frame
+ *    - CRITICAL: register ALL proof meshes with `noa.rendering.addMeshToScene`
+ * 4) Player arms (first person) + avatar (third person), both MUST be visible:
+ *    - register all meshes with `addMeshToScene`
+ *    - set zoomDistance + currentZoom when toggling view mode
+ * 5) Keep your Colyseus logic minimal and intact
+ *
+ * Keys:
+ * - F5 = toggle first/third
+ * - F6 = toggle forceCrosshair
  */
 
 import { Engine } from "noa-engine";
@@ -28,7 +34,7 @@ import { Vector3 } from "@babylonjs/core/Maths/math.vector";
 import { Color3 } from "@babylonjs/core/Maths/math.color";
 
 /* ============================================================
- * NOA boot (named export)
+ * NOA bootstrap (Engine constructor - matches your build)
  * ============================================================
  */
 
@@ -38,10 +44,14 @@ const opts = {
   chunkSize: 32,
   chunkAddDistance: 2.5,
   chunkRemoveDistance: 3.5,
+
+  // these are valid engine options per docs you pasted (safe to include)
+  stickyPointerLock: true,
+  dragCameraOutsidePointerLock: true,
 };
 
 console.log("========================================");
-console.log("[NOA_BOOT] Using named export Engine. typeof Engine:", typeof Engine);
+console.log("[NOA_BOOT] typeof Engine:", typeof Engine);
 console.log("========================================");
 
 const noa = new Engine(opts);
@@ -61,15 +71,22 @@ let applyViewModeGlobal = null;
 
 let colyRoom = null;
 
+/** Babylon diagnostics storage */
 const DIAG = {
-  inited: false,
   scene: null,
   engine: null,
-  proofA: null,
-  proofB: null,
+
+  proof1: null,
+  proof2: null,
   frontCube: null,
-  avatar: null,
-  armsRoot: null,
+
+  avatarRoot: null,
+  fpArmsRoot: null,
+  armL: null,
+  armR: null,
+
+  initTruthDone: false,
+  initAvatarDone: false,
 };
 
 /* ============================================================
@@ -86,7 +103,7 @@ function clamp(v, a, b) {
 }
 
 function getPointerLockTarget() {
-  // Prefer NOA container if present; else fall back
+  // noa.container is often a div
   const c = noaAny.container;
   if (c && typeof c === "object") return c;
   return document.getElementById("noa-container") || document.querySelector("canvas");
@@ -97,25 +114,47 @@ function isPointerLockedToNoa() {
   return !!(target && document.pointerLockElement === target);
 }
 
-function getScene() {
-  // per NOA docs: rendering.getScene() or rendering.scene
+/**
+ * Resolve the actual Babylon scene/engine used by NOA.
+ */
+function resolveBabylonScene() {
+  const r = noaAny.rendering;
+
   try {
-    if (noaAny.rendering && typeof noaAny.rendering.getScene === "function") return noaAny.rendering.getScene();
+    if (r && typeof r.getScene === "function") {
+      const s = r.getScene();
+      if (s) return s;
+    }
   } catch {}
+
   try {
-    if (noaAny.rendering && noaAny.rendering.scene) return noaAny.rendering.scene;
+    if (r && r.scene) return r.scene;
   } catch {}
+
   return null;
 }
 
-function getBabylonEngine(scene) {
+function resolveBabylonEngine(scene) {
   try {
     if (scene && typeof scene.getEngine === "function") return scene.getEngine();
   } catch {}
   try {
-    if (noaAny.rendering && noaAny.rendering.engine) return noaAny.rendering.engine;
+    const r = noaAny.rendering;
+    if (r && r.engine) return r.engine;
   } catch {}
   return null;
+}
+
+/**
+ * CRITICAL: register a Babylon mesh with NOA so it is included
+ * in NOA's selection/octree render logic and actually draws.
+ */
+function noaAddMesh(mesh, isStatic = false, pos = null, containingChunk = null) {
+  try {
+    noa.rendering.addMeshToScene(mesh, !!isStatic, pos || null, containingChunk || null);
+  } catch (e) {
+    console.warn("[NOA_RENDER] addMeshToScene failed:", e);
+  }
 }
 
 /* ============================================================
@@ -158,7 +197,7 @@ function createCrosshairOverlay() {
 
   function refresh() {
     const locked = isPointerLockedToNoa();
-    // Show in first person; optionally force
+    // show always if forced; otherwise show in first person
     const show = forceCrosshair || viewMode === 0 || locked;
     crosshair.style.display = show ? "flex" : "none";
   }
@@ -181,6 +220,7 @@ const crosshairUI = createCrosshairOverlay();
     const target = getPointerLockTarget();
     if (!target) return;
 
+    // Only attach once
     clearInterval(interval);
 
     const el = /** @type {any} */ (target);
@@ -196,7 +236,7 @@ const crosshairUI = createCrosshairOverlay();
     if (typeof addEvt === "function") {
       addEvt.call(el, "click", () => {
         try {
-          // allow pointerlock in either mode (you can still unlock if you want)
+          // allow pointer lock in any mode (you can still unlock via ESC)
           if (document.pointerLockElement !== el && typeof el.requestPointerLock === "function") {
             el.requestPointerLock();
           }
@@ -220,7 +260,7 @@ document.addEventListener("keydown", (e) => {
     e.preventDefault();
     viewMode = (viewMode + 1) % 2;
 
-    // If you want to auto-unlock when leaving first person, keep this:
+    // optionally unlock when leaving first person
     if (viewMode !== 0) {
       try {
         document.exitPointerLock?.();
@@ -277,7 +317,7 @@ noa.world.on("worldDataNeeded", function (id, data, x, y, z) {
 });
 
 /* ============================================================
- * Babylon helpers (materials/meshes)
+ * TEST A: Scene/Render truth tests
  * ============================================================
  */
 
@@ -290,28 +330,30 @@ function createSolidMat(scene, name, color) {
   return mat;
 }
 
-/**
- * CRITICAL: register with NOA renderer so it actually draws.
- */
-function noaRegisterMesh(mesh, isStatic = false) {
-  try {
-    // addMeshToScene(mesh, isStatic?, pos?, containingChunk?)
-    noa.rendering.addMeshToScene(mesh, !!isStatic);
-  } catch (e) {
-    console.warn("[NOA_RENDER] addMeshToScene failed:", e);
-  }
+function createProofCube(scene, label, color, pos) {
+  const box = MeshBuilder.CreateBox(`proof_${label}`, { size: 3 }, scene);
+  box.material = createSolidMat(scene, `mat_${label}`, color);
+  box.position.copyFrom(pos);
+  box.isPickable = false;
+  box.isVisible = true;
+  box.alwaysSelectAsActiveMesh = true;
+  return box;
 }
 
-/* ============================================================
- * TEST A: Truth cubes (single real rendering scene)
- * ============================================================
- */
+function createFrontCube(scene) {
+  const box = MeshBuilder.CreateBox("frontCube", { size: 1.5 }, scene);
+  box.material = createSolidMat(scene, "mat_frontCube", new Color3(0, 0.6, 1));
+  box.isPickable = false;
+  box.isVisible = true;
+  box.alwaysSelectAsActiveMesh = true;
+  return box;
+}
 
 function initTruthTestsOnce() {
-  if (DIAG.inited) return true;
+  if (DIAG.initTruthDone) return true;
 
-  const scene = getScene();
-  const engine = getBabylonEngine(scene);
+  const scene = resolveBabylonScene();
+  const engine = resolveBabylonEngine(scene);
 
   if (!scene || !engine) return false;
 
@@ -322,56 +364,40 @@ function initTruthTestsOnce() {
     "[NOA] scene exists?",
     !!scene,
     "activeCamera exists?",
-    !!scene.activeCamera,
+    !!(scene && scene.activeCamera),
     "cameraType:",
-    scene.activeCamera ? scene.activeCamera.getClassName?.() || scene.activeCamera.constructor?.name : "(none)"
+    scene && scene.activeCamera ? scene.activeCamera.getClassName?.() || scene.activeCamera.constructor?.name : "(none)"
   );
 
-  // Make it VERY obvious we touched the correct scene
+  // magenta-ish sky
   try {
-    // clearColor in NOA defaults as array; Babylon scene.clearColor is Color4,
-    // but assigning a Color3 usually works; if it doesn't, ignore.
+    // clearColor is normally Color4; some builds accept Color3.
+    // If it throws, ignore.
     scene.clearColor = new Color3(1, 0, 1);
     console.log("[TestA] magenta clearColor set");
   } catch {}
 
-  // Proof cubes
-  const proofA = MeshBuilder.CreateBox("proof_A", { size: 3 }, scene);
-  proofA.material = createSolidMat(scene, "mat_proof_A", new Color3(0, 1, 0));
-  proofA.position.set(0, 14, 0);
-  proofA.isPickable = false;
-  proofA.alwaysSelectAsActiveMesh = true;
-  proofA.isVisible = true;
+  // create proof meshes
+  const proof1 = createProofCube(scene, "A", new Color3(0, 1, 0), new Vector3(0, 14, 0));
+  const proof2 = createProofCube(scene, "B", new Color3(1, 1, 0), new Vector3(6, 14, 0));
+  const frontCube = createFrontCube(scene);
 
-  const proofB = MeshBuilder.CreateBox("proof_B", { size: 3 }, scene);
-  proofB.material = createSolidMat(scene, "mat_proof_B", new Color3(1, 1, 0));
-  proofB.position.set(6, 14, 0);
-  proofB.isPickable = false;
-  proofB.alwaysSelectAsActiveMesh = true;
-  proofB.isVisible = true;
+  // CRITICAL: register with NOA rendering selection/octree
+  noaAddMesh(proof1, true);
+  noaAddMesh(proof2, true);
+  noaAddMesh(frontCube, false);
 
-  // A cube we force in front of camera every frame
-  const frontCube = MeshBuilder.CreateBox("frontCube", { size: 1.5 }, scene);
-  frontCube.material = createSolidMat(scene, "mat_frontCube", new Color3(0, 0.6, 1));
-  frontCube.isPickable = false;
-  frontCube.alwaysSelectAsActiveMesh = true;
-  frontCube.isVisible = true;
-
-  // IMPORTANT: register with NOA, or they may never render
-  noaRegisterMesh(proofA, true);
-  noaRegisterMesh(proofB, true);
-  noaRegisterMesh(frontCube, false);
-
-  DIAG.proofA = proofA;
-  DIAG.proofB = proofB;
+  DIAG.proof1 = proof1;
+  DIAG.proof2 = proof2;
   DIAG.frontCube = frontCube;
 
-  DIAG.inited = true;
+  console.log("[TestA] proof meshes created + registered with noa.rendering.addMeshToScene");
 
-  console.log("[TestA] initialized: proof cubes + frontCube registered with noa.rendering.addMeshToScene");
+  DIAG.initTruthDone = true;
   return true;
 }
 
+// Retry init until we can resolve scene/engine
 (function bootTruthTests() {
   let tries = 0;
   const t = setInterval(() => {
@@ -386,72 +412,65 @@ function initTruthTestsOnce() {
 })();
 
 /* ============================================================
- * Minimal avatar + arms (cubes) - also registered with NOA
+ * Arms + 3rd-person avatar (minimal cubes, registered with NOA)
  * ============================================================
  */
 
-function initMinimalAvatarOnce() {
-  if (DIAG.avatar || DIAG.armsRoot) return;
+function initAvatarOnce() {
+  if (DIAG.initAvatarDone) return true;
 
-  const scene = getScene();
-  if (!scene) return;
+  const scene = resolveBabylonScene();
+  if (!scene) return false;
 
-  // 1. Avatar cube (visible in third person)
-  const avatar = MeshBuilder.CreateBox("avatarCube", { size: 1.5 }, scene);
-  avatar.material = createSolidMat(scene, "mat_avatar", new Color3(1, 0, 0));
-  avatar.position.set(0, 12, 0);
-  avatar.isPickable = false;
-  avatar.alwaysSelectAsActiveMesh = true;
-  avatar.isVisible = true;
+  // 3rd-person avatar cube
+  const avatarRoot = MeshBuilder.CreateBox("avatarCube", { size: 1.5 }, scene);
+  avatarRoot.material = createSolidMat(scene, "avatarMat", new Color3(1, 0, 0));
+  avatarRoot.position.set(0, 12, 0);
+  avatarRoot.isPickable = false;
+  avatarRoot.alwaysSelectAsActiveMesh = true;
+  avatarRoot.isVisible = true;
 
-  // 2. Arms root (visible in first person)
-  const armsRoot = new Mesh("fpArmsRoot", scene);
-  
-  // FIX: Parent the arms to the active camera. 
-  // This is the correct way to make UI/arms follow the view (rotation included).
-  if (scene.activeCamera) {
-    armsRoot.parent = scene.activeCamera;
-  }
-  
-  // FIX: Render on top of geometry so they don't clip into walls
-  armsRoot.renderingGroupId = 1;
+  // first-person arms
+  const fpArmsRoot = new Mesh("fpArmsRoot", scene);
+  fpArmsRoot.isPickable = false;
+  fpArmsRoot.alwaysSelectAsActiveMesh = true;
+  fpArmsRoot.isVisible = true;
 
-  armsRoot.isPickable = false;
-  armsRoot.alwaysSelectAsActiveMesh = true;
-  armsRoot.isVisible = true;
-
-  // Position children relative to the camera parent
-  // (0,0,0) is the camera lens. +Z is forward. -Y is down.
   const armL = MeshBuilder.CreateBox("armL", { size: 0.6 }, scene);
-  armL.parent = armsRoot;
-  armL.material = createSolidMat(scene, "mat_armL", new Color3(0.2, 0.8, 0.2));
-  armL.position.set(-0.6, -0.6, 1.5); // Left, Down, Forward
+  armL.parent = fpArmsRoot;
+  armL.material = createSolidMat(scene, "armMatL", new Color3(0.2, 0.8, 0.2));
+  armL.position.set(-0.6, -0.4, 1.4);
   armL.isPickable = false;
   armL.alwaysSelectAsActiveMesh = true;
-  armL.renderingGroupId = 1; // Ensure child inherits sort order
+  armL.isVisible = true;
 
   const armR = MeshBuilder.CreateBox("armR", { size: 0.6 }, scene);
-  armR.parent = armsRoot;
-  armR.material = createSolidMat(scene, "mat_armR", new Color3(0.2, 0.8, 0.2));
-  armR.position.set(0.6, -0.6, 1.5); // Right, Down, Forward
+  armR.parent = fpArmsRoot;
+  armR.material = createSolidMat(scene, "armMatR", new Color3(0.2, 0.8, 0.2));
+  armR.position.set(0.6, -0.4, 1.4);
   armR.isPickable = false;
   armR.alwaysSelectAsActiveMesh = true;
-  armR.renderingGroupId = 1;
+  armR.isVisible = true;
 
-  // CRITICAL: register with NOA renderer
-  noaRegisterMesh(avatar, false);
-  noaRegisterMesh(armsRoot, false);
+  // CRITICAL: register with NOA rendering selection/octree
+  // Register root + children to be absolutely sure
+  noaAddMesh(avatarRoot, false);
+  noaAddMesh(fpArmsRoot, false);
+  noaAddMesh(armL, false);
+  noaAddMesh(armR, false);
 
-  // Best-effort attach avatar to player entity mesh component
+  // try to attach avatar to NOA player entity mesh component (best effort)
   try {
-    const ents = noa.entities;
+    const entities = noa.entities;
     const playerEntity = noa.playerEntity;
-    const meshCompName = ents.names?.mesh ?? "mesh";
+    const meshCompName = entities.names?.mesh ?? "mesh";
+    const addComp = entities["addComponent"];
+    const hasComp = entities["hasComponent"];
 
-    if (typeof ents.addComponent === "function") {
-      if (!ents.hasComponent || !ents.hasComponent(playerEntity, meshCompName)) {
-        ents.addComponent(playerEntity, meshCompName, {
-          mesh: avatar,
+    if (typeof addComp === "function") {
+      if (!hasComp || !hasComp.call(entities, playerEntity, meshCompName)) {
+        addComp.call(entities, playerEntity, meshCompName, {
+          mesh: avatarRoot,
           offset: [0, 0, 0],
         });
       }
@@ -461,57 +480,77 @@ function initMinimalAvatarOnce() {
     console.warn("[Avatar] attach failed (non-fatal):", e);
   }
 
+  DIAG.avatarRoot = avatarRoot;
+  DIAG.fpArmsRoot = fpArmsRoot;
+  DIAG.armL = armL;
+  DIAG.armR = armR;
+
   function applyViewMode() {
+    const locked = isPointerLockedToNoa();
     const isFirst = viewMode === 0;
 
-    // NOA camera zoomDistance is the correct third-person distance knob
+    // Snap camera between 1st/3rd.
+    // Writing currentZoom helps force immediate application.
     try {
       const z = isFirst ? 0 : 6;
       noa.camera.zoomDistance = z;
       noa.camera.currentZoom = z;
     } catch {}
 
-    // Avatar visible only in third person
-    avatar.setEnabled(!isFirst);
+    // avatar visible only in third person
+    if (DIAG.avatarRoot) DIAG.avatarRoot.setEnabled(!isFirst);
 
-    // Arms visible only in first person
+    // arms visible only in first person
+    // We DO NOT require pointerlock to show arms (otherwise it feels "broken").
+    // If you want locked-only, change to: const armsOn = isFirst && locked;
     const armsOn = isFirst;
-    armsRoot.setEnabled(armsOn);
+    if (DIAG.fpArmsRoot) DIAG.fpArmsRoot.setEnabled(armsOn);
 
-    console.log("[applyViewMode] viewMode:", isFirst ? "first" : "third", "avatar:", !isFirst, "arms:", armsOn);
+    // keep crosshair in sync
+    try {
+      crosshairUI.refresh();
+    } catch {}
+
+    console.log(
+      "[applyViewMode] viewMode:",
+      isFirst ? "first" : "third",
+      "locked:",
+      locked,
+      "avatar:",
+      !isFirst,
+      "arms:",
+      armsOn,
+      "zoomDistance:",
+      safeNum(noa.camera.zoomDistance, -1),
+      "currentZoom:",
+      safeNum(noa.camera.currentZoom, -1)
+    );
   }
 
   applyViewModeGlobal = applyViewMode;
   applyViewMode();
+  document.addEventListener("pointerlockchange", applyViewMode);
 
-  document.addEventListener("pointerlockchange", () => {
-    try {
-      applyViewMode();
-    } catch {}
-  });
-
-  DIAG.avatar = avatar;
-  DIAG.armsRoot = armsRoot;
+  DIAG.initAvatarDone = true;
+  return true;
 }
 
 (function bootAvatar() {
   let tries = 0;
   const t = setInterval(() => {
     tries++;
-    initMinimalAvatarOnce();
-    if (DIAG.avatar && DIAG.armsRoot) {
+    if (initAvatarOnce()) {
       clearInterval(t);
     } else if (tries > 80) {
       clearInterval(t);
-      console.warn("[Avatar] Gave up initializing minimal avatar after retries.");
+      console.warn("[Avatar] Gave up initializing after retries.");
     }
   }, 150);
 })();
 
 /* ============================================================
- * beforeRender loop
- * - force frontCube in front of camera
- * - position avatar at player location (backup logic)
+ * beforeRender loop: move frontCube in front of camera
+ * + position arms + (failsafe) keep avatar near player
  * ============================================================
  */
 
@@ -520,10 +559,10 @@ let frameCounter = 0;
 noa.on("beforeRender", function () {
   frameCounter++;
 
-  const scene = getScene();
-  const cam = scene?.activeCamera;
+  const scene = resolveBabylonScene();
+  const cam = scene && scene.activeCamera ? scene.activeCamera : null;
 
-  // Force the "frontCube" in front of the active camera
+  // Move frontCube in front of camera (guaranteed visible if rendering works)
   if (cam && DIAG.frontCube) {
     try {
       if (typeof cam.maxZ === "number" && cam.maxZ < 500) cam.maxZ = 10000;
@@ -546,59 +585,67 @@ noa.on("beforeRender", function () {
     DIAG.frontCube.isVisible = true;
   }
 
-  // --- ARMS LOGIC REMOVED ---
-  // The arms are now parented to the camera in initMinimalAvatarOnce. 
-  // We do NOT manually position them here, or it will conflict with the parent transform.
+  // Position arms in front of camera (first-person only)
+  if (cam && DIAG.fpArmsRoot && DIAG.fpArmsRoot.isEnabled()) {
+    let fwd = null;
+    try {
+      if (typeof cam.getForwardRay === "function") fwd = cam.getForwardRay(1).direction;
+      else if (typeof cam.getDirection === "function") fwd = cam.getDirection(new Vector3(0, 0, 1));
+    } catch {}
 
-  // Failsafe: keep avatar at player position (third-person only)
-  // Also sync rotation from the player entity mesh data if available
-  if (DIAG.avatar && DIAG.avatar.isEnabled()) {
+    DIAG.fpArmsRoot.position.copyFrom(cam.position);
+    if (fwd) DIAG.fpArmsRoot.position.addInPlace(fwd.scale(1.2));
+  }
+
+  // Failsafe: keep avatar at player position when enabled (third-person)
+  if (DIAG.avatarRoot && DIAG.avatarRoot.isEnabled()) {
     try {
       const p = noa.entities.getPosition(noa.playerEntity);
       if (p && p.length >= 3) {
-        // Position: Add small offset so it stands on ground, not in it
-        DIAG.avatar.position.set(p[0], p[1] + 0.75, p[2]);
-        
-        // Rotation: Attempt to read rotation from entity data to make 3rd person model turn
-        const meshDat = noa.entities.getMeshData(noa.playerEntity);
-        if (meshDat && meshDat.mesh && meshDat.mesh.rotation) {
-             DIAG.avatar.rotation.y = meshDat.mesh.rotation.y;
-        }
+        DIAG.avatarRoot.position.set(p[0], p[1] + 0.9, p[2]);
       }
-    } catch (e) {
-      // ignore
-    }
+    } catch {}
   }
 
   // periodic diagnostics
   if (frameCounter % 180 === 0) {
-    const s0 = getScene();
-    const c0 = s0?.activeCamera;
+    const s0 = resolveBabylonScene();
+    const c0 = s0 && s0.activeCamera ? s0.activeCamera : null;
+
     console.log(
-      "[Diag] sceneMeshes=",
+      "[Diag] meshes=",
       s0 ? s0.meshes.length : "(no scene)",
-      "activeCamera=",
+      "camera=",
       c0 ? c0.name : "(none)",
+      "viewMode=",
+      viewMode,
       "zoomDistance=",
       safeNum(noa.camera.zoomDistance, -1),
       "currentZoom=",
       safeNum(noa.camera.currentZoom, -1),
-      "viewMode=",
-      viewMode
+      "frontCubeEnabled=",
+      DIAG.frontCube ? DIAG.frontCube.isEnabled?.() : "(none)",
+      "frontCubeVisible=",
+      DIAG.frontCube ? DIAG.frontCube.isVisible : "(none)"
     );
   }
 });
 
 /* ============================================================
- * NOA tick: zoom with scroll (third person)
+ * NOA tick (zoom with scroll for third person)
  * ============================================================
  */
 
 noa.on("tick", function () {
   const scroll = noa.inputs.pointerState.scrolly;
   if (scroll !== 0 && viewMode !== 0) {
-    noa.camera.zoomDistance += scroll > 0 ? 1 : -1;
-    noa.camera.zoomDistance = clamp(noa.camera.zoomDistance, 2, 12);
+    const delta = scroll > 0 ? 1 : -1;
+    noa.camera.zoomDistance = clamp(noa.camera.zoomDistance + delta, 2, 12);
+
+    // snap currentZoom as well
+    try {
+      noa.camera.currentZoom = noa.camera.zoomDistance;
+    } catch {}
   }
 });
 
@@ -661,7 +708,10 @@ async function connectColyseus() {
 
     console.log("[Colyseus] connected, session:", room.sessionId);
 
+    // server sends "welcome"
     room.onMessage("welcome", (msg) => console.log("[Colyseus] welcome:", msg));
+
+    // broadcast debug
     room.onMessage("*", (type, message) => console.log("[Colyseus] msg:", type, message));
 
     room.onLeave(() => {
@@ -669,6 +719,7 @@ async function connectColyseus() {
       colyRoom = null;
     });
 
+    // send movement (optional)
     setInterval(() => {
       if (!colyRoom) return;
       let p = [0, 10, 0];
