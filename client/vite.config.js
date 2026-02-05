@@ -1,79 +1,40 @@
 import { resolve } from 'path'
 import { defineConfig } from 'vite'
 
-export default defineConfig(({ command, mode, ssrBuild }) => {
-    if (mode === 'production') {
-        // production-specific config hooks can go here
-    }
-
+export default defineConfig(({ command, mode }) => {
     return {
-        // Vite serves files from ./src
         root: './src',
-
-        // Use relative paths for assets (handy for static hosting)
         base: './',
 
-        // Module resolution rules
         resolve: {
-            extensions: ['.js'],
-
+            extensions: ['.js', '.ts', '.json'],
             alias: {
                 // ------------------------------------------------------------
-                // FIX: Force Colyseus to use the browser distribution
-                // This prevents the "parse is not exported" / Node module errors
+                // FIX: Use absolute path to bypass package 'exports' restriction
+                // This forces the browser bundle to load
                 // ------------------------------------------------------------
-                'colyseus.js': 'colyseus.js/dist/colyseus.js',
-
-                // Force Vite/Rollup to NOT pick the Node build of httpie
+                'colyseus.js': resolve(__dirname, 'node_modules/colyseus.js/dist/colyseus.js'),
+                
+                // Fallbacks for nested dependencies if they still misbehave
                 '@colyseus/httpie/node': '@colyseus/httpie',
-                '@colyseus/httpie/node/index.mjs': '@colyseus/httpie',
-
-                // ------------------------------------------------------------
-                // CRITICAL: ensure ALL "babylonjs" namespace imports resolve to
-                // Babylon 6 core legacy build (single runtime)
-                // ------------------------------------------------------------
+                
+                // Babylon Legacy Fix
                 babylonjs: '@babylonjs/core/Legacy/legacy',
             },
-
-            dedupe: [
-                // Ensure single copy in the bundle graph
-                '@babylonjs/core',
-            ],
-
-            // Prefer browser entry points when bundling for the web
-            mainFields: ['browser', 'module', 'jsnext:main', 'jsnext'],
-
-            // Prefer browser export conditions (prevents selecting "node" condition)
-            conditions: ['browser', 'module', 'import', 'default'],
+            dedupe: ['@babylonjs/core'],
         },
 
-        plugins: [],
-
-        server: {
-            port: 8080,
-            host: '0.0.0.0',
-        },
-
-        // Production build configuration
         build: {
             target: 'es2020',
             outDir: '../dist',
             emptyOutDir: true,
-            chunkSizeWarningLimit: 1200,
             minify: true,
-
             rollupOptions: {
                 input: resolve(__dirname, 'src/index.html'),
-
-                // keep babylon in its own chunk
                 manualChunks: (id) => {
                     if (id.includes('@babylon') || id.includes('babylonjs')) return 'babylon'
                 },
             },
         },
-
-        // Misc
-        clearScreen: false,
-        logLevel: 'info',
     }
 })
