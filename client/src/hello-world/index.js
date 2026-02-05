@@ -5,8 +5,8 @@
  * - NOA controller (movement/physics/world)
  * - FPS Rig: Arms + Tool (Sway/Bob/Swing)
  * - 3rd Person Rig: Blocky Avatar (Walk/Swing)
- * - Multiplayer: Colyseus 0.17 SDK (Defensive Syncing)
- * - Fixes: "players" undefined error, floating feet, jump visibility
+ * - Multiplayer: Colyseus 0.17 SDK (Correct Method Call Syntax)
+ * - Fixes: "n is not a function", feet alignment, jump visibility
  */
 
 import { Engine } from "noa-engine";
@@ -701,14 +701,14 @@ async function connectColyseus() {
     colyRoom = room;
     console.log("Colyseus Connected. Session ID:", room.sessionId);
 
-    // LOGIC: Handle "players" map synchronization defensively
+    // LOGIC: Handle "players" map synchronization using METHOD CALLS (0.15+)
     function initPlayersMap(playersMap) {
       if (!playersMap) return;
 
       console.log("Players map found, hooking listeners...");
 
-      // 1. On Player Joined
-      playersMap.onAdd = (player, sessionId) => {
+      // FIX: Use .onAdd() as a method, NOT property assignment
+      playersMap.onAdd((player, sessionId) => {
         if (sessionId === room.sessionId) return; // Ignore self
 
         console.log("Remote player joined:", sessionId);
@@ -728,35 +728,36 @@ async function connectColyseus() {
         // Set Initial Pos
         rig.root.position.set(player.x, player.y + 0.075, player.z);
 
-        player.onChange = (changes) => {
+        // FIX: Use .onChange() as a method
+        player.onChange((changes) => {
           const rp = remotePlayers[sessionId];
           if (!rp) return;
           
-          changes.forEach(change => {
-            if (change.field === "x") rp.targetPos.x = change.value;
-            if (change.field === "y") rp.targetPos.y = change.value;
-            if (change.field === "z") rp.targetPos.z = change.value;
-            if (change.field === "yaw") rp.targetRot = change.value;
-          });
-        };
-      };
+          // Note: 'changes' might be undefined in some versions if using simplified .listen(),
+          // but if using .onChange() it usually provides the changeset or is triggered after change.
+          // In 0.17+, accessing properties directly is safe inside the callback.
+          rp.targetPos.x = player.x;
+          rp.targetPos.y = player.y;
+          rp.targetPos.z = player.z;
+          rp.targetRot = player.yaw;
+        });
+      });
 
-      // 2. On Player Left
-      playersMap.onRemove = (player, sessionId) => {
+      // FIX: Use .onRemove() as a method
+      playersMap.onRemove((player, sessionId) => {
         console.log("Remote player left:", sessionId);
         const rp = remotePlayers[sessionId];
         if (rp && rp.mesh) {
           rp.mesh.dispose(); 
         }
         delete remotePlayers[sessionId];
-      };
+      });
     }
 
     // Try to init immediately if players exist
     if (room.state.players) {
         initPlayersMap(room.state.players);
     } else {
-        // Fallback: If 'players' isn't there yet, wait for the first state patch
         console.warn("Room state 'players' not yet available. Waiting for patch...");
         const detach = room.onStateChange((state) => {
             if (state.players) {
