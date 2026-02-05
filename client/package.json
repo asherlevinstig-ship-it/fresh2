@@ -26,7 +26,7 @@
     "@babylonjs/loaders": "^6.49.0",
     "@colyseus/sdk": "^0.17.25",
     "babylonjs-inspector": "^5.14.1",
-    "colyseus.js": "^0.16.22",
+    "colyseus.js": "^0.14.13",
     "fastnoise-lite": "^1.1.1",
     "noa-engine": "^0.33.0",
     "voxel-crunch": "^0.2.1"
