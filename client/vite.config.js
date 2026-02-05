@@ -10,12 +10,13 @@ export default defineConfig(({ command, mode }) => {
             extensions: ['.js', '.ts', '.json'],
             alias: {
                 // ------------------------------------------------------------
-                // FIX: Use absolute path to bypass package 'exports' restriction
-                // This forces the browser bundle to load
+                // FIX: Point @colyseus/sdk to its browser distribution
+                // This bypasses Node.js dependencies like 'httpie'
                 // ------------------------------------------------------------
-                'colyseus.js': resolve(__dirname, 'node_modules/colyseus.js/dist/colyseus.js'),
+                '@colyseus/sdk': resolve(__dirname, 'node_modules/@colyseus/sdk/dist/colyseus.js'),
                 
-                // Fallbacks for nested dependencies if they still misbehave
+                // Keep these just in case other dependencies reference them
+                'colyseus.js': resolve(__dirname, 'node_modules/@colyseus/sdk/dist/colyseus.js'),
                 '@colyseus/httpie/node': '@colyseus/httpie',
                 
                 // Babylon Legacy Fix

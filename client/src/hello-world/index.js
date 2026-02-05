@@ -5,14 +5,12 @@
  * - NOA controller (movement/physics/world)
  * - FPS Rig: Arms + Tool (Sway/Bob/Swing)
  * - 3rd Person Rig: Blocky Avatar (Walk/Swing)
- * - Multiplayer: Colyseus syncing with correct interpolation
- * - Fixes:
- * - Avatar feet aligned to ground (+0.075 offset)
- * - Jumping no longer makes player invisible (Picking/Culling fixes)
+ * - Multiplayer: Updated to Colyseus 0.17 SDK
+ * - Fixes: Avatar feet aligned, jumping visibility, version mismatch fixed
  */
 
 import { Engine } from "noa-engine";
-import { Client } from "colyseus.js"; 
+import { Client } from "@colyseus/sdk"; // CHANGED: Using new SDK
 import * as BABYLON from "babylonjs";
 
 /* ============================================================
@@ -305,7 +303,6 @@ function createAvatarRig(scene, namePrefix) {
   // Register all meshes
   [head, body, armL, armR, legL, legR, tool].forEach(m => {
     // CRITICAL: Set isPickable false so the camera raycast passes THROUGH the player
-    // This prevents the camera from snapping inside the player's head
     m.isPickable = false;
     
     noaAddMesh(m, false);
