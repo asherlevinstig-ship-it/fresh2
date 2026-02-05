@@ -2,24 +2,28 @@
 /*
  * Fresh2 - hello-world (NOA main entry) - FULL REWRITE (NO OMITS)
  *
- * Goals:
- * 1) Fix "[NOA_BOOT] Could not find NOA factory function export" by using a DEFAULT import
- *    (best for Vite/ESM <-> CJS interop) and a robust resolver that also handles weird wrappers
- *    like default.default.
- * 2) Add Crosshair + PointerLock (click-to-lock).
- * 3) Add TEST A (Render/Scene Truth Tests) that PROVES which Babylon Scene is actually rendering:
- *    - Enumerate ALL Babylon scenes on the engine
- *    - Create a BIG "PROOF cube" in EACH scene
- *    - Also move a "frontCube" in front of the *active camera* each frame (per-scene)
- *    If you STILL can't see proof cubes, then your viewport isn’t rendering those scenes/cameras.
+ * FIX for your Vite build error:
+ * - noa-engine does NOT export a default from src/index.js (Rollup/Vite is correct).
+ * - So we MUST NOT do: `import NOA_MOD from "noa-engine"`
+ * - Instead use: `import * as NOA_MOD from "noa-engine"`
  *
- * NOTE:
- * - This file is JavaScript (index.js). We disable TS checking at the top.
- * - We use bracket access for noa.entities etc.
- * - We avoid Scene.isInFrustum() because it can throw if cam frustum planes aren’t ready.
+ * ALSO fix runtime export-shape weirdness:
+ * - Resolve NOA via:
+ *   1) Engine class export (preferred): new Engine(opts)
+ *   2) createEngine export (if present): createEngine(opts)
+ *   3) function export (rare): NOA_MOD(opts)
+ *   4) wrapped defaults (default.default...) if any bundler creates them
+ *
+ * Goals:
+ * 1) Fix NOA bootstrap across export shapes (and fix your build).
+ * 2) Add Crosshair + PointerLock (click-to-lock).
+ * 3) Add TEST A (Render/Scene Truth Tests) to PROVE which Babylon Scene is rendering:
+ *    - Enumerate ALL Babylon scenes on the engine
+ *    - Create BIG "PROOF cubes" in EACH scene
+ *    - Move a "frontCube" in front of the *active camera* each frame (per-scene)
  */
 
-import NOA_MOD from "noa-engine";
+import * as NOA_MOD from "noa-engine";
 import { Client } from "@colyseus/sdk";
 
 import { MeshBuilder } from "@babylonjs/core/Meshes/meshBuilder";
@@ -29,7 +33,7 @@ import { Vector3 } from "@babylonjs/core/Maths/math.vector";
 import { Color3 } from "@babylonjs/core/Maths/math.color";
 
 /* ============================================================
- * NOA bootstrap (FACTORY ONLY - fixes export shape issues)
+ * NOA bootstrap (WORKS WITH VITE/ROLLUP - NO DEFAULT IMPORT)
  * ============================================================
  */
 
@@ -42,65 +46,84 @@ const opts = {
 };
 
 /**
- * Robustly resolve the NOA factory across:
- * - CJS default export: function
- * - ESM default export: { default: fn }
- * - double-wrapped: { default: { default: fn } }
- * - named export: { createEngine: fn }
- * - namespace-like: { default: fn, createEngine: fn }
+ * Robust resolver that returns an initializer:
+ *  - If Engine exists, returns () => new Engine(opts)
+ *  - Else if createEngine exists, returns () => createEngine(opts)
+ *  - Else if module itself is callable, returns () => module(opts)
+ *  - Else tries unwrap .default chains and repeats
  */
-function resolveNoaFactory(mod) {
+function resolveNoaInitializer(mod) {
   const seen = new Set();
   let m = mod;
 
-  for (let i = 0; i < 6; i++) {
+  function makeInitFrom(maybe) {
+    // Prefer Engine (documented API)
+    if (maybe && typeof maybe.Engine === "function") {
+      return (o) => new maybe.Engine(o);
+    }
+    // Some builds expose createEngine
+    if (maybe && typeof maybe.createEngine === "function") {
+      return (o) => maybe.createEngine(o);
+    }
+    // Rare: module itself callable
+    if (typeof maybe === "function") {
+      return (o) => maybe(o);
+    }
+    return null;
+  }
+
+  for (let i = 0; i < 8; i++) {
     if (!m || seen.has(m)) break;
     seen.add(m);
 
-    if (typeof m === "function") return m;
-    if (typeof m.createEngine === "function") return m.createEngine;
+    const init = makeInitFrom(m);
+    if (init) return init;
 
-    // unwrap default chains if present
+    // unwrap default wrappers (default/default.default/etc)
     if (m && typeof m === "object" && "default" in m) {
       m = m.default;
       continue;
     }
     break;
   }
+
   return null;
 }
 
 console.log("========================================");
-console.log("[NOA_BOOT] raw import typeof:", typeof NOA_MOD);
+console.log("[NOA_BOOT] typeof NOA_MOD:", typeof NOA_MOD);
 try {
-  console.log("[NOA_BOOT] raw import keys:", NOA_MOD && typeof NOA_MOD === "object" ? Object.keys(NOA_MOD) : "(not object)");
+  console.log("[NOA_BOOT] module keys:", NOA_MOD && typeof NOA_MOD === "object" ? Object.keys(NOA_MOD) : "(not object)");
 } catch {
-  console.log("[NOA_BOOT] raw import keys: (failed)");
+  console.log("[NOA_BOOT] module keys: (failed)");
 }
 try {
-  console.log("[NOA_BOOT] typeof NOA_MOD.default:", typeof (NOA_MOD && NOA_MOD.default));
+  console.log("[NOA_BOOT] typeof NOA_MOD.Engine:", typeof (NOA_MOD && NOA_MOD.Engine));
 } catch {
-  console.log("[NOA_BOOT] typeof NOA_MOD.default: (failed)");
+  console.log("[NOA_BOOT] typeof NOA_MOD.Engine: (failed)");
 }
 try {
   console.log("[NOA_BOOT] typeof NOA_MOD.createEngine:", typeof (NOA_MOD && NOA_MOD.createEngine));
 } catch {
   console.log("[NOA_BOOT] typeof NOA_MOD.createEngine: (failed)");
 }
+try {
+  console.log("[NOA_BOOT] typeof NOA_MOD.default:", typeof (NOA_MOD && NOA_MOD.default));
+} catch {
+  console.log("[NOA_BOOT] typeof NOA_MOD.default: (failed)");
+}
 console.log("========================================");
 
-const createNoa = resolveNoaFactory(NOA_MOD);
+const initNoa = resolveNoaInitializer(NOA_MOD);
 
-if (!createNoa) {
-  console.log("[NOA_BOOT] FAILED to resolve NOA factory.");
-  console.log("[NOA_BOOT] raw import value:", NOA_MOD);
-  throw new Error("[NOA_BOOT] Could not find NOA factory function export. Check noa-engine import / bundler interop.");
+if (!initNoa) {
+  throw new Error("[NOA_BOOT] Could not resolve NOA initializer (Engine/createEngine/function). Check noa-engine import/export shape.");
 }
 
-const noa = createNoa(opts);
+const noa = initNoa(opts);
 const noaAny = noa;
 
-console.log("noa-engine booted (factory resolved)");
+console.log("noa-engine booted");
 
 /* ============================================================
  * State
@@ -327,7 +350,6 @@ function resolveBabylonScene() {
     if (r && r._scene) return r._scene;
   } catch {}
 
-  // As a last resort, try to find any Babylon engine via scene.getEngine()
   return null;
 }
 
@@ -346,9 +368,6 @@ function resolveBabylonEngine(scene) {
 /* ============================================================
  * TEST A: Scene/Render truth tests (no omits)
  * ============================================================
- *
- * We create proof objects in EVERY scene on the engine.
- * If you see none, you are not looking at those scenes/cameras.
  */
 
 function createSolidMat(scene, name, color) {
@@ -366,15 +385,10 @@ function createProofCube(scene, label, color, pos) {
   box.position.copyFrom(pos);
   box.isPickable = false;
   box.isVisible = true;
-  // Keep it eligible to draw
   box.alwaysSelectAsActiveMesh = true;
   return box;
 }
 
-/**
- * “Front cube” that is forced in front of a scene’s activeCamera every frame.
- * This bypasses all “position is wrong” issues.
- */
 function createFrontCube(scene, label) {
   const box = MeshBuilder.CreateBox(`front_${label}`, { size: 1.5 }, scene);
   box.material = createSolidMat(scene, `mat_front_${label}`, new Color3(0, 0.6, 1));
@@ -388,13 +402,6 @@ function createFrontCube(scene, label) {
 function initTruthTestsOnce() {
   const scene = resolveBabylonScene();
   const engine = resolveBabylonEngine(scene);
-
-  // Best-effort version print (may not exist depending on bundling)
-  try {
-    console.log("[Babylon] imported Engine.Version:", NOA_MOD?.Engine?.Version || "(unknown)");
-  } catch {
-    console.log("[Babylon] imported Engine.Version: (failed)");
-  }
 
   console.log(
     "[NOA] scene exists?",
@@ -412,6 +419,8 @@ function initTruthTestsOnce() {
 
   // Visual “magenta sky” to prove we touched the correct scene
   try {
+    // NOTE: Babylon clearColor is normally Color4, but this is a harmless debug poke.
+    // If it errors, we ignore.
     scene.clearColor = new Color3(1, 0, 1);
     console.log("[TestA] magenta clearColor set");
   } catch {}
@@ -440,8 +449,7 @@ function initTruthTestsOnce() {
     console.log("[RenderProbe] scene.activeCamera.layerMask =", s.activeCamera?.layerMask);
     console.log("[RenderProbe] =================================");
 
-    // Optional HARD TEST:
-    // Disable custom render function if present (just to prove the hypothesis)
+    // Optional HARD TEST: disable custom render functions if present
     const sAny = /** @type {any} */ (s);
     const rmAny = /** @type {any} */ (rm);
     if (typeof sAny.customRenderFunction === "function") {
@@ -454,7 +462,6 @@ function initTruthTestsOnce() {
     }
   })();
 
-  // Enumerate ALL scenes on the engine and plant proof meshes in each
   const scenes = engine.scenes || [];
   DIAG.scenes = [];
 
@@ -466,10 +473,9 @@ function initTruthTestsOnce() {
     const label = `S${idx}`;
     const cam = s.activeCamera;
     const camName = cam ? cam.name : "(none)";
-    const camType = cam ? cam.getClassName?.() || cam.constructor?.name : "(none)";
+    const camType = cam ? (cam.getClassName?.() || cam.constructor?.name) : "(none)";
     console.log(`[TestA] Scene ${label}: meshes=${s.meshes.length} activeCamera=${camName} (${camType})`);
 
-    // Put a big cube at world origin-ish and another somewhere else
     const proof1 = createProofCube(s, `${label}_A`, new Color3(0, 1, 0), new Vector3(0, 14, 0));
     const proof2 = createProofCube(s, `${label}_B`, new Color3(1, 1, 0), new Vector3(6, 14, 0));
     const front = createFrontCube(s, label);
@@ -486,7 +492,6 @@ function initTruthTestsOnce() {
   return true;
 }
 
-// Retry init until we can resolve scene/engine
 (function bootTruthTests() {
   let tries = 0;
   const t = setInterval(() => {
@@ -503,10 +508,6 @@ function initTruthTestsOnce() {
 /* ============================================================
  * “Arms” + “3rd person avatar” (minimal version)
  * ============================================================
- *
- * IMPORTANT:
- * We keep this minimal until TEST A proves we can render ANY custom mesh.
- * These are just colored cubes.
  */
 
 let avatarRoot = null;
@@ -580,16 +581,7 @@ function initMinimalAvatarOnce() {
     const armsOn = isFirst && locked;
     if (fpArmsRoot) fpArmsRoot.setEnabled(armsOn);
 
-    console.log(
-      "[applyViewMode] viewMode:",
-      isFirst ? "first" : "third",
-      "locked:",
-      locked,
-      "avatar:",
-      !isFirst,
-      "arms:",
-      armsOn
-    );
+    console.log("[applyViewMode] viewMode:", isFirst ? "first" : "third", "locked:", locked, "avatar:", !isFirst, "arms:", armsOn);
   }
 
   applyViewModeGlobal = applyViewMode;
@@ -633,7 +625,6 @@ noa.on("beforeRender", function () {
     if (typeof cam.maxZ === "number" && cam.maxZ < 500) cam.maxZ = 5000;
 
     // Put cube in front of camera: position + forward vector
-    // Babylon cameras expose getForwardRay or getDirection; both can exist
     let fwd = null;
     try {
       if (typeof cam.getForwardRay === "function") {
@@ -644,7 +635,6 @@ noa.on("beforeRender", function () {
     } catch {}
 
     if (!fwd) {
-      // fallback: just park it near the camera
       frontCube.position.copyFrom(cam.position);
       frontCube.position.z += 2;
     } else {
@@ -661,7 +651,6 @@ noa.on("beforeRender", function () {
   if (scene && scene.activeCamera && fpArmsRoot && fpArmsRoot.isEnabled()) {
     const cam = scene.activeCamera;
 
-    // Put arms root at camera position and slightly forward
     let fwd = null;
     try {
       if (typeof cam.getForwardRay === "function") fwd = cam.getForwardRay(1).direction;
@@ -672,8 +661,6 @@ noa.on("beforeRender", function () {
     if (fwd) fpArmsRoot.position.addInPlace(fwd.scale(1.2));
   }
 
-  // make sure our meshes are actually in the scene mesh array
-  // (do NOT call isInFrustum; it can throw if frustum planes aren’t ready)
   if (frameCounter % 120 === 0) {
     const s0 = resolveBabylonScene();
     if (s0) {
