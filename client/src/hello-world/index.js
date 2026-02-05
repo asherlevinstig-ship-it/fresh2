@@ -1,16 +1,20 @@
 // @ts-nocheck
 /*
- * Fresh2 - hello-world (NOA main entry) - FINAL FIXED VERSION
- * * Features:
+ * Fresh2 - hello-world (NOA main entry) - FULL REWRITE (NO OMITS)
+ * -------------------------------------------------------------
+ * Features:
  * - NOA controller (movement/physics/world)
  * - FPS Rig: Arms + Tool (Sway/Bob/Swing)
  * - 3rd Person Rig: Blocky Avatar (Walk/Swing)
- * - Multiplayer: Colyseus 0.17 SDK (Correct Method Call Syntax)
- * - Fixes: "n is not a function", feet alignment, jump visibility
+ * - Multiplayer: Colyseus SDK + Schema map listeners (COMPAT FIX)
+ * - Fixes:
+ *    - "n.onAdd is not a function" (supports BOTH listener styles)
+ *    - "onMessage() not registered for type 'welcome'" (register handler)
+ *    - feet alignment / jump visibility (alwaysSelectAsActiveMesh)
  */
 
 import { Engine } from "noa-engine";
-import { Client } from "@colyseus/sdk"; 
+import { Client } from "@colyseus/sdk";
 import * as BABYLON from "babylonjs";
 
 /* ============================================================
@@ -51,7 +55,7 @@ const remotePlayers = {}; // Stores { mesh, parts, targetPos, targetRot, lastPos
 const STATE = {
   scene: null,
   engine: null,
-  
+
   // Camera/Follow state
   camFollowState: null,
   baseFollowOffset: [0, 0, 0],
@@ -64,10 +68,10 @@ const STATE = {
   lastPitch: 0,
   bobPhase: 0,
   lastPlayerPos: null, // For velocity calculation
-  
+
   swingT: 999, // Time since last swing
   swingDuration: 0.22,
-  
+
   animState: "idle", // idle/walk/run/jump/fall/swing
 };
 
@@ -86,7 +90,7 @@ const MESH = {
 
   // 3rd Person Rig (Local)
   avatarRoot: null,
-  avParts: {}, // { head, body, armL, armR, legL, legR, tool }
+  avParts: {}, // { head, body, armL, armR, legL, legR, tool, root }
 };
 
 /* ============================================================
@@ -116,10 +120,9 @@ function resolveScene() {
 function noaAddMesh(mesh, isStatic = false, pos = null) {
   try {
     noa.rendering.addMeshToScene(mesh, !!isStatic, pos || null);
-    
-    // CRITICAL FIX: Prevent aggressive culling (disappearing when jumping)
-    mesh.alwaysSelectAsActiveMesh = true; 
-    
+
+    // Prevent aggressive culling (disappearing when jumping)
+    mesh.alwaysSelectAsActiveMesh = true;
   } catch (e) {
     console.warn("[NOA_RENDER] addMeshToScene failed:", e);
   }
@@ -152,25 +155,37 @@ function createCrosshairOverlay() {
   div.id = "noa-crosshair";
   Object.assign(div.style, {
     position: "fixed",
-    top: "50%", left: "50%",
-    width: "22px", height: "22px",
+    top: "50%",
+    left: "50%",
+    width: "22px",
+    height: "22px",
     transform: "translate(-50%, -50%)",
     pointerEvents: "none",
     zIndex: "9999",
-    display: "none"
+    display: "none",
   });
 
   const lineStyle = {
     position: "absolute",
     backgroundColor: "rgba(255,255,255,0.9)",
-    boxShadow: "0 0 2px black"
+    boxShadow: "0 0 2px black",
   };
 
   const h = document.createElement("div");
-  Object.assign(h.style, lineStyle, { width: "100%", height: "2px", top: "10px", left: "0" });
-  
+  Object.assign(h.style, lineStyle, {
+    width: "100%",
+    height: "2px",
+    top: "10px",
+    left: "0",
+  });
+
   const v = document.createElement("div");
-  Object.assign(v.style, lineStyle, { width: "2px", height: "100%", left: "10px", top: "0" });
+  Object.assign(v.style, lineStyle, {
+    width: "2px",
+    height: "100%",
+    left: "10px",
+    top: "0",
+  });
 
   div.appendChild(h);
   div.appendChild(v);
@@ -181,7 +196,7 @@ function createCrosshairOverlay() {
     const show = forceCrosshair || viewMode === 0 || locked;
     div.style.display = show ? "block" : "none";
   }
-  
+
   document.addEventListener("pointerlockchange", refresh);
   setInterval(refresh, 500);
 
@@ -239,15 +254,17 @@ function ensureSceneReady() {
     scene.activeCamera.minZ = 0.01;
     scene.activeCamera.maxZ = 5000;
   }
-  
+
   try {
     const st = noa.ents.getState(noa.camera.cameraTarget, "followsEntity");
     if (st && st.offset) {
       STATE.camFollowState = st;
       STATE.baseFollowOffset = [...st.offset];
     }
-  } catch(e) { /* ignore */ }
-  
+  } catch (e) {
+    /* ignore */
+  }
+
   return true;
 }
 
@@ -258,63 +275,113 @@ function createAvatarRig(scene, namePrefix) {
   const root = new BABYLON.TransformNode(namePrefix + "_root", scene);
 
   // Materials
-  const skinMat = createSolidMat(scene, "mat_skin", new BABYLON.Color3(1.0, 0.82, 0.68));
-  const shirtMat = createSolidMat(scene, "mat_shirt", new BABYLON.Color3(0.2, 0.4, 0.95));
-  const pantsMat = createSolidMat(scene, "mat_pants", new BABYLON.Color3(0.1, 0.1, 0.2));
-  const toolMat = createSolidMat(scene, "mat_av_tool", new BABYLON.Color3(0.9, 0.9, 0.95));
+  const skinMat = createSolidMat(
+    scene,
+    "mat_skin",
+    new BABYLON.Color3(1.0, 0.82, 0.68)
+  );
+  const shirtMat = createSolidMat(
+    scene,
+    "mat_shirt",
+    new BABYLON.Color3(0.2, 0.4, 0.95)
+  );
+  const pantsMat = createSolidMat(
+    scene,
+    "mat_pants",
+    new BABYLON.Color3(0.1, 0.1, 0.2)
+  );
+  const toolMat = createSolidMat(
+    scene,
+    "mat_av_tool",
+    new BABYLON.Color3(0.9, 0.9, 0.95)
+  );
 
   // Mesh Parts
-  const head = BABYLON.MeshBuilder.CreateBox(namePrefix + "_head", { size: 0.6 }, scene);
+  const head = BABYLON.MeshBuilder.CreateBox(
+    namePrefix + "_head",
+    { size: 0.6 },
+    scene
+  );
   head.material = skinMat;
   head.parent = root;
   head.position.set(0, 1.55, 0);
 
-  const body = BABYLON.MeshBuilder.CreateBox(namePrefix + "_body", { width: 0.7, height: 0.9, depth: 0.35 }, scene);
+  const body = BABYLON.MeshBuilder.CreateBox(
+    namePrefix + "_body",
+    { width: 0.7, height: 0.9, depth: 0.35 },
+    scene
+  );
   body.material = shirtMat;
   body.parent = root;
   body.position.set(0, 0.95, 0);
 
-  const armL = BABYLON.MeshBuilder.CreateBox(namePrefix + "_armL", { width: 0.25, height: 0.8, depth: 0.25 }, scene);
+  const armL = BABYLON.MeshBuilder.CreateBox(
+    namePrefix + "_armL",
+    { width: 0.25, height: 0.8, depth: 0.25 },
+    scene
+  );
   armL.material = shirtMat;
   armL.parent = root;
   armL.position.set(-0.55, 1.05, 0);
 
-  const armR = BABYLON.MeshBuilder.CreateBox(namePrefix + "_armR", { width: 0.25, height: 0.8, depth: 0.25 }, scene);
+  const armR = BABYLON.MeshBuilder.CreateBox(
+    namePrefix + "_armR",
+    { width: 0.25, height: 0.8, depth: 0.25 },
+    scene
+  );
   armR.material = shirtMat;
   armR.parent = root;
   armR.position.set(0.55, 1.05, 0);
 
-  const legL = BABYLON.MeshBuilder.CreateBox(namePrefix + "_legL", { width: 0.28, height: 0.85, depth: 0.28 }, scene);
+  const legL = BABYLON.MeshBuilder.CreateBox(
+    namePrefix + "_legL",
+    { width: 0.28, height: 0.85, depth: 0.28 },
+    scene
+  );
   legL.material = pantsMat;
   legL.parent = root;
   legL.position.set(-0.18, 0.35, 0);
 
-  const legR = BABYLON.MeshBuilder.CreateBox(namePrefix + "_legR", { width: 0.28, height: 0.85, depth: 0.28 }, scene);
+  const legR = BABYLON.MeshBuilder.CreateBox(
+    namePrefix + "_legR",
+    { width: 0.28, height: 0.85, depth: 0.28 },
+    scene
+  );
   legR.material = pantsMat;
   legR.parent = root;
   legR.position.set(0.18, 0.35, 0);
 
-  const tool = BABYLON.MeshBuilder.CreateBox(namePrefix + "_tool", { size: 0.28 }, scene);
+  const tool = BABYLON.MeshBuilder.CreateBox(
+    namePrefix + "_tool",
+    { size: 0.28 },
+    scene
+  );
   tool.material = toolMat;
   tool.parent = root;
   tool.position.set(0.72, 0.85, 0.18);
   tool.rotation.set(0.2, 0.2, 0.2);
 
   // Register all meshes
-  [head, body, armL, armR, legL, legR, tool].forEach(m => {
-    // CRITICAL: Set isPickable false so the camera raycast passes THROUGH the player
+  [head, body, armL, armR, legL, legR, tool].forEach((m) => {
+    // Camera raycast passes THROUGH players
     m.isPickable = false;
-    
+
     noaAddMesh(m, false);
-    
+
     // Force always render (prevents culling on jump)
     m.alwaysSelectAsActiveMesh = true;
-    m.cullingStrategy = BABYLON.AbstractMesh.CULLINGSTRATEGY_OPTIMISTIC_INCLUSION_F;
+    m.cullingStrategy = BABYLON.AbstractMesh.CULLINGSTRATEGY_OPTIMISTIC_INCLUSION;
   });
 
   return {
     root,
-    head, body, armL, armR, legL, legR, tool
+    head,
+    body,
+    armL,
+    armR,
+    legL,
+    legR,
+    tool,
   };
 }
 
@@ -333,13 +400,21 @@ function initFpsRig() {
   const armMat = createSolidMat(scene, "mat_arm", new BABYLON.Color3(0.2, 0.8, 0.2));
   const toolMat = createSolidMat(scene, "mat_tool", new BABYLON.Color3(0.9, 0.9, 0.95));
 
-  const armL = BABYLON.MeshBuilder.CreateBox("fp_armL", { width: 0.45, height: 0.9, depth: 0.45 }, scene);
+  const armL = BABYLON.MeshBuilder.CreateBox(
+    "fp_armL",
+    { width: 0.45, height: 0.9, depth: 0.45 },
+    scene
+  );
   armL.material = armMat;
   armL.parent = armsRoot;
   armL.position.set(-0.55, -0.35, 1.05);
   armL.rotation.set(0.1, 0.25, 0);
 
-  const armR = BABYLON.MeshBuilder.CreateBox("fp_armR", { width: 0.45, height: 0.9, depth: 0.45 }, scene);
+  const armR = BABYLON.MeshBuilder.CreateBox(
+    "fp_armR",
+    { width: 0.45, height: 0.9, depth: 0.45 },
+    scene
+  );
   armR.material = armMat;
   armR.parent = armsRoot;
   armR.position.set(0.55, -0.35, 1.05);
@@ -351,7 +426,7 @@ function initFpsRig() {
   tool.position.set(0.28, -0.55, 1.1);
   tool.rotation.set(0.25, 0.1, 0);
 
-  [armL, armR, tool].forEach(m => {
+  [armL, armR, tool].forEach((m) => {
     m.isPickable = false;
     noaAddMesh(m, false);
   });
@@ -373,7 +448,7 @@ function initLocalAvatar() {
 function initDebugMeshes() {
   if (MESH.proofA) return;
   const scene = STATE.scene;
-  
+
   const proofA = BABYLON.MeshBuilder.CreateBox("proofA", { size: 3 }, scene);
   proofA.material = createSolidMat(scene, "mat_proofA", new BABYLON.Color3(0, 1, 0));
   proofA.position.set(0, 14, 0);
@@ -385,7 +460,7 @@ function initDebugMeshes() {
 
   MESH.proofA = proofA;
   MESH.frontCube = frontCube;
-  
+
   refreshDebugProofMeshes();
 }
 
@@ -415,17 +490,17 @@ function applyViewMode() {
   try {
     const st = STATE.camFollowState;
     if (st && st.offset) {
-        if (isFirst) {
-            st.offset[0] = STATE.baseFollowOffset[0];
-            st.offset[1] = STATE.baseFollowOffset[1];
-            st.offset[2] = STATE.baseFollowOffset[2];
-        } else {
-            st.offset[0] = STATE.baseFollowOffset[0] + 0.5; // Shoulder offset
-            st.offset[1] = STATE.baseFollowOffset[1];
-            st.offset[2] = STATE.baseFollowOffset[2];
-        }
+      if (isFirst) {
+        st.offset[0] = STATE.baseFollowOffset[0];
+        st.offset[1] = STATE.baseFollowOffset[1];
+        st.offset[2] = STATE.baseFollowOffset[2];
+      } else {
+        st.offset[0] = STATE.baseFollowOffset[0] + 0.5; // Shoulder offset
+        st.offset[1] = STATE.baseFollowOffset[1];
+        st.offset[2] = STATE.baseFollowOffset[2];
+      }
     }
-  } catch(e) {}
+  } catch (e) {}
 
   // 3. Toggle Visibility
   setEnabled(MESH.armsRoot, isFirst);
@@ -445,7 +520,7 @@ function updateFpsRig(dt, speed) {
 
   const heading = safeNum(noa.camera.heading, 0);
   const pitch = safeNum(noa.camera.pitch, 0);
-  
+
   let dHeading = heading - STATE.lastHeading;
   let dPitch = pitch - STATE.lastPitch;
 
@@ -481,7 +556,7 @@ function updateFpsRig(dt, speed) {
     -0.02 + bobY - swingAmt * 0.04,
     0
   );
-  
+
   const targetRot = new BABYLON.Vector3(
     swayY + swingAmt * 0.9,
     swayX * 0.8 + swingAmt * 0.15,
@@ -500,7 +575,7 @@ function updateFpsRig(dt, speed) {
 }
 
 function updateAvatarAnim(parts, speed, grounded, isSwing) {
-  if (!parts.root.isEnabled()) return;
+  if (!parts || !parts.root || !parts.root.isEnabled()) return;
 
   const walkAmp = grounded ? clamp(speed / 4.5, 0, 1) : 0;
   const walkPhase = STATE.bobPhase * 0.6;
@@ -522,7 +597,7 @@ function updateAvatarAnim(parts, speed, grounded, isSwing) {
     parts.armR.rotation.x = -armSwing + swingAmt * 1.4;
     parts.armR.rotation.z = swingAmt * 0.25;
   }
-  
+
   if (parts.tool) {
     parts.tool.rotation.x = 0.2 + swingAmt * 1.2;
     parts.tool.rotation.z = 0.2 + swingAmt * 0.35;
@@ -542,20 +617,20 @@ function getLocalPhysics(dt) {
   try {
     const body = noa.entities.getPhysicsBody(noa.playerEntity);
     if (body) {
-        const v = body.velocity;
-        speed = Math.sqrt(v[0] * v[0] + v[2] * v[2]);
-        vy = v[1];
-        if (body.resting[1] < 0) grounded = true;
+      const v = body.velocity;
+      speed = Math.sqrt(v[0] * v[0] + v[2] * v[2]);
+      vy = v[1];
+      if (body.resting[1] < 0) grounded = true;
     }
-  } catch(e) {}
+  } catch (e) {}
 
   const p = noa.entities.getPosition(noa.playerEntity);
   if (!speed && STATE.lastPlayerPos && p) {
-      const dx = p[0] - STATE.lastPlayerPos[0];
-      const dz = p[2] - STATE.lastPlayerPos[2];
-      speed = Math.sqrt(dx*dx + dz*dz) / dt;
+    const dx = p[0] - STATE.lastPlayerPos[0];
+    const dz = p[2] - STATE.lastPlayerPos[2];
+    speed = Math.sqrt(dx * dx + dz * dz) / dt;
   }
-  
+
   if (p) STATE.lastPlayerPos = [...p];
 
   return { speed, grounded, vy };
@@ -576,59 +651,56 @@ noa.on("beforeRender", function () {
 
   // 1. Local Player Physics
   const { speed, grounded } = getLocalPhysics(dt);
-  
+
   // 2. Update Local FPS Rig
   updateFpsRig(dt, speed);
 
   // 3. Update Local Avatar (3rd Person)
   if (MESH.avatarRoot) {
     const p = noa.entities.getPosition(noa.playerEntity);
-    
+
     // Position Update
     MESH.avatarRoot.position.set(p[0], p[1] + 0.075, p[2]);
     MESH.avatarRoot.rotation.y = safeNum(noa.camera.heading, 0);
 
-    // FIX: Force matrix update to prevent laggy visual bounding box updates
+    // Force matrix update to prevent laggy visual bounding box updates
     MESH.avatarRoot.computeWorldMatrix(true);
-    
-    updateAvatarAnim(
-        MESH.avParts, 
-        speed, 
-        grounded, 
-        STATE.swingT < STATE.swingDuration
-    );
+
+    updateAvatarAnim(MESH.avParts, speed, grounded, STATE.swingT < STATE.swingDuration);
   }
 
   // 4. Update Remote Players (Interpolation)
   for (let sid in remotePlayers) {
     const rp = remotePlayers[sid];
-    if (!rp.mesh) continue;
+    if (!rp || !rp.mesh) continue;
 
-    const t = 0.2; 
+    const t = 0.2;
+
     rp.mesh.position.x = lerp(rp.mesh.position.x, rp.targetPos.x, t);
     rp.mesh.position.y = lerp(rp.mesh.position.y, rp.targetPos.y + 0.075, t);
     rp.mesh.position.z = lerp(rp.mesh.position.z, rp.targetPos.z, t);
-    
+
     rp.mesh.rotation.y = lerp(rp.mesh.rotation.y, rp.targetRot, t);
 
     // Calculate velocity for animation
     const dx = rp.mesh.position.x - rp.lastPos.x;
     const dz = rp.mesh.position.z - rp.lastPos.z;
-    const dist = Math.sqrt(dx*dx + dz*dz);
-    const remoteSpeed = dist / dt;
+    const dist = Math.sqrt(dx * dx + dz * dz);
+    const remoteSpeed = dt > 0 ? dist / dt : 0;
 
     rp.lastPos.x = rp.mesh.position.x;
     rp.lastPos.y = rp.mesh.position.y;
     rp.lastPos.z = rp.mesh.position.z;
 
-    updateAvatarAnim(rp.parts, remoteSpeed, true, false); 
+    // We assume grounded for remote (simple), and no swing state (simple)
+    updateAvatarAnim(rp.parts, remoteSpeed, true, false);
   }
-  
+
   // 5. Debug Mesh Update
   if (showDebugProof && MESH.frontCube) {
-      const cam = STATE.scene.activeCamera;
-      const fwd = cam.getForwardRay(3).direction;
-      MESH.frontCube.position.copyFrom(cam.position).addInPlace(fwd.scale(3));
+    const cam = STATE.scene.activeCamera;
+    const fwd = cam.getForwardRay(3).direction;
+    MESH.frontCube.position.copyFrom(cam.position).addInPlace(fwd.scale(3));
   }
 });
 
@@ -655,7 +727,11 @@ document.addEventListener("keydown", (e) => {
 noa.on("tick", function () {
   const scroll = noa.inputs.pointerState.scrolly;
   if (scroll !== 0 && viewMode === 1) {
-    noa.camera.zoomDistance = clamp(noa.camera.zoomDistance + (scroll > 0 ? 1 : -1), 2, 12);
+    noa.camera.zoomDistance = clamp(
+      noa.camera.zoomDistance + (scroll > 0 ? 1 : -1),
+      2,
+      12
+    );
     noa.camera.currentZoom = noa.camera.zoomDistance;
   }
 });
@@ -683,104 +759,197 @@ noa.inputs.down.on("alt-fire", function () {
 noa.inputs.bind("alt-fire", "KeyE");
 
 /* ============================================================
- * COLYSEUS MULTIPLAYER CLIENT
+ * COLYSEUS MULTIPLAYER CLIENT (FULL COMPAT FIX)
  * ============================================================
  */
 
-const ENDPOINT = (import.meta.env && import.meta.env.VITE_COLYSEUS_ENDPOINT) 
-  ? import.meta.env.VITE_COLYSEUS_ENDPOINT 
-  : "ws://localhost:2567";
+const ENDPOINT =
+  import.meta.env && import.meta.env.VITE_COLYSEUS_ENDPOINT
+    ? import.meta.env.VITE_COLYSEUS_ENDPOINT
+    : "ws://localhost:2567";
 
 const colyseusClient = new Client(ENDPOINT);
 
+/**
+ * Attach Schema Map listeners in a way that works across:
+ * - "property assignment" style: map.onAdd = (value, key) => {}
+ * - "method" style: map.onAdd((value, key) => {})
+ *
+ * Your runtime error "n.onAdd is not a function" happens when you call
+ * a property-assignment API as though it was a method.
+ */
+function attachPlayersMapListeners(playersMap, room) {
+  if (!playersMap) return;
+
+  console.log("Players map found, hooking listeners...");
+  try {
+    console.log("playersMap.onAdd typeof:", typeof playersMap.onAdd);
+    console.log("playersMap.onRemove typeof:", typeof playersMap.onRemove);
+  } catch (e) {}
+
+  const handleAdd = (player, sessionId) => {
+    if (!player || !sessionId) return;
+    if (sessionId === room.sessionId) return; // Ignore self
+
+    console.log("Remote player joined:", sessionId);
+
+    if (!ensureSceneReady()) return;
+
+    // If already exists, ignore
+    if (remotePlayers[sessionId]) return;
+
+    const rig = createAvatarRig(STATE.scene, "remote_" + sessionId);
+
+    remotePlayers[sessionId] = {
+      mesh: rig.root,
+      parts: rig,
+      targetPos: {
+        x: safeNum(player.x, 0),
+        y: safeNum(player.y, 0),
+        z: safeNum(player.z, 0),
+      },
+      targetRot: safeNum(player.yaw, 0),
+      lastPos: {
+        x: safeNum(player.x, 0),
+        y: safeNum(player.y, 0),
+        z: safeNum(player.z, 0),
+      },
+    };
+
+    // Set initial position
+    rig.root.position.set(
+      safeNum(player.x, 0),
+      safeNum(player.y, 0) + 0.075,
+      safeNum(player.z, 0)
+    );
+
+    // Player change listener: again support both styles
+    const onPlayerChange = () => {
+      const rp = remotePlayers[sessionId];
+      if (!rp) return;
+      rp.targetPos.x = safeNum(player.x, rp.targetPos.x);
+      rp.targetPos.y = safeNum(player.y, rp.targetPos.y);
+      rp.targetPos.z = safeNum(player.z, rp.targetPos.z);
+      rp.targetRot = safeNum(player.yaw, rp.targetRot);
+    };
+
+    if (typeof player.onChange === "function") {
+      // Method style
+      try {
+        player.onChange(onPlayerChange);
+      } catch (e) {
+        // Some builds expose onChange as a property slot, not a method
+        player.onChange = onPlayerChange;
+      }
+    } else {
+      // Property assignment style
+      player.onChange = onPlayerChange;
+    }
+  };
+
+  const handleRemove = (_player, sessionId) => {
+    console.log("Remote player left:", sessionId);
+    const rp = remotePlayers[sessionId];
+    if (rp && rp.mesh) {
+      rp.mesh.dispose();
+    }
+    delete remotePlayers[sessionId];
+  };
+
+  // Map listener attachment: support BOTH APIs
+  if (typeof playersMap.onAdd === "function") {
+    // method style
+    try {
+      playersMap.onAdd(handleAdd);
+    } catch (e) {
+      // fallback to assignment
+      playersMap.onAdd = handleAdd;
+    }
+  } else {
+    // assignment style
+    playersMap.onAdd = handleAdd;
+  }
+
+  if (typeof playersMap.onRemove === "function") {
+    try {
+      playersMap.onRemove(handleRemove);
+    } catch (e) {
+      playersMap.onRemove = handleRemove;
+    }
+  } else {
+    playersMap.onRemove = handleRemove;
+  }
+
+  // Spawn existing players already in the map
+  // MapSchema generally supports forEach((value, key) => ...)
+  try {
+    if (typeof playersMap.forEach === "function") {
+      playersMap.forEach((player, sessionId) => {
+        if (sessionId !== room.sessionId && !remotePlayers[sessionId]) {
+          handleAdd(player, sessionId);
+        }
+      });
+    } else {
+      // Extremely defensive: some runtimes might behave like a plain object
+      for (const sessionId in playersMap) {
+        const player = playersMap[sessionId];
+        if (sessionId !== room.sessionId && player && !remotePlayers[sessionId]) {
+          handleAdd(player, sessionId);
+        }
+      }
+    }
+  } catch (e) {
+    console.warn("[COLYSEUS] Could not iterate players map:", e);
+  }
+}
+
 async function connectColyseus() {
   console.log("Connecting to Colyseus at:", ENDPOINT);
-  
+
   try {
     const room = await colyseusClient.joinOrCreate("my_room");
     colyRoom = room;
     console.log("Colyseus Connected. Session ID:", room.sessionId);
 
-    // LOGIC: Handle "players" map synchronization using METHOD CALLS (0.15+)
-    function initPlayersMap(playersMap) {
-      if (!playersMap) return;
+    // Fix warning: register handler for server-sent message type "welcome"
+    room.onMessage("welcome", (msg) => {
+      console.log("[server] welcome:", msg);
+    });
 
-      console.log("Players map found, hooking listeners...");
+    // Robust: wait for players to appear, attach once
+    let playersHooked = false;
 
-      // FIX: Use .onAdd() as a method, NOT property assignment
-      playersMap.onAdd((player, sessionId) => {
-        if (sessionId === room.sessionId) return; // Ignore self
-
-        console.log("Remote player joined:", sessionId);
-        
-        if (!ensureSceneReady()) return;
-
-        const rig = createAvatarRig(STATE.scene, "remote_" + sessionId);
-        
-        remotePlayers[sessionId] = {
-          mesh: rig.root,
-          parts: rig,
-          targetPos: { x: player.x, y: player.y, z: player.z },
-          targetRot: player.yaw,
-          lastPos: { x: player.x, y: player.y, z: player.z },
-        };
-
-        // Set Initial Pos
-        rig.root.position.set(player.x, player.y + 0.075, player.z);
-
-        // FIX: Use .onChange() as a method
-        player.onChange((changes) => {
-          const rp = remotePlayers[sessionId];
-          if (!rp) return;
-          
-          // Note: 'changes' might be undefined in some versions if using simplified .listen(),
-          // but if using .onChange() it usually provides the changeset or is triggered after change.
-          // In 0.17+, accessing properties directly is safe inside the callback.
-          rp.targetPos.x = player.x;
-          rp.targetPos.y = player.y;
-          rp.targetPos.z = player.z;
-          rp.targetRot = player.yaw;
-        });
-      });
-
-      // FIX: Use .onRemove() as a method
-      playersMap.onRemove((player, sessionId) => {
-        console.log("Remote player left:", sessionId);
-        const rp = remotePlayers[sessionId];
-        if (rp && rp.mesh) {
-          rp.mesh.dispose(); 
-        }
-        delete remotePlayers[sessionId];
-      });
+    // If already present
+    if (room.state && room.state.players) {
+      playersHooked = true;
+      attachPlayersMapListeners(room.state.players, room);
     }
 
-    // Try to init immediately if players exist
-    if (room.state.players) {
-        initPlayersMap(room.state.players);
-    } else {
-        console.warn("Room state 'players' not yet available. Waiting for patch...");
-        const detach = room.onStateChange((state) => {
-            if (state.players) {
-                initPlayersMap(state.players);
-                detach(); // Stop listening once found
-            }
-        });
-    }
+    // Watch state changes until players exists
+    room.onStateChange((state) => {
+      if (playersHooked) return;
+      if (state && state.players) {
+        playersHooked = true;
+        attachPlayersMapListeners(state.players, room);
+      }
+    });
 
-    // 3. Send Loop
+    // Send loop
     setInterval(() => {
       if (!colyRoom) return;
-      
+
       const p = noa.entities.getPosition(noa.playerEntity);
       const yaw = noa.camera.heading;
       const pitch = noa.camera.pitch;
 
-      colyRoom.send("move", { 
-        x: p[0], y: p[1], z: p[2], 
-        yaw: yaw, pitch: pitch 
+      colyRoom.send("move", {
+        x: p[0],
+        y: p[1],
+        z: p[2],
+        yaw: yaw,
+        pitch: pitch,
       });
     }, 100);
-
   } catch (err) {
     console.error("Colyseus Connection Failed:", err);
   }
@@ -788,11 +957,15 @@ async function connectColyseus() {
 
 connectColyseus();
 
-// Force scene init check loop
+/* ============================================================
+ * FORCE SCENE INIT CHECK LOOP
+ * ============================================================
+ */
+
 const bootInterval = setInterval(() => {
-    if (ensureSceneReady()) {
-        clearInterval(bootInterval);
-        applyViewMode(); 
-        console.log("Scene Ready.");
-    }
+  if (ensureSceneReady()) {
+    clearInterval(bootInterval);
+    applyViewMode();
+    console.log("Scene Ready.");
+  }
 }, 100);
