@@ -3,8 +3,9 @@
  * Fresh2 - hello-world (NOA main entry) - FULL REWRITE (NO OMITS)
  *
  * Goals:
- * 1) Fix "jr is not a constructor" by NEVER using `new Engine(...)` and instead
- *    calling noa-engine as a FACTORY, regardless of export shape.
+ * 1) Fix "[NOA_BOOT] Could not find NOA factory function export" by using a DEFAULT import
+ *    (best for Vite/ESM <-> CJS interop) and a robust resolver that also handles weird wrappers
+ *    like default.default.
  * 2) Add Crosshair + PointerLock (click-to-lock).
  * 3) Add TEST A (Render/Scene Truth Tests) that PROVES which Babylon Scene is actually rendering:
  *    - Enumerate ALL Babylon scenes on the engine
@@ -18,7 +19,7 @@
  * - We avoid Scene.isInFrustum() because it can throw if cam frustum planes aren’t ready.
  */
 
-import * as NOA_MOD from "noa-engine";
+import NOA_MOD from "noa-engine";
 import { Client } from "@colyseus/sdk";
 
 import { MeshBuilder } from "@babylonjs/core/Meshes/meshBuilder";
@@ -28,7 +29,7 @@ import { Vector3 } from "@babylonjs/core/Maths/math.vector";
 import { Color3 } from "@babylonjs/core/Maths/math.color";
 
 /* ============================================================
- * NOA bootstrap (FACTORY ONLY - fixes "not a constructor")
+ * NOA bootstrap (FACTORY ONLY - fixes export shape issues)
  * ============================================================
  */
 
@@ -40,27 +41,66 @@ const opts = {
   chunkRemoveDistance: 3.5,
 };
 
-const createNoa =
-  (NOA_MOD && typeof NOA_MOD.default === "function" && NOA_MOD.default) ||
-  (NOA_MOD && typeof NOA_MOD.createEngine === "function" && NOA_MOD.createEngine) ||
-  (typeof NOA_MOD === "function" && NOA_MOD) ||
-  null;
+/**
+ * Robustly resolve the NOA factory across:
+ * - CJS default export: function
+ * - ESM default export: { default: fn }
+ * - double-wrapped: { default: { default: fn } }
+ * - named export: { createEngine: fn }
+ * - namespace-like: { default: fn, createEngine: fn }
+ */
+function resolveNoaFactory(mod) {
+  const seen = new Set();
+  let m = mod;
+
+  for (let i = 0; i < 6; i++) {
+    if (!m || seen.has(m)) break;
+    seen.add(m);
+
+    if (typeof m === "function") return m;
+    if (typeof m.createEngine === "function") return m.createEngine;
+
+    // unwrap default chains if present
+    if (m && typeof m === "object" && "default" in m) {
+      m = m.default;
+      continue;
+    }
+    break;
+  }
+  return null;
+}
 
 console.log("========================================");
-console.log("[NOA_BOOT] module keys:", Object.keys(NOA_MOD || {}));
-console.log("[NOA_BOOT] typeof NOA_MOD.default:", typeof (NOA_MOD && NOA_MOD.default));
-console.log("[NOA_BOOT] typeof NOA_MOD.createEngine:", typeof (NOA_MOD && NOA_MOD.createEngine));
-console.log("[NOA_BOOT] typeof NOA_MOD:", typeof NOA_MOD);
+console.log("[NOA_BOOT] raw import typeof:", typeof NOA_MOD);
+try {
+  console.log("[NOA_BOOT] raw import keys:", NOA_MOD && typeof NOA_MOD === "object" ? Object.keys(NOA_MOD) : "(not object)");
+} catch {
+  console.log("[NOA_BOOT] raw import keys: (failed)");
+}
+try {
+  console.log("[NOA_BOOT] typeof NOA_MOD.default:", typeof (NOA_MOD && NOA_MOD.default));
+} catch {
+  console.log("[NOA_BOOT] typeof NOA_MOD.default: (failed)");
+}
+try {
+  console.log("[NOA_BOOT] typeof NOA_MOD.createEngine:", typeof (NOA_MOD && NOA_MOD.createEngine));
+} catch {
+  console.log("[NOA_BOOT] typeof NOA_MOD.createEngine: (failed)");
+}
 console.log("========================================");
+
+const createNoa = resolveNoaFactory(NOA_MOD);
 
 if (!createNoa) {
-  throw new Error("[NOA_BOOT] Could not find NOA factory function export. Check noa-engine import.");
+  console.log("[NOA_BOOT] FAILED to resolve NOA factory.");
+  console.log("[NOA_BOOT] raw import value:", NOA_MOD);
+  throw new Error("[NOA_BOOT] Could not find NOA factory function export. Check noa-engine import / bundler interop.");
 }
 
 const noa = createNoa(opts);
 const noaAny = noa;
 
-console.log("noa-engine v0.33.0 (debug)");
+console.log("noa-engine booted (factory resolved)");
 
 /* ============================================================
  * State
@@ -349,7 +389,13 @@ function initTruthTestsOnce() {
   const scene = resolveBabylonScene();
   const engine = resolveBabylonEngine(scene);
 
-  console.log("[Babylon] imported Engine.Version:", (/** @type {any} */ (NOA_MOD))?.Engine?.Version || "(unknown)");
+  // Best-effort version print (may not exist depending on bundling)
+  try {
+    console.log("[Babylon] imported Engine.Version:", NOA_MOD?.Engine?.Version || "(unknown)");
+  } catch {
+    console.log("[Babylon] imported Engine.Version: (failed)");
+  }
+
   console.log(
     "[NOA] scene exists?",
     !!scene,
@@ -385,8 +431,11 @@ function initTruthTestsOnce() {
     const rm = s.renderingManager;
 
     console.log("========== [RenderProbe] ==========");
-    console.log("[RenderProbe] scene.customRenderFunction =", typeof (/** @type {any} */ (s)).customRenderFunction);
-    console.log("[RenderProbe] renderingManager.customRenderFunction =", typeof (rm && (/** @type {any} */ (rm)).customRenderFunction));
+    console.log("[RenderProbe] scene.customRenderFunction =", typeof /** @type {any} */ (s).customRenderFunction);
+    console.log(
+      "[RenderProbe] renderingManager.customRenderFunction =",
+      typeof (rm && /** @type {any} */ (rm).customRenderFunction)
+    );
     console.log("[RenderProbe] scene.meshes.length =", s.meshes.length);
     console.log("[RenderProbe] scene.activeCamera.layerMask =", s.activeCamera?.layerMask);
     console.log("[RenderProbe] =================================");
@@ -417,7 +466,7 @@ function initTruthTestsOnce() {
     const label = `S${idx}`;
     const cam = s.activeCamera;
     const camName = cam ? cam.name : "(none)";
-    const camType = cam ? (cam.getClassName?.() || cam.constructor?.name) : "(none)";
+    const camType = cam ? cam.getClassName?.() || cam.constructor?.name : "(none)";
     console.log(`[TestA] Scene ${label}: meshes=${s.meshes.length} activeCamera=${camName} (${camType})`);
 
     // Put a big cube at world origin-ish and another somewhere else
@@ -531,7 +580,16 @@ function initMinimalAvatarOnce() {
     const armsOn = isFirst && locked;
     if (fpArmsRoot) fpArmsRoot.setEnabled(armsOn);
 
-    console.log("[applyViewMode] viewMode:", isFirst ? "first" : "third", "locked:", locked, "avatar:", !isFirst, "arms:", armsOn);
+    console.log(
+      "[applyViewMode] viewMode:",
+      isFirst ? "first" : "third",
+      "locked:",
+      locked,
+      "avatar:",
+      !isFirst,
+      "arms:",
+      armsOn
+    );
   }
 
   applyViewModeGlobal = applyViewMode;
