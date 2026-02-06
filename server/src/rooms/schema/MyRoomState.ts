@@ -1,49 +1,60 @@
 // ============================================================
-// 1) COLYSEUS SCHEMA (HYBRID INVENTORY + EQUIPMENT + STATS)
-// File: state.ts  (FULL REWRITE - NO OMITS)
+// schema/MyRoomState.ts  (FULL REWRITE - NO OMITS)
+// ------------------------------------------------------------
+// Includes:
+// - Player transform (x,y,z,yaw,pitch)
+// - Stats (hp/stamina + sprint/swing flags)
+// - Hotbar selection (0..8)
+// - Inventory: fixed grid (cols/rows + slots = item uid or "")
+// - Equipment: references item uids
+// - Items: MapSchema of ItemState keyed by uid
 // ============================================================
 
 import { Schema, type, MapSchema, ArraySchema } from "@colyseus/schema";
 
 /** One item stack or equipment instance */
 export class ItemState extends Schema {
-  // unique instance id (use session+counter or nanoid on server)
+  /** Unique item instance id (also used as key in PlayerState.items) */
   @type("string") uid: string = "";
 
-  // item type id (e.g. "dirt", "grass", "pickaxe_wood")
+  /** Item kind/type id e.g. "block:dirt", "tool:pickaxe_wood" */
   @type("string") kind: string = "";
 
-  // stack quantity
+  /** Stack quantity (tools usually 1) */
   @type("number") qty: number = 0;
 
-  // durability for tools (0..maxDurability)
+  /** Durability for tools (0..maxDurability) */
   @type("number") durability: number = 0;
 
+  /** Max durability for tools */
   @type("number") maxDurability: number = 0;
 
-  // optional metadata (simple string; if you need rich meta later, promote to separate Schema)
+  /** Optional metadata (simple string; upgrade later if needed) */
   @type("string") meta: string = "";
 }
 
-/** Fixed-size inventory grid as an Array of slot keys (Item uid or "" for empty) */
+/** Fixed-size inventory grid */
 export class InventoryState extends Schema {
-  // grid size (server authoritative)
+  /** Grid columns (Minecraft-style default 9) */
   @type("number") cols: number = 9;
 
+  /** Grid rows (default 4 -> 36 slots) */
   @type("number") rows: number = 4;
 
-  // slot -> item uid (or "" empty)
-  @type([ "string" ]) slots: ArraySchema<string> = new ArraySchema<string>();
+  /**
+   * Slot contents: item uid OR "" for empty.
+   * Length should be cols*rows (server enforces).
+   */
+  @type(["string"]) slots: ArraySchema<string> = new ArraySchema<string>();
 
   constructor() {
     super();
-    // 9x4 default = 36 slots
     const total = 9 * 4;
     for (let i = 0; i < total; i++) this.slots.push("");
   }
 }
 
-/** Equipment slots reference item uids (must exist in items map) */
+/** Equipment slots hold item uids (must exist in PlayerState.items) */
 export class EquipmentState extends Schema {
   @type("string") head: string = "";
   @type("string") chest: string = "";
@@ -53,11 +64,12 @@ export class EquipmentState extends Schema {
   @type("string") offhand: string = "";
 }
 
-/** Per-player state replicated to clients */
+/** Player replicated state */
 export class PlayerState extends Schema {
   @type("string") id: string = "";
   @type("string") name: string = "Steve";
 
+  // transform
   @type("number") x: number = 0;
   @type("number") y: number = 0;
   @type("number") z: number = 0;
@@ -65,7 +77,7 @@ export class PlayerState extends Schema {
   @type("number") yaw: number = 0;
   @type("number") pitch: number = 0;
 
-  // --- Stats ---
+  // stats
   @type("number") hp: number = 20;
   @type("number") maxHp: number = 20;
 
@@ -75,18 +87,20 @@ export class PlayerState extends Schema {
   @type("boolean") sprinting: boolean = false;
   @type("boolean") swinging: boolean = false;
 
-  // --- Inventory / items ---
-  // All items owned by the player (key = item uid)
+  // hotbar selection (0..8)
+  @type("number") hotbarIndex: number = 0;
+
+  // items owned by player (key = uid)
   @type({ map: ItemState }) items: MapSchema<ItemState> = new MapSchema<ItemState>();
 
-  // Inventory grid (slots contain item uid or "")
+  // inventory grid
   @type(InventoryState) inventory: InventoryState = new InventoryState();
 
-  // Equipped slots (contain item uid or "")
+  // equipped uids
   @type(EquipmentState) equip: EquipmentState = new EquipmentState();
 }
 
 /** Room state */
 export class MyRoomState extends Schema {
-  @type({ map: PlayerState }) players = new MapSchema<PlayerState>();
+  @type({ map: PlayerState }) players: MapSchema<PlayerState> = new MapSchema<PlayerState>();
 }

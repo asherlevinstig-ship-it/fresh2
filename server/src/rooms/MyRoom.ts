@@ -1,3 +1,7 @@
+// ============================================================
+// rooms/MyRoom.ts  (FULL REWRITE - NO OMITS, TS-NARROW FIXED)
+// ============================================================
+
 import { Room, Client, CloseCode } from "colyseus";
 import { MyRoomState, PlayerState, ItemState } from "./schema/MyRoomState.js";
 
@@ -14,6 +18,7 @@ type MoveMsg = {
 
 type SprintMsg = { on: boolean };
 type SwingMsg = { t?: number };
+type HotbarSetMsg = { index: number };
 
 type InvMoveMsg = { from: string; to: string };
 type InvSplitMsg = { slot: string };
@@ -35,9 +40,10 @@ function nowMs() {
  * - "inv:<index>" e.g. inv:12
  * - "eq:<key>"    e.g. eq:tool, eq:head
  */
+type EquipKey = "head" | "chest" | "legs" | "feet" | "tool" | "offhand";
 type SlotRef =
   | { kind: "inv"; index: number }
-  | { kind: "eq"; key: "head" | "chest" | "legs" | "feet" | "tool" | "offhand" };
+  | { kind: "eq"; key: EquipKey };
 
 function parseSlotRef(s: any): SlotRef | null {
   if (typeof s !== "string") return null;
@@ -49,43 +55,51 @@ function parseSlotRef(s: any): SlotRef | null {
   }
 
   if (s.startsWith("eq:")) {
-    const key = s.slice(3);
-    const allowed = new Set(["head", "chest", "legs", "feet", "tool", "offhand"]);
+    const key = s.slice(3) as EquipKey;
+    const allowed = new Set<EquipKey>(["head", "chest", "legs", "feet", "tool", "offhand"]);
     if (!allowed.has(key)) return null;
-    return { kind: "eq", key: key as any };
+    return { kind: "eq", key };
   }
 
   return null;
 }
 
 function getTotalSlots(p: PlayerState) {
-  const cols = isFiniteNum((p as any).inventory?.cols) ? (p as any).inventory.cols : 9;
-  const rows = isFiniteNum((p as any).inventory?.rows) ? (p as any).inventory.rows : 4;
+  const cols = isFiniteNum(p.inventory?.cols) ? p.inventory.cols : 9;
+  const rows = isFiniteNum(p.inventory?.rows) ? p.inventory.rows : 4;
   return Math.max(1, cols * rows);
+}
+
+function ensureSlotsLength(p: PlayerState) {
+  const total = getTotalSlots(p);
+  while (p.inventory.slots.length < total) p.inventory.slots.push("");
+  while (p.inventory.slots.length > total) p.inventory.slots.pop();
 }
 
 function getSlotUid(p: PlayerState, slot: SlotRef): string {
   if (slot.kind === "inv") {
+    ensureSlotsLength(p);
     const total = getTotalSlots(p);
     if (slot.index < 0 || slot.index >= total) return "";
-    return String((p as any).inventory.slots[slot.index] || "");
+    return String(p.inventory.slots[slot.index] || "");
   } else {
-    return String((p as any).equip[slot.key] || "");
+    return String((p.equip as any)[slot.key] || "");
   }
 }
 
 function setSlotUid(p: PlayerState, slot: SlotRef, uid: string) {
   uid = uid ? String(uid) : "";
   if (slot.kind === "inv") {
+    ensureSlotsLength(p);
     const total = getTotalSlots(p);
     if (slot.index < 0 || slot.index >= total) return;
-    (p as any).inventory.slots[slot.index] = uid;
+    p.inventory.slots[slot.index] = uid;
   } else {
-    (p as any).equip[slot.key] = uid;
+    (p.equip as any)[slot.key] = uid;
   }
 }
 
-function isEquipSlotCompatible(slotKey: string, itemKind: string) {
+function isEquipSlotCompatible(slotKey: EquipKey, itemKind: string) {
   if (!itemKind) return true;
   const k = itemKind.toLowerCase();
 
@@ -109,18 +123,53 @@ function maxStackForKind(kind: string) {
   return 64;
 }
 
+// ---------------- HOTBAR ----------------
+
+function normalizeHotbarIndex(i: any) {
+  const n = Number(i);
+  if (!Number.isFinite(n)) return 0;
+  return clamp(Math.floor(n), 0, 8);
+}
+
+function syncEquipToolToHotbar(p: PlayerState) {
+  ensureSlotsLength(p);
+
+  const idx = normalizeHotbarIndex(p.hotbarIndex);
+  const uid = String(p.inventory.slots[idx] || "");
+  if (!uid) {
+    p.equip.tool = "";
+    return;
+  }
+
+  const it = p.items.get(uid);
+  if (!it) {
+    p.equip.tool = "";
+    return;
+  }
+
+  if (!isEquipSlotCompatible("tool", String(it.kind || ""))) {
+    p.equip.tool = "";
+    return;
+  }
+
+  p.equip.tool = uid;
+}
+
+// ------------- ITEM HELPERS -------------
+
+function makeUid(sessionId: string, tag: string) {
+  return `${sessionId}:${tag}:${nowMs()}:${Math.floor(Math.random() * 1e9)}`;
+}
+
 export class MyRoom extends Room {
   public maxClients = 16;
-
-  // typed view of state (fixes your TS version mismatch with Room<T>)
   public state!: MyRoomState;
 
   public onCreate(options: any) {
     this.setState(new MyRoomState());
-
     console.log("room", this.roomId, "created with options:", options);
 
-    // ---- Simulation tick: stamina regen/drain, swing flag timeout
+    // ---- Simulation tick
     const TICK_MS = 50; // 20 Hz
     const STAMINA_DRAIN_PER_SEC = 18;
     const STAMINA_REGEN_PER_SEC = 12;
@@ -133,6 +182,8 @@ export class MyRoom extends Room {
       const dt = TICK_MS / 1000;
 
       this.state.players.forEach((p: PlayerState, sid: string) => {
+        ensureSlotsLength(p);
+
         p.maxHp = clamp(isFiniteNum(p.maxHp) ? p.maxHp : 20, 1, 200);
         p.maxStamina = clamp(isFiniteNum(p.maxStamina) ? p.maxStamina : 100, 1, 1000);
 
@@ -149,13 +200,15 @@ export class MyRoom extends Room {
         }
 
         const t0 = lastSwingAt.get(sid) || 0;
-        if (p.swinging && nowMs() - t0 > SWING_FLAG_MS) {
-          p.swinging = false;
-        }
+        if (p.swinging && nowMs() - t0 > SWING_FLAG_MS) p.swinging = false;
+
+        p.hotbarIndex = normalizeHotbarIndex(p.hotbarIndex);
+        syncEquipToolToHotbar(p);
       });
     }, TICK_MS);
 
     // ---- Messages
+
     this.onMessage("move", (client: Client, msg: MoveMsg) => {
       const p = this.state.players.get(client.sessionId);
       if (!p) return;
@@ -185,12 +238,19 @@ export class MyRoom extends Room {
     this.onMessage("swing", (client: Client, _msg: SwingMsg) => {
       const p = this.state.players.get(client.sessionId);
       if (!p) return;
-
       if (p.stamina < SWING_COST) return;
 
       p.stamina = clamp(p.stamina - SWING_COST, 0, p.maxStamina);
       p.swinging = true;
       lastSwingAt.set(client.sessionId, nowMs());
+    });
+
+    this.onMessage("hotbar:set", (client: Client, msg: HotbarSetMsg) => {
+      const p = this.state.players.get(client.sessionId);
+      if (!p) return;
+
+      p.hotbarIndex = normalizeHotbarIndex(msg?.index);
+      syncEquipToolToHotbar(p);
     });
 
     this.onMessage("inv:move", (client: Client, msg: InvMoveMsg) => {
@@ -201,7 +261,9 @@ export class MyRoom extends Room {
       const to = parseSlotRef(msg?.to);
       if (!from || !to) return;
 
+      ensureSlotsLength(p);
       const total = getTotalSlots(p);
+
       if (from.kind === "inv" && (from.index < 0 || from.index >= total)) return;
       if (to.kind === "inv" && (to.index < 0 || to.index >= total)) return;
 
@@ -214,24 +276,30 @@ export class MyRoom extends Room {
       const fromItem = fromUid ? p.items.get(fromUid) : null;
       const toItem = toUid ? p.items.get(toUid) : null;
 
-      if (to.kind === "eq" && fromItem) {
-        if (!isEquipSlotCompatible(String(to.key), String(fromItem.kind || ""))) return;
-      }
-      if (to.kind === "eq" && toItem) {
-        if (!isEquipSlotCompatible(String(to.key), String(toItem.kind || ""))) return;
+      // Narrow 'to' before using to.key
+      if (to.kind === "eq") {
+        const toKey: EquipKey = to.key;
+        if (fromItem) {
+          if (!isEquipSlotCompatible(toKey, String(fromItem.kind || ""))) return;
+        }
+        if (toItem) {
+          if (!isEquipSlotCompatible(toKey, String(toItem.kind || ""))) return;
+        }
       }
 
-      // move into empty
+      // destination empty => move
       if (!toUid) {
         setSlotUid(p, to, fromUid);
         setSlotUid(p, from, "");
+        syncEquipToolToHotbar(p);
         return;
       }
 
-      // move from empty (reverse)
+      // source empty => move reverse
       if (!fromUid) {
         setSlotUid(p, from, toUid);
         setSlotUid(p, to, "");
+        syncEquipToolToHotbar(p);
         return;
       }
 
@@ -239,24 +307,31 @@ export class MyRoom extends Room {
       if (fromItem && toItem && String(fromItem.kind) === String(toItem.kind)) {
         const maxStack = maxStackForKind(String(toItem.kind));
         if (maxStack > 1) {
-          const space = maxStack - (toItem.qty || 0);
+          const toQty = isFiniteNum(toItem.qty) ? toItem.qty : 0;
+          const fromQty = isFiniteNum(fromItem.qty) ? fromItem.qty : 0;
+
+          const space = maxStack - toQty;
           if (space > 0) {
-            const moveQty = Math.min(space, fromItem.qty || 0);
-            toItem.qty = (toItem.qty || 0) + moveQty;
-            fromItem.qty = (fromItem.qty || 0) - moveQty;
+            const moveQty = Math.min(space, fromQty);
+
+            toItem.qty = toQty + moveQty;
+            fromItem.qty = fromQty - moveQty;
 
             if ((fromItem.qty || 0) <= 0) {
               setSlotUid(p, from, "");
               p.items.delete(fromUid);
             }
+
+            syncEquipToolToHotbar(p);
             return;
           }
         }
       }
 
-      // swap
+      // otherwise swap
       setSlotUid(p, to, fromUid);
       setSlotUid(p, from, toUid);
+      syncEquipToolToHotbar(p);
     });
 
     this.onMessage("inv:split", (client: Client, msg: InvSplitMsg) => {
@@ -266,6 +341,7 @@ export class MyRoom extends Room {
       const slot = parseSlotRef(msg?.slot);
       if (!slot || slot.kind !== "inv") return;
 
+      ensureSlotsLength(p);
       const total = getTotalSlots(p);
       if (slot.index < 0 || slot.index >= total) return;
 
@@ -294,7 +370,7 @@ export class MyRoom extends Room {
 
       it.qty = remain;
 
-      const newUid = `${client.sessionId}:${nowMs()}:${Math.floor(Math.random() * 1e9)}`;
+      const newUid = makeUid(client.sessionId, "split");
       const it2 = new ItemState();
       it2.uid = newUid;
       it2.kind = String(it.kind || "");
@@ -305,6 +381,8 @@ export class MyRoom extends Room {
 
       p.items.set(newUid, it2);
       p.inventory.slots[emptyIndex] = newUid;
+
+      syncEquipToolToHotbar(p);
     });
 
     this.onMessage("hello", (client: Client, message: any) => {
@@ -325,14 +403,14 @@ export class MyRoom extends Room {
       p.name = "Steve";
     }
 
-    // Spawn
+    // spawn
     p.x = 0;
     p.y = 10;
     p.z = 0;
     p.yaw = 0;
     p.pitch = 0;
 
-    // Stats defaults
+    // stats
     p.maxHp = 20;
     p.hp = 20;
     p.maxStamina = 100;
@@ -340,18 +418,18 @@ export class MyRoom extends Room {
     p.sprinting = false;
     p.swinging = false;
 
-    // Inventory defaults
+    // inventory
     p.inventory.cols = 9;
     p.inventory.rows = 4;
+    ensureSlotsLength(p);
 
-    const total = p.inventory.cols * p.inventory.rows;
-    while (p.inventory.slots.length < total) p.inventory.slots.push("");
-    while (p.inventory.slots.length > total) p.inventory.slots.pop();
+    // hotbar default selection
+    p.hotbarIndex = 2;
 
-    // Starter items
-    const dirtUid = `${client.sessionId}:item:dirt:${nowMs()}`;
-    const grassUid = `${client.sessionId}:item:grass:${nowMs() + 1}`;
-    const toolUid = `${client.sessionId}:item:tool:${nowMs() + 2}`;
+    // starter items
+    const dirtUid = makeUid(client.sessionId, "dirt");
+    const grassUid = makeUid(client.sessionId, "grass");
+    const toolUid = makeUid(client.sessionId, "tool");
 
     const dirt = new ItemState();
     dirt.uid = dirtUid;
@@ -374,9 +452,12 @@ export class MyRoom extends Room {
     p.items.set(grassUid, grass);
     p.items.set(toolUid, tool);
 
+    // place into hotbar slots 0,1,2
     p.inventory.slots[0] = dirtUid;
     p.inventory.slots[1] = grassUid;
-    p.equip.tool = toolUid;
+    p.inventory.slots[2] = toolUid;
+
+    syncEquipToolToHotbar(p);
 
     this.state.players.set(client.sessionId, p);
 

@@ -1,25 +1,28 @@
-// ============================================================
-// 2) FRONTEND MAIN ENTRY (NOA + COLYSEUS + HUD + INVENTORY UI)
-// File: main.ts  (FULL REWRITE - NO OMITS)
-// ============================================================
-
 // @ts-nocheck
 /*
- * Fresh2 - hello-world (NOA main entry) - FULL REWRITE (NO OMITS)
- * -------------------------------------------------------------
+ * fresh2 - client main/index (NOA main entry) - FULL REWRITE (NO OMITS)
+ * -------------------------------------------------------------------
  * Includes:
- * - View mode enforcement EVERY FRAME (prevents "1st on ground, 3rd in air")
- * - 3rd-person camera hard-follow behind avatar (ONLY when viewMode === 1)
- * - Prevent camera roll/slant in 3rd person (forces upright camera)
- * - Multiplayer: Colyseus SDK (state-diff sync; no MapSchema hooks required)
- * - Debug: Avatar/camera snapshots in 3rd person
- * - HUD: Hearts + Stamina overlay synced from Colyseus schema (local player)
- * - Inventory UI: Hybrid grid + equipment, drag/drop, server-intent messages
+ * - NOA world generation
+ * - First/Third person view mode enforcement EVERY FRAME (prevents mid-air flip)
+ * - FPS rig + 3rd-person avatar rigs (local + remote)
+ * - Crosshair overlay
+ * - Hotbar overlay (inv:0..8), server-authoritative hotbarIndex
+ * - Inventory overlay (toggle with I), drag/drop slot-to-slot, split stacks
+ * - Colyseus (@colyseus/sdk) state sync + remote interpolation
+ * - Sends: move, sprint, swing, hotbar:set, inv:move, inv:split
+ *
+ * Assumptions:
+ * - Server room is "my_room"
+ * - Schema matches your MyRoomState / PlayerState / ItemState
  */
 
 import { Engine } from "noa-engine";
-import { Client } from "@colyseus/sdk";
+import { Client as ColyClient } from "@colyseus/sdk";
 import * as BABYLON from "babylonjs";
+
+// ---- If you have shared schema types in the client, import them (optional). ----
+// import type { MyRoomState, PlayerState, ItemState } from "../server/src/schema/MyRoomState"; // example
 
 /* ============================================================
  * NOA BOOTSTRAP
@@ -51,36 +54,15 @@ console.log("noa-engine booted:", noa.version);
 let viewMode = 0; // 0 = first, 1 = third
 let forceCrosshair = true;
 let showDebugProof = false;
-
-// Inventory UI
 let inventoryOpen = false;
 
 // Multiplayer
 let colyRoom = null;
 /**
- * remotePlayers: { [sessionId]: { mesh, parts, targetPos, targetRot, lastPos } }
+ * remotePlayers[sessionId] = { mesh, parts, targetPos, targetRot, lastPos }
  */
 const remotePlayers = {};
 let lastPlayersKeys = new Set();
-
-// Local replicated stats (from server)
-const LOCAL_STATS = {
-  hp: 20,
-  maxHp: 20,
-  stamina: 100,
-  maxStamina: 100,
-  sprinting: false,
-  swinging: false,
-};
-
-// Local replicated inventory snapshot (derived from server state)
-const LOCAL_INV = {
-  cols: 9,
-  rows: 4,
-  slots: [], // string[] item uid or ""
-  items: {}, // { [uid]: { uid, kind, qty, durability, maxDurability, meta } }
-  equip: { head: "", chest: "", legs: "", feet: "", tool: "", offhand: "" },
-};
 
 const STATE = {
   scene: null,
@@ -106,7 +88,7 @@ const STATE = {
 
   // debug throttle
   avDbgLastLog: 0,
-  avDbgIntervalMs: 200,
+  avDbgIntervalMs: 250,
 };
 
 const MESH = {
@@ -123,7 +105,38 @@ const MESH = {
 
   // Third-person avatar (local)
   avatarRoot: null,
-  avParts: {}, // { root, head, body, armL, armR, legL, legR, tool }
+  avParts: {},
+
+  // inventory drag ghost
+  dragGhost: null,
+};
+
+/* ============================================================
+ * CLIENT REPLICATED SNAPSHOT
+ * ============================================================
+ * We keep local copies of our own player state (from Colyseus)
+ * so UI can render consistently.
+ */
+
+const LOCAL_INV = {
+  cols: 9,
+  rows: 4,
+  slots: [], // string[] (uids)
+  items: {}, // uid -> {uid, kind, qty, durability, maxDurability, meta}
+  equip: { head: "", chest: "", legs: "", feet: "", tool: "", offhand: "" },
+};
+
+const LOCAL_HOTBAR = {
+  index: 0,
+};
+
+const LOCAL_STATS = {
+  hp: 20,
+  maxHp: 20,
+  stamina: 100,
+  maxStamina: 100,
+  sprinting: false,
+  swinging: false,
 };
 
 /* ============================================================
@@ -153,7 +166,6 @@ function resolveScene() {
 function noaAddMesh(mesh, isStatic = false, pos = null) {
   try {
     noa.rendering.addMeshToScene(mesh, !!isStatic, pos || null);
-    // reduce aggressive culling issues
     mesh.alwaysSelectAsActiveMesh = true;
   } catch (e) {
     console.warn("[NOA_RENDER] addMeshToScene failed:", e);
@@ -257,20 +269,10 @@ function createCrosshairOverlay() {
   };
 
   const h = document.createElement("div");
-  Object.assign(h.style, lineStyle, {
-    width: "100%",
-    height: "2px",
-    top: "10px",
-    left: "0",
-  });
+  Object.assign(h.style, lineStyle, { width: "100%", height: "2px", top: "10px", left: "0" });
 
   const v = document.createElement("div");
-  Object.assign(v.style, lineStyle, {
-    width: "2px",
-    height: "100%",
-    left: "10px",
-    top: "0",
-  });
+  Object.assign(v.style, lineStyle, { width: "2px", height: "100%", left: "10px", top: "0" });
 
   div.appendChild(h);
   div.appendChild(v);
@@ -291,140 +293,133 @@ function createCrosshairOverlay() {
 const crosshairUI = createCrosshairOverlay();
 
 /* ============================================================
- * UI: HUD OVERLAY (HEARTS + STAMINA)
+ * UI: HOTBAR OVERLAY
  * ============================================================
  */
 
-function createHudOverlay() {
+function createHotbarOverlay() {
   const wrap = document.createElement("div");
-  wrap.id = "noa-hud";
+  wrap.id = "noa-hotbar";
   Object.assign(wrap.style, {
     position: "fixed",
-    left: "14px",
-    bottom: "14px",
+    left: "50%",
+    bottom: "18px",
+    transform: "translateX(-50%)",
     zIndex: "9999",
     pointerEvents: "none",
-    fontFamily: "system-ui, -apple-system, Segoe UI, Roboto, Arial",
-    textShadow: "0 1px 2px rgba(0,0,0,0.8)",
-    userSelect: "none",
-    display: "block",
+    display: "grid",
+    gridTemplateColumns: "repeat(9, 54px)",
+    gap: "8px",
+    padding: "10px 12px",
+    borderRadius: "16px",
+    background: "rgba(0,0,0,0.35)",
+    border: "1px solid rgba(255,255,255,0.14)",
+    boxShadow: "0 12px 34px rgba(0,0,0,0.35)",
+    backdropFilter: "blur(6px)",
   });
 
-  // Hearts row
-  const hearts = document.createElement("div");
-  Object.assign(hearts.style, {
-    display: "flex",
-    gap: "2px",
-    alignItems: "center",
-    marginBottom: "8px",
-    fontSize: "20px",
-    lineHeight: "20px",
-  });
+  const slots = [];
+  for (let i = 0; i < 9; i++) {
+    const slot = document.createElement("div");
+    slot.dataset.idx = String(i);
+    Object.assign(slot.style, {
+      width: "54px",
+      height: "54px",
+      borderRadius: "14px",
+      background: "rgba(15,15,18,0.65)",
+      border: "1px solid rgba(255,255,255,0.12)",
+      position: "relative",
+      overflow: "hidden",
+    });
 
-  // Stamina bar
-  const staminaWrap = document.createElement("div");
-  Object.assign(staminaWrap.style, {
-    width: "220px",
-    height: "10px",
-    borderRadius: "6px",
-    background: "rgba(0,0,0,0.45)",
-    border: "1px solid rgba(255,255,255,0.25)",
-    overflow: "hidden",
-  });
+    const icon = document.createElement("div");
+    Object.assign(icon.style, {
+      position: "absolute",
+      left: "8px",
+      top: "8px",
+      right: "8px",
+      bottom: "8px",
+      display: "flex",
+      alignItems: "center",
+      justifyContent: "center",
+      fontSize: "12px",
+      opacity: "0.95",
+      textAlign: "center",
+      lineHeight: "1.15",
+      fontFamily: "system-ui, -apple-system, Segoe UI, Roboto, Arial",
+      textShadow: "0 1px 2px rgba(0,0,0,0.85)",
+      userSelect: "none",
+      whiteSpace: "nowrap",
+    });
 
-  const staminaFill = document.createElement("div");
-  Object.assign(staminaFill.style, {
-    width: "100%",
-    height: "100%",
-    borderRadius: "6px",
-    background: "rgba(80, 220, 120, 0.9)",
-    transformOrigin: "left center",
-    transform: "scaleX(1)",
-  });
+    const qty = document.createElement("div");
+    Object.assign(qty.style, {
+      position: "absolute",
+      right: "8px",
+      bottom: "6px",
+      fontSize: "12px",
+      fontWeight: "800",
+      opacity: "0.92",
+      textShadow: "0 1px 2px rgba(0,0,0,0.85)",
+      fontFamily: "system-ui, -apple-system, Segoe UI, Roboto, Arial",
+      userSelect: "none",
+    });
 
-  staminaWrap.appendChild(staminaFill);
+    const keycap = document.createElement("div");
+    keycap.textContent = String(i + 1);
+    Object.assign(keycap.style, {
+      position: "absolute",
+      left: "8px",
+      bottom: "6px",
+      fontSize: "11px",
+      opacity: "0.55",
+      fontWeight: "700",
+      fontFamily: "system-ui, -apple-system, Segoe UI, Roboto, Arial",
+      userSelect: "none",
+    });
 
-  // optional hint label
-  const label = document.createElement("div");
-  Object.assign(label.style, {
-    marginTop: "6px",
-    fontSize: "12px",
-    opacity: "0.75",
-  });
-  label.textContent = "";
+    slot.appendChild(icon);
+    slot.appendChild(qty);
+    slot.appendChild(keycap);
+    wrap.appendChild(slot);
 
-  wrap.appendChild(hearts);
-  wrap.appendChild(staminaWrap);
-  wrap.appendChild(label);
+    slots.push({ slot, icon, qty });
+  }
+
   document.body.appendChild(wrap);
 
-  // internal cache to reduce DOM churn
-  let lastHp = -1,
-    lastMaxHp = -1,
-    lastSt = -1,
-    lastMaxSt = -1;
+  function itemShort(kind) {
+    if (!kind) return "";
+    const k = String(kind);
+    const last = k.includes(":") ? k.split(":").pop() : k;
+    return last.length > 14 ? last.slice(0, 14) + "…" : last;
+  }
 
-  function setHp(hp, maxHp) {
-    hp = Math.max(0, Math.min(maxHp || 0, hp || 0));
-    maxHp = Math.max(1, maxHp || 1);
+  function refresh() {
+    for (let i = 0; i < 9; i++) {
+      const uid = LOCAL_INV.slots?.[i] || "";
+      const it = uid ? LOCAL_INV.items[uid] : null;
 
-    if (hp === lastHp && maxHp === lastMaxHp) return;
-    lastHp = hp;
-    lastMaxHp = maxHp;
+      slots[i].icon.textContent = it ? itemShort(it.kind) : "";
+      slots[i].qty.textContent = it && safeNum(it.qty, 0) > 1 ? String(it.qty | 0) : "";
 
-    // each heart = 2 hp
-    const heartsCount = Math.ceil(maxHp / 2);
-    const fullHearts = Math.floor(hp / 2);
-    const hasHalf = hp % 2 === 1;
-
-    hearts.innerHTML = "";
-    for (let i = 0; i < heartsCount; i++) {
-      const span = document.createElement("span");
-      if (i < fullHearts) {
-        span.textContent = "♥";
-        span.style.color = "rgba(255,80,80,0.95)";
-      } else if (i === fullHearts && hasHalf) {
-        span.textContent = "♥";
-        span.style.color = "rgba(255,80,80,0.55)";
-      } else {
-        span.textContent = "♡";
-        span.style.color = "rgba(255,255,255,0.55)";
-      }
-      hearts.appendChild(span);
+      const selected = i === (LOCAL_HOTBAR.index | 0);
+      slots[i].slot.style.borderColor = selected ? "rgba(255,255,255,0.65)" : "rgba(255,255,255,0.12)";
+      slots[i].slot.style.boxShadow = selected ? "0 0 0 2px rgba(255,255,255,0.18) inset" : "none";
     }
   }
 
-  function setStamina(stamina, maxStamina) {
-    stamina = Math.max(0, Math.min(maxStamina || 0, stamina || 0));
-    maxStamina = Math.max(1, maxStamina || 1);
-
-    if (stamina === lastSt && maxStamina === lastMaxSt) return;
-    lastSt = stamina;
-    lastMaxSt = maxStamina;
-
-    const pct = stamina / maxStamina;
-    staminaFill.style.transform = `scaleX(${pct})`;
-
-    // color shift when low
-    if (pct < 0.25) staminaFill.style.background = "rgba(255, 200, 80, 0.95)";
-    else staminaFill.style.background = "rgba(80, 220, 120, 0.9)";
-  }
-
-  function setHint(text) {
-    label.textContent = text || "";
-  }
-
   function setVisible(on) {
-    wrap.style.display = on ? "block" : "none";
+    wrap.style.display = on ? "grid" : "none";
   }
 
-  return { setHp, setStamina, setHint, setVisible };
+  return { refresh, setVisible };
 }
 
-const hudUI = createHudOverlay();
+const hotbarUI = createHotbarOverlay();
 
 /* ============================================================
- * UI: INVENTORY OVERLAY (GRID + EQUIPMENT + DRAG/DROP)
+ * UI: INVENTORY OVERLAY (drag/drop, split)
  * ============================================================
  */
 
@@ -434,12 +429,10 @@ function createInventoryOverlay() {
   Object.assign(overlay.style, {
     position: "fixed",
     inset: "0",
-    background: "rgba(0,0,0,0.55)",
-    zIndex: "10000",
     display: "none",
-    pointerEvents: "auto",
-    fontFamily: "system-ui, -apple-system, Segoe UI, Roboto, Arial",
-    color: "white",
+    zIndex: "9998",
+    background: "rgba(0,0,0,0.35)",
+    backdropFilter: "blur(6px)",
   });
 
   const panel = document.createElement("div");
@@ -448,375 +441,411 @@ function createInventoryOverlay() {
     left: "50%",
     top: "50%",
     transform: "translate(-50%, -50%)",
-    width: "820px",
-    maxWidth: "92vw",
-    borderRadius: "16px",
-    background: "rgba(20,20,26,0.95)",
-    border: "1px solid rgba(255,255,255,0.15)",
-    boxShadow: "0 12px 40px rgba(0,0,0,0.5)",
+    width: "min(860px, 92vw)",
+    borderRadius: "18px",
+    background: "rgba(20,20,24,0.88)",
+    border: "1px solid rgba(255,255,255,0.14)",
+    boxShadow: "0 18px 60px rgba(0,0,0,0.55)",
     padding: "16px",
+    fontFamily: "system-ui, -apple-system, Segoe UI, Roboto, Arial",
+    color: "rgba(255,255,255,0.92)",
   });
 
-  const header = document.createElement("div");
-  Object.assign(header.style, {
+  const topRow = document.createElement("div");
+  Object.assign(topRow.style, {
     display: "flex",
     alignItems: "center",
     justifyContent: "space-between",
+    gap: "12px",
     marginBottom: "12px",
   });
 
   const title = document.createElement("div");
   title.textContent = "Inventory";
-  Object.assign(title.style, { fontSize: "18px", fontWeight: "700", letterSpacing: "0.2px" });
+  Object.assign(title.style, { fontSize: "18px", fontWeight: "800", letterSpacing: "0.2px" });
 
   const hint = document.createElement("div");
-  hint.textContent = "Drag items • Right-click slot to split (client intent) • Press I to close";
-  Object.assign(hint.style, { fontSize: "12px", opacity: "0.75", textAlign: "right" });
+  hint.textContent = "Drag to move • Right-click: split stack • Esc/I to close";
+  Object.assign(hint.style, { fontSize: "12px", opacity: "0.75" });
 
-  header.appendChild(title);
-  header.appendChild(hint);
+  topRow.appendChild(title);
+  topRow.appendChild(hint);
 
-  const body = document.createElement("div");
-  Object.assign(body.style, {
+  const gridWrap = document.createElement("div");
+  Object.assign(gridWrap.style, {
     display: "grid",
-    gridTemplateColumns: "240px 1fr",
-    gap: "14px",
+    gridTemplateColumns: "1fr 260px",
+    gap: "16px",
   });
 
-  // Equipment column
-  const equipCol = document.createElement("div");
-  Object.assign(equipCol.style, {
-    borderRadius: "14px",
+  const invArea = document.createElement("div");
+  const eqArea = document.createElement("div");
+
+  // Inventory grid
+  const invGrid = document.createElement("div");
+  Object.assign(invGrid.style, {
+    display: "grid",
+    gridTemplateColumns: `repeat(${LOCAL_INV.cols || 9}, 64px)`,
+    gap: "10px",
     padding: "12px",
-    background: "rgba(255,255,255,0.05)",
-    border: "1px solid rgba(255,255,255,0.08)",
+    borderRadius: "16px",
+    background: "rgba(0,0,0,0.25)",
+    border: "1px solid rgba(255,255,255,0.10)",
+    justifyContent: "center",
   });
 
-  const equipTitle = document.createElement("div");
-  equipTitle.textContent = "Equipment";
-  Object.assign(equipTitle.style, { fontWeight: "700", marginBottom: "10px", opacity: "0.9" });
+  // Equipment
+  const eqTitle = document.createElement("div");
+  eqTitle.textContent = "Equipment";
+  Object.assign(eqTitle.style, { fontSize: "14px", fontWeight: "800", marginBottom: "10px" });
 
-  const equipGrid = document.createElement("div");
-  Object.assign(equipGrid.style, {
+  const eqGrid = document.createElement("div");
+  Object.assign(eqGrid.style, {
     display: "grid",
-    gridTemplateColumns: "1fr 1fr",
+    gridTemplateColumns: "repeat(2, 1fr)",
     gap: "10px",
   });
 
-  // Inventory column
-  const invCol = document.createElement("div");
-  Object.assign(invCol.style, {
-    borderRadius: "14px",
-    padding: "12px",
-    background: "rgba(255,255,255,0.05)",
-    border: "1px solid rgba(255,255,255,0.08)",
-  });
+  const eqKeys = ["head", "chest", "legs", "feet", "tool", "offhand"];
+  const eqCells = {};
 
-  const invTitleRow = document.createElement("div");
-  Object.assign(invTitleRow.style, {
-    display: "flex",
-    alignItems: "center",
-    justifyContent: "space-between",
-    marginBottom: "10px",
-  });
-
-  const invTitle = document.createElement("div");
-  invTitle.textContent = "Backpack";
-  Object.assign(invTitle.style, { fontWeight: "700", opacity: "0.9" });
-
-  const invMeta = document.createElement("div");
-  invMeta.textContent = "";
-  Object.assign(invMeta.style, { fontSize: "12px", opacity: "0.7" });
-
-  invTitleRow.appendChild(invTitle);
-  invTitleRow.appendChild(invMeta);
-
-  const slotsWrap = document.createElement("div");
-  Object.assign(slotsWrap.style, {
-    display: "grid",
-    gap: "8px",
-    gridTemplateColumns: "repeat(9, 1fr)",
-  });
-
-  // Quick tooltip
-  const tooltip = document.createElement("div");
-  Object.assign(tooltip.style, {
-    position: "fixed",
-    left: "0",
-    top: "0",
-    transform: "translate(-9999px, -9999px)",
-    background: "rgba(10,10,12,0.92)",
-    border: "1px solid rgba(255,255,255,0.12)",
-    padding: "8px 10px",
-    borderRadius: "10px",
-    fontSize: "12px",
-    zIndex: "10001",
-    pointerEvents: "none",
-    whiteSpace: "pre",
-    maxWidth: "320px",
-    boxShadow: "0 8px 28px rgba(0,0,0,0.45)",
-  });
-
-  document.body.appendChild(tooltip);
-
-  const equipSlots = {};
-  const equipOrder = [
-    ["head", "Head"],
-    ["chest", "Chest"],
-    ["legs", "Legs"],
-    ["feet", "Feet"],
-    ["tool", "Tool"],
-    ["offhand", "Offhand"],
-  ];
-
-  function makeSlotEl(slotId, labelText) {
-    const slot = document.createElement("div");
-    slot.dataset.slotId = slotId;
-    Object.assign(slot.style, {
-      width: "100%",
-      aspectRatio: "1 / 1",
-      borderRadius: "12px",
-      background: "rgba(0,0,0,0.25)",
+  function makeSlotBox(label, slotId) {
+    const cell = document.createElement("div");
+    cell.dataset.slot = slotId;
+    Object.assign(cell.style, {
+      height: "64px",
+      borderRadius: "14px",
+      background: "rgba(15,15,18,0.65)",
       border: "1px solid rgba(255,255,255,0.12)",
-      display: "flex",
-      alignItems: "center",
-      justifyContent: "center",
       position: "relative",
       overflow: "hidden",
+      userSelect: "none",
     });
 
-    const label = document.createElement("div");
-    label.textContent = labelText || "";
-    Object.assign(label.style, {
+    const lab = document.createElement("div");
+    lab.textContent = label;
+    Object.assign(lab.style, {
       position: "absolute",
-      left: "8px",
-      bottom: "6px",
+      left: "10px",
+      top: "8px",
       fontSize: "11px",
-      opacity: "0.65",
-      pointerEvents: "none",
+      opacity: "0.55",
+      fontWeight: "700",
     });
 
     const icon = document.createElement("div");
-    icon.textContent = "";
     Object.assign(icon.style, {
+      position: "absolute",
+      left: "10px",
+      right: "10px",
+      bottom: "10px",
+      top: "24px",
+      display: "flex",
+      alignItems: "center",
+      justifyContent: "center",
       fontSize: "12px",
-      opacity: "0.9",
       textAlign: "center",
-      padding: "6px",
       lineHeight: "1.15",
-      pointerEvents: "none",
+      opacity: "0.92",
+      textShadow: "0 1px 2px rgba(0,0,0,0.85)",
+      whiteSpace: "nowrap",
     });
 
     const qty = document.createElement("div");
-    qty.textContent = "";
     Object.assign(qty.style, {
       position: "absolute",
-      right: "8px",
-      bottom: "6px",
+      right: "10px",
+      bottom: "8px",
       fontSize: "12px",
-      fontWeight: "700",
-      opacity: "0.9",
+      fontWeight: "900",
+      opacity: "0.88",
       textShadow: "0 1px 2px rgba(0,0,0,0.85)",
-      pointerEvents: "none",
     });
 
-    slot.appendChild(icon);
-    slot.appendChild(qty);
-    slot.appendChild(label);
+    cell.appendChild(lab);
+    cell.appendChild(icon);
+    cell.appendChild(qty);
 
-    // Drag/drop
-    slot.draggable = true;
-
-    slot.addEventListener("dragstart", (e) => {
-      const sid = slot.dataset.slotId;
-      if (!sid) return;
-      const payload = { from: sid };
-      e.dataTransfer?.setData("application/json", JSON.stringify(payload));
-      e.dataTransfer?.setData("text/plain", sid);
-    });
-
-    slot.addEventListener("dragover", (e) => {
-      e.preventDefault();
-      slot.style.borderColor = "rgba(255,255,255,0.35)";
-    });
-
-    slot.addEventListener("dragleave", () => {
-      slot.style.borderColor = "rgba(255,255,255,0.12)";
-    });
-
-    slot.addEventListener("drop", (e) => {
-      e.preventDefault();
-      slot.style.borderColor = "rgba(255,255,255,0.12)";
-
-      const raw = e.dataTransfer?.getData("application/json") || "";
-      let from = "";
-      try {
-        from = JSON.parse(raw).from || "";
-      } catch (_) {
-        from = e.dataTransfer?.getData("text/plain") || "";
-      }
-      const to = slot.dataset.slotId || "";
-      if (!from || !to || from === to) return;
-
-      // send move intent to server
-      sendMoveItem(from, to);
-    });
-
-    // Right click => split stack intent
-    slot.addEventListener("contextmenu", (e) => {
-      e.preventDefault();
-      const sid = slot.dataset.slotId || "";
-      if (!sid) return;
-      sendSplitStack(sid);
-    });
-
-    // tooltip
-    slot.addEventListener("mousemove", (e) => {
-      const sid = slot.dataset.slotId || "";
-      const info = getSlotTooltip(sid);
-      if (!info) {
-        tooltip.style.transform = "translate(-9999px, -9999px)";
-        return;
-      }
-      tooltip.textContent = info;
-      tooltip.style.transform = `translate(${e.clientX + 12}px, ${e.clientY + 12}px)`;
-    });
-
-    slot.addEventListener("mouseleave", () => {
-      tooltip.style.transform = "translate(-9999px, -9999px)";
-    });
-
-    return { slot, icon, qty };
+    return { cell, icon, qty };
   }
 
-  function getSlotTooltip(slotId) {
-    // slotId formats:
-    // inv:12
-    // eq:tool
-    if (!slotId) return "";
+  // build inv slots (max 9*4 by default)
+  const invCells = [];
+  function rebuildInvGrid() {
+    invGrid.innerHTML = "";
+    invCells.length = 0;
 
-    let uid = "";
-    if (slotId.startsWith("inv:")) {
-      const idx = Number(slotId.slice(4));
-      uid = LOCAL_INV.slots[idx] || "";
-    } else if (slotId.startsWith("eq:")) {
-      const key = slotId.slice(3);
-      uid = LOCAL_INV.equip[key] || "";
-    }
+    const cols = LOCAL_INV.cols || 9;
+    const rows = LOCAL_INV.rows || 4;
 
-    if (!uid) return "";
-
-    const it = LOCAL_INV.items[uid];
-    if (!it) return "";
-
-    const lines = [];
-    lines.push(`${it.kind || "Unknown Item"}`);
-    if (safeNum(it.qty, 0) > 1) lines.push(`Qty: ${it.qty}`);
-    if (safeNum(it.maxDurability, 0) > 0) lines.push(`Durability: ${it.durability}/${it.maxDurability}`);
-    if (it.meta) lines.push(`${it.meta}`);
-
-    return lines.join("\n");
-  }
-
-  function renderEquipment() {
-    equipGrid.innerHTML = "";
-    for (const [key, label] of equipOrder) {
-      const el = makeSlotEl(`eq:${key}`, label);
-      equipSlots[key] = el;
-      equipGrid.appendChild(el.slot);
-    }
-  }
-
-  // build inventory slots
-  const invSlotEls = [];
-  function buildInventorySlots(cols, rows) {
-    slotsWrap.innerHTML = "";
-    invSlotEls.length = 0;
-
-    slotsWrap.style.gridTemplateColumns = `repeat(${cols}, 1fr)`;
+    invGrid.style.gridTemplateColumns = `repeat(${cols}, 64px)`;
 
     const total = cols * rows;
     for (let i = 0; i < total; i++) {
-      const el = makeSlotEl(`inv:${i}`, "");
-      invSlotEls.push(el);
-      slotsWrap.appendChild(el.slot);
-    }
+      const { cell, icon, qty } = makeSlotBox("", `inv:${i}`);
+      // remove label for inv
+      cell.firstChild.style.display = "none";
 
-    invMeta.textContent = `${cols}×${rows} (${total} slots)`;
-  }
-
-  function itemShort(kind) {
-    // tiny label for slot icon
-    if (!kind) return "";
-    // cheap “prettify”: pick last segment and cap
-    const k = String(kind).split("/").pop();
-    return k.length > 14 ? k.slice(0, 14) + "…" : k;
-  }
-
-  function refresh() {
-    // build slots if dimensions changed
-    const cols = safeNum(LOCAL_INV.cols, 9);
-    const rows = safeNum(LOCAL_INV.rows, 4);
-    const total = cols * rows;
-
-    if (invSlotEls.length !== total) {
-      buildInventorySlots(cols, rows);
-    }
-
-    // equipment
-    for (const [key] of equipOrder) {
-      const uid = LOCAL_INV.equip[key] || "";
-      const it = uid ? LOCAL_INV.items[uid] : null;
-      const el = equipSlots[key];
-      if (!el) continue;
-      el.icon.textContent = it ? itemShort(it.kind) : "";
-      el.qty.textContent = it && safeNum(it.qty, 0) > 1 ? String(it.qty) : "";
-    }
-
-    // grid
-    for (let i = 0; i < invSlotEls.length; i++) {
-      const uid = LOCAL_INV.slots[i] || "";
-      const it = uid ? LOCAL_INV.items[uid] : null;
-      const el = invSlotEls[i];
-      el.icon.textContent = it ? itemShort(it.kind) : "";
-      el.qty.textContent = it && safeNum(it.qty, 0) > 1 ? String(it.qty) : "";
+      invGrid.appendChild(cell);
+      invCells.push({ cell, icon, qty });
     }
   }
 
-  function setOpen(on) {
-    overlay.style.display = on ? "block" : "none";
+  // build equip cells
+  for (const k of eqKeys) {
+    const pretty = k[0].toUpperCase() + k.slice(1);
+    const { cell, icon, qty } = makeSlotBox(pretty, `eq:${k}`);
+    eqGrid.appendChild(cell);
+    eqCells[k] = { cell, icon, qty };
   }
 
-  // click background to close
-  overlay.addEventListener("mousedown", (e) => {
-    if (e.target === overlay) {
-      inventoryOpen = false;
-      syncPointerLockForInventory();
-      setOpen(false);
-    }
+  invArea.appendChild(invGrid);
+
+  Object.assign(eqArea.style, {
+    padding: "12px",
+    borderRadius: "16px",
+    background: "rgba(0,0,0,0.25)",
+    border: "1px solid rgba(255,255,255,0.10)",
+    height: "fit-content",
   });
 
-  panel.appendChild(header);
-  equipCol.appendChild(equipTitle);
-  equipCol.appendChild(equipGrid);
+  eqArea.appendChild(eqTitle);
+  eqArea.appendChild(eqGrid);
 
-  invCol.appendChild(invTitleRow);
-  invCol.appendChild(slotsWrap);
+  gridWrap.appendChild(invArea);
+  gridWrap.appendChild(eqArea);
 
-  body.appendChild(equipCol);
-  body.appendChild(invCol);
-
-  panel.appendChild(body);
+  panel.appendChild(topRow);
+  panel.appendChild(gridWrap);
   overlay.appendChild(panel);
   document.body.appendChild(overlay);
 
-  renderEquipment();
-  buildInventorySlots(LOCAL_INV.cols, LOCAL_INV.rows);
+  // Drag state
+  const drag = {
+    active: false,
+    from: "",
+    over: "",
+    uid: "",
+    startX: 0,
+    startY: 0,
+  };
 
-  return { setOpen, refresh };
+  function itemShort(kind) {
+    if (!kind) return "";
+    const k = String(kind);
+    const last = k.includes(":") ? k.split(":").pop() : k;
+    return last.length > 18 ? last.slice(0, 18) + "…" : last;
+  }
+
+  function slotUid(slotId) {
+    if (!slotId) return "";
+    if (slotId.startsWith("inv:")) {
+      const idx = Number(slotId.slice(4));
+      return LOCAL_INV.slots?.[idx] || "";
+    }
+    if (slotId.startsWith("eq:")) {
+      const key = slotId.slice(3);
+      return (LOCAL_INV.equip && LOCAL_INV.equip[key]) ? LOCAL_INV.equip[key] : "";
+    }
+    return "";
+  }
+
+  function renderCell(cellObj, uid, isSelectedHotbarSlot) {
+    const it = uid ? LOCAL_INV.items[uid] : null;
+    cellObj.icon.textContent = it ? itemShort(it.kind) : "";
+    cellObj.qty.textContent = it && safeNum(it.qty, 0) > 1 ? String(it.qty | 0) : "";
+
+    cellObj.cell.style.borderColor = isSelectedHotbarSlot
+      ? "rgba(255,255,255,0.65)"
+      : "rgba(255,255,255,0.12)";
+    cellObj.cell.style.boxShadow = isSelectedHotbarSlot
+      ? "0 0 0 2px rgba(255,255,255,0.18) inset"
+      : "none";
+  }
+
+  function refresh() {
+    // Ensure grid matches cols/rows
+    if (invCells.length !== (LOCAL_INV.cols || 9) * (LOCAL_INV.rows || 4)) {
+      rebuildInvGrid();
+      bindCells();
+    }
+
+    // render inv
+    const total = invCells.length;
+    for (let i = 0; i < total; i++) {
+      const uid = LOCAL_INV.slots?.[i] || "";
+      const isHotbarSelected = i >= 0 && i <= 8 && i === (LOCAL_HOTBAR.index | 0);
+      renderCell(invCells[i], uid, isHotbarSelected);
+    }
+
+    // render equip
+    for (const k of eqKeys) {
+      const uid = LOCAL_INV.equip?.[k] || "";
+      renderCell(eqCells[k], uid, false);
+    }
+  }
+
+  function sendInvMove(from, to) {
+    if (!colyRoom) return;
+    try {
+      colyRoom.send("inv:move", { from, to });
+    } catch (e) {}
+  }
+
+  function sendInvSplit(slot) {
+    if (!colyRoom) return;
+    try {
+      colyRoom.send("inv:split", { slot });
+    } catch (e) {}
+  }
+
+  function makeGhost(text) {
+    const g = document.createElement("div");
+    g.textContent = text;
+    Object.assign(g.style, {
+      position: "fixed",
+      left: "0px",
+      top: "0px",
+      transform: "translate(-9999px, -9999px)",
+      zIndex: "10000",
+      pointerEvents: "none",
+      padding: "10px 12px",
+      borderRadius: "14px",
+      background: "rgba(0,0,0,0.80)",
+      border: "1px solid rgba(255,255,255,0.14)",
+      color: "white",
+      fontFamily: "system-ui, -apple-system, Segoe UI, Roboto, Arial",
+      fontSize: "12px",
+      fontWeight: "800",
+      textShadow: "0 1px 2px rgba(0,0,0,0.85)",
+      boxShadow: "0 10px 30px rgba(0,0,0,0.5)",
+      maxWidth: "220px",
+      whiteSpace: "nowrap",
+      overflow: "hidden",
+      textOverflow: "ellipsis",
+    });
+    document.body.appendChild(g);
+    return g;
+  }
+
+  function setGhostPos(x, y) {
+    if (!MESH.dragGhost) return;
+    MESH.dragGhost.style.transform = `translate(${x + 12}px, ${y + 12}px)`;
+  }
+
+  function beginDrag(slotId, x, y) {
+    const uid = slotUid(slotId);
+    if (!uid) return;
+
+    const it = LOCAL_INV.items[uid];
+    drag.active = true;
+    drag.from = slotId;
+    drag.over = "";
+    drag.uid = uid;
+    drag.startX = x;
+    drag.startY = y;
+
+    const label = it ? `${itemShort(it.kind)}${safeNum(it.qty, 0) > 1 ? ` x${it.qty | 0}` : ""}` : uid;
+
+    if (!MESH.dragGhost) MESH.dragGhost = makeGhost(label);
+    else MESH.dragGhost.textContent = label;
+
+    setGhostPos(x, y);
+  }
+
+  function endDrag() {
+    if (!drag.active) return;
+
+    if (MESH.dragGhost) {
+      MESH.dragGhost.style.transform = "translate(-9999px, -9999px)";
+    }
+
+    if (drag.over && drag.over !== drag.from) {
+      sendInvMove(drag.from, drag.over);
+    }
+
+    drag.active = false;
+    drag.from = "";
+    drag.over = "";
+    drag.uid = "";
+  }
+
+  function onCellDown(slotId, e) {
+    // right click = split
+    if (e.button === 2) {
+      e.preventDefault();
+      sendInvSplit(slotId);
+      return;
+    }
+
+    // left click start drag
+    if (e.button === 0) {
+      e.preventDefault();
+      beginDrag(slotId, e.clientX, e.clientY);
+    }
+  }
+
+  function onCellEnter(slotId) {
+    if (!drag.active) return;
+    drag.over = slotId;
+  }
+
+  function bindCells() {
+    // prevent context menu over inventory UI
+    overlay.addEventListener("contextmenu", (e) => e.preventDefault());
+
+    // Bind inv cells
+    for (const c of invCells) {
+      const slotId = c.cell.dataset.slot;
+      c.cell.style.pointerEvents = "auto";
+
+      c.cell.onmousedown = (e) => onCellDown(slotId, e);
+      c.cell.onmouseenter = () => onCellEnter(slotId);
+    }
+
+    // Bind eq cells
+    for (const k of eqKeys) {
+      const slotId = `eq:${k}`;
+      const c = eqCells[k];
+      c.cell.style.pointerEvents = "auto";
+      c.cell.onmousedown = (e) => onCellDown(slotId, e);
+      c.cell.onmouseenter = () => onCellEnter(slotId);
+    }
+  }
+
+  rebuildInvGrid();
+  bindCells();
+
+  window.addEventListener("mousemove", (e) => {
+    if (!drag.active) return;
+    setGhostPos(e.clientX, e.clientY);
+  });
+
+  window.addEventListener("mouseup", () => {
+    if (!drag.active) return;
+    endDrag();
+  });
+
+  function open() {
+    overlay.style.display = "block";
+    refresh();
+  }
+
+  function close() {
+    overlay.style.display = "none";
+    endDrag();
+  }
+
+  function setVisible(on) {
+    overlay.style.display = on ? "block" : "none";
+    if (on) refresh();
+    else endDrag();
+  }
+
+  return { open, close, setVisible, refresh, isOpen: () => overlay.style.display !== "none" };
 }
 
-const invUI = createInventoryOverlay();
+const inventoryUI = createInventoryOverlay();
 
 /* ============================================================
  * WORLD GENERATION
@@ -1079,6 +1108,7 @@ function enforceViewModeEveryFrame() {
   setEnabled(MESH.avatarRoot, !isFirst);
 
   crosshairUI.refresh();
+  hotbarUI.refresh();
 }
 
 function applyViewModeOnce() {
@@ -1160,7 +1190,11 @@ function updateFpsRig(dt, speed) {
   const wr = MESH.weaponRoot;
   const s = clamp(dt * 12, 0, 1);
 
-  const targetPos = new BABYLON.Vector3(bobX + swayX * 0.8, -0.02 + bobY - swingAmt * 0.04, 0);
+  const targetPos = new BABYLON.Vector3(
+    bobX + swayX * 0.8,
+    -0.02 + bobY - swingAmt * 0.04,
+    0
+  );
 
   const targetRot = new BABYLON.Vector3(
     swayY + swingAmt * 0.9,
@@ -1239,74 +1273,7 @@ function getLocalPhysics(dt) {
 }
 
 /* ============================================================
- * 3RD PERSON DEBUG SNAPSHOTS
- * ============================================================
- */
-
-function isVecFinite(v) {
-  return v && Number.isFinite(v.x) && Number.isFinite(v.y) && Number.isFinite(v.z);
-}
-
-function meshEnabled(m) {
-  try {
-    return typeof m.isEnabled === "function" ? m.isEnabled() : !!m._isEnabled;
-  } catch (e) {
-    return true;
-  }
-}
-
-function getMeshesFromRig(parts) {
-  if (!parts) return [];
-  return [parts.head, parts.body, parts.armL, parts.armR, parts.legL, parts.legR, parts.tool].filter(Boolean);
-}
-
-function debugThirdPersonAvatar(nowMs) {
-  if (viewMode !== 1) return;
-  if (!STATE.scene) return;
-  if (!MESH.avatarRoot || !MESH.avParts?.root) return;
-
-  const cam = STATE.scene.activeCamera;
-  const root = MESH.avParts.root;
-  const meshes = getMeshesFromRig(MESH.avParts);
-
-  const rootPos = root.position;
-  const rootRot = root.rotation;
-
-  const camPos = cam?.position;
-  const distToCam = camPos ? BABYLON.Vector3.Distance(camPos, root.position) : null;
-
-  const due = nowMs - STATE.avDbgLastLog >= STATE.avDbgIntervalMs;
-  if (!due) return;
-  STATE.avDbgLastLog = nowMs;
-
-  let anyDisabled = !meshEnabled(root);
-  let anyInvisible = root.isVisible === false;
-  let anyNaN = !isVecFinite(rootPos) || !isVecFinite(rootRot);
-
-  for (const m of meshes) {
-    if (!meshEnabled(m)) anyDisabled = true;
-    if (m.isVisible === false || (typeof m.visibility === "number" && m.visibility <= 0)) anyInvisible = true;
-    if (!isVecFinite(m.position) || !isVecFinite(m.rotation) || !isVecFinite(m.scaling)) anyNaN = true;
-  }
-
-  console.log("AVATAR SNAP:", {
-    viewMode,
-    rootPos: { x: rootPos.x, y: rootPos.y, z: rootPos.z },
-    rootRot: { x: rootRot.x, y: rootRot.y, z: rootRot.z },
-    y: safeNum(rootPos.y, null),
-    rootEnabled: meshEnabled(root),
-    rootVisible: root.isVisible !== false,
-    camPos: camPos ? { x: camPos.x, y: camPos.y, z: camPos.z } : null,
-    distToCam,
-    camRollZ: cam?.rotation ? cam.rotation.z : null,
-    anyDisabled,
-    anyInvisible,
-    anyNaN,
-  });
-}
-
-/* ============================================================
- * MULTIPLAYER STATE DIFF SYNC (NO MapSchema hooks)
+ * MULTIPLAYER STATE SNAPSHOT + SYNC
  * ============================================================
  */
 
@@ -1314,7 +1281,6 @@ function getPlayersSnapshot(players) {
   const out = {};
   if (!players) return out;
 
-  // MapSchema in some builds provides forEach
   if (typeof players.forEach === "function") {
     try {
       players.forEach((player, sessionId) => {
@@ -1324,7 +1290,6 @@ function getPlayersSnapshot(players) {
     } catch (e) {}
   }
 
-  // fallback
   try {
     for (const k of Object.keys(players)) out[k] = players[k];
   } catch (e) {}
@@ -1337,8 +1302,6 @@ function spawnRemotePlayer(sessionId, player) {
   if (colyRoom && sessionId === colyRoom.sessionId) return;
   if (remotePlayers[sessionId]) return;
   if (!ensureSceneReady()) return;
-
-  console.log("Remote player joined:", sessionId);
 
   const rig = createAvatarRig(STATE.scene, "remote_" + sessionId);
 
@@ -1364,8 +1327,6 @@ function spawnRemotePlayer(sessionId, player) {
 function removeRemotePlayer(sessionId) {
   const rp = remotePlayers[sessionId];
   if (!rp) return;
-
-  console.log("Remote player left:", sessionId);
 
   try {
     if (rp.mesh) rp.mesh.dispose();
@@ -1394,6 +1355,82 @@ function updateRemoteTargetsFromState(playersObj) {
   }
 }
 
+function snapshotMyState(me) {
+  if (!me) return;
+
+  // stats
+  LOCAL_STATS.hp = safeNum(me.hp, LOCAL_STATS.hp);
+  LOCAL_STATS.maxHp = safeNum(me.maxHp, LOCAL_STATS.maxHp);
+  LOCAL_STATS.stamina = safeNum(me.stamina, LOCAL_STATS.stamina);
+  LOCAL_STATS.maxStamina = safeNum(me.maxStamina, LOCAL_STATS.maxStamina);
+  LOCAL_STATS.sprinting = !!me.sprinting;
+  LOCAL_STATS.swinging = !!me.swinging;
+
+  // hotbar
+  LOCAL_HOTBAR.index = safeNum(me.hotbarIndex, LOCAL_HOTBAR.index) | 0;
+
+  // inventory sizes
+  LOCAL_INV.cols = safeNum(me.inventory?.cols, LOCAL_INV.cols) | 0;
+  LOCAL_INV.rows = safeNum(me.inventory?.rows, LOCAL_INV.rows) | 0;
+
+  // slots
+  const slots = [];
+  try {
+    const src = me.inventory?.slots;
+    if (src && typeof src.length === "number") {
+      for (let i = 0; i < src.length; i++) slots.push(String(src[i] || ""));
+    }
+  } catch (e) {}
+  LOCAL_INV.slots = slots;
+
+  // equip
+  const eq = me.equip || {};
+  LOCAL_INV.equip = {
+    head: String(eq.head || ""),
+    chest: String(eq.chest || ""),
+    legs: String(eq.legs || ""),
+    feet: String(eq.feet || ""),
+    tool: String(eq.tool || ""),
+    offhand: String(eq.offhand || ""),
+  };
+
+  // items map
+  const items = {};
+  try {
+    const m = me.items;
+    if (m && typeof m.forEach === "function") {
+      m.forEach((it, uid) => {
+        items[String(uid)] = {
+          uid: String(it.uid || uid),
+          kind: String(it.kind || ""),
+          qty: safeNum(it.qty, 0) | 0,
+          durability: safeNum(it.durability, 0) | 0,
+          maxDurability: safeNum(it.maxDurability, 0) | 0,
+          meta: String(it.meta || ""),
+        };
+      });
+    } else if (m && typeof m === "object") {
+      for (const uid of Object.keys(m)) {
+        const it = m[uid];
+        items[String(uid)] = {
+          uid: String(it.uid || uid),
+          kind: String(it.kind || ""),
+          qty: safeNum(it.qty, 0) | 0,
+          durability: safeNum(it.durability, 0) | 0,
+          maxDurability: safeNum(it.maxDurability, 0) | 0,
+          meta: String(it.meta || ""),
+        };
+      }
+    }
+  } catch (e) {}
+
+  LOCAL_INV.items = items;
+
+  // refresh UI
+  hotbarUI.refresh();
+  if (inventoryUI.isOpen()) inventoryUI.refresh();
+}
+
 function syncPlayersFromState(state) {
   if (!state) return;
 
@@ -1411,105 +1448,35 @@ function syncPlayersFromState(state) {
   updateRemoteTargetsFromState(playersObj);
   lastPlayersKeys = newKeys;
 
-  // Refresh local HUD + inventory snapshot whenever state changes
-  updateLocalFromState(playersObj);
+  // snapshot my player for UI
+  if (colyRoom && playersObj[colyRoom.sessionId]) {
+    snapshotMyState(playersObj[colyRoom.sessionId]);
+  }
 }
 
 /* ============================================================
- * LOCAL SYNC: STATS + INVENTORY (FROM SERVER STATE)
+ * NETWORK SEND HELPERS
  * ============================================================
  */
 
-function snapshotMapSchema(mapSchemaLike) {
-  const out = {};
-  if (!mapSchemaLike) return out;
-  if (typeof mapSchemaLike.forEach === "function") {
-    try {
-      mapSchemaLike.forEach((v, k) => (out[k] = v));
-      return out;
-    } catch (e) {}
-  }
-  try {
-    for (const k of Object.keys(mapSchemaLike)) out[k] = mapSchemaLike[k];
-  } catch (e) {}
-  return out;
-}
-
-function snapshotArraySchema(arrLike) {
-  if (!arrLike) return [];
-  try {
-    // ArraySchema behaves like array
-    return Array.from(arrLike);
-  } catch (e) {
-    return [];
-  }
-}
-
-function updateLocalFromState(playersObj) {
-  if (!colyRoom) return;
-  const me = playersObj[colyRoom.sessionId];
-  if (!me) return;
-
-  // stats
-  LOCAL_STATS.hp = safeNum(me.hp, LOCAL_STATS.hp);
-  LOCAL_STATS.maxHp = safeNum(me.maxHp, LOCAL_STATS.maxHp);
-  LOCAL_STATS.stamina = safeNum(me.stamina, LOCAL_STATS.stamina);
-  LOCAL_STATS.maxStamina = safeNum(me.maxStamina, LOCAL_STATS.maxStamina);
-  LOCAL_STATS.sprinting = !!me.sprinting;
-  LOCAL_STATS.swinging = !!me.swinging;
-
-  hudUI.setHp(LOCAL_STATS.hp, LOCAL_STATS.maxHp);
-  hudUI.setStamina(LOCAL_STATS.stamina, LOCAL_STATS.maxStamina);
-  hudUI.setHint(LOCAL_STATS.sprinting ? "Sprinting" : "");
-
-  // inventory
-  LOCAL_INV.cols = safeNum(me.inventory?.cols, LOCAL_INV.cols);
-  LOCAL_INV.rows = safeNum(me.inventory?.rows, LOCAL_INV.rows);
-  LOCAL_INV.slots = snapshotArraySchema(me.inventory?.slots);
-
-  const itemsObj = snapshotMapSchema(me.items);
-  const itemsOut = {};
-  for (const uid of Object.keys(itemsObj)) {
-    const it = itemsObj[uid];
-    itemsOut[uid] = {
-      uid: String(it.uid || uid),
-      kind: String(it.kind || ""),
-      qty: safeNum(it.qty, 0),
-      durability: safeNum(it.durability, 0),
-      maxDurability: safeNum(it.maxDurability, 0),
-      meta: String(it.meta || ""),
-    };
-  }
-  LOCAL_INV.items = itemsOut;
-
-  LOCAL_INV.equip = {
-    head: String(me.equip?.head || ""),
-    chest: String(me.equip?.chest || ""),
-    legs: String(me.equip?.legs || ""),
-    feet: String(me.equip?.feet || ""),
-    tool: String(me.equip?.tool || ""),
-    offhand: String(me.equip?.offhand || ""),
-  };
-
-  if (inventoryOpen) invUI.refresh();
-}
-
-/* ============================================================
- * INVENTORY SERVER-INTENT MESSAGES
- * ============================================================
- */
-
-function sendMoveItem(fromSlotId, toSlotId) {
+function sendHotbarIndex(index) {
   if (!colyRoom) return;
   try {
-    colyRoom.send("inv:move", { from: String(fromSlotId), to: String(toSlotId) });
+    colyRoom.send("hotbar:set", { index: index | 0 });
   } catch (e) {}
 }
 
-function sendSplitStack(slotId) {
+function sendSprint(on) {
   if (!colyRoom) return;
   try {
-    colyRoom.send("inv:split", { slot: String(slotId) });
+    colyRoom.send("sprint", { on: !!on });
+  } catch (e) {}
+}
+
+function sendSwing() {
+  if (!colyRoom) return;
+  try {
+    colyRoom.send("swing", { t: performance.now() });
   } catch (e) {}
 }
 
@@ -1518,81 +1485,83 @@ function sendSplitStack(slotId) {
  * ============================================================
  */
 
-function syncPointerLockForInventory() {
-  // If inventory is open, release pointer lock so the mouse can drag items
-  try {
-    if (inventoryOpen) {
-      if (document.pointerLockElement) document.exitPointerLock?.();
-    } else {
-      // do nothing; NOA will re-lock when user clicks canvas
-    }
-  } catch (e) {}
-}
-
 document.addEventListener("keydown", (e) => {
   if (e.code === "KeyV") {
     viewMode = (viewMode + 1) % 2;
     applyViewModeOnce();
   }
+
   if (e.code === "KeyC") {
     forceCrosshair = !forceCrosshair;
     crosshairUI.refresh();
   }
+
   if (e.code === "KeyP") {
     showDebugProof = !showDebugProof;
     refreshDebugProofMeshes();
   }
 
   // Inventory toggle
-  if (e.code === "KeyI") {
+  if (e.code === "KeyI" || e.code === "Tab") {
+    e.preventDefault();
     inventoryOpen = !inventoryOpen;
-    invUI.setOpen(inventoryOpen);
-    if (inventoryOpen) invUI.refresh();
-    syncPointerLockForInventory();
+    inventoryUI.setVisible(inventoryOpen);
+
+    // When inventory opens, release pointer lock if locked
+    if (inventoryOpen && document.pointerLockElement === noa.container.canvas) {
+      document.exitPointerLock?.();
+    }
   }
 
-  // Sprint start (Shift)
-  if (e.code === "ShiftLeft" || e.code === "ShiftRight") {
-    sendSprintIntent(true);
+  // ESC closes inventory
+  if (e.code === "Escape") {
+    if (inventoryOpen) {
+      inventoryOpen = false;
+      inventoryUI.setVisible(false);
+    }
+  }
+
+  // Hotbar number keys (only when inventory closed)
+  if (!inventoryOpen) {
+    if (e.code === "Digit1") sendHotbarIndex(0);
+    if (e.code === "Digit2") sendHotbarIndex(1);
+    if (e.code === "Digit3") sendHotbarIndex(2);
+    if (e.code === "Digit4") sendHotbarIndex(3);
+    if (e.code === "Digit5") sendHotbarIndex(4);
+    if (e.code === "Digit6") sendHotbarIndex(5);
+    if (e.code === "Digit7") sendHotbarIndex(6);
+    if (e.code === "Digit8") sendHotbarIndex(7);
+    if (e.code === "Digit9") sendHotbarIndex(8);
   }
 });
 
-document.addEventListener("keyup", (e) => {
-  // Sprint stop (Shift)
-  if (e.code === "ShiftLeft" || e.code === "ShiftRight") {
-    sendSprintIntent(false);
-  }
-});
-
-function sendSprintIntent(on) {
-  if (!colyRoom) return;
-  try {
-    colyRoom.send("sprint", { on: !!on });
-  } catch (e) {}
-}
-
+// 3rd-person zoom + hotbar scroll
 noa.on("tick", function () {
   const scroll = noa.inputs.pointerState.scrolly;
-  if (scroll !== 0 && viewMode === 1) {
+
+  // 3rd-person zoom
+  if (scroll !== 0 && viewMode === 1 && !inventoryOpen) {
     noa.camera.zoomDistance = clamp(noa.camera.zoomDistance + (scroll > 0 ? 1 : -1), 2, 12);
     noa.camera.currentZoom = noa.camera.zoomDistance;
   }
+
+  // hotbar wheel selection (Minecraft-like)
+  if (!inventoryOpen && scroll !== 0) {
+    const dir = scroll > 0 ? 1 : -1;
+    const next = (LOCAL_HOTBAR.index + dir + 9) % 9;
+    sendHotbarIndex(next);
+  }
 });
 
-function triggerSwing() {
+function triggerSwingLocalOnly() {
   STATE.swingT = 0;
-
-  if (colyRoom) {
-    try {
-      colyRoom.send("swing", { t: performance.now() });
-    } catch (e) {}
-  }
 }
 
 noa.inputs.down.on("fire", function () {
-  if (inventoryOpen) return;
+  triggerSwingLocalOnly();
+  sendSwing();
 
-  triggerSwing();
+  // mine
   if (noa.targetedBlock) {
     const pos = noa.targetedBlock.position;
     noa.setBlock(0, pos[0], pos[1], pos[2]);
@@ -1600,9 +1569,10 @@ noa.inputs.down.on("fire", function () {
 });
 
 noa.inputs.down.on("alt-fire", function () {
-  if (inventoryOpen) return;
+  triggerSwingLocalOnly();
+  sendSwing();
 
-  triggerSwing();
+  // place
   if (noa.targetedBlock) {
     const pos = noa.targetedBlock.adjacent;
     noa.setBlock(grassID, pos[0], pos[1], pos[2]);
@@ -1610,6 +1580,18 @@ noa.inputs.down.on("alt-fire", function () {
 });
 
 noa.inputs.bind("alt-fire", "KeyE");
+
+// Sprint intent: Shift key
+document.addEventListener("keydown", (e) => {
+  if (e.code === "ShiftLeft" || e.code === "ShiftRight") {
+    if (!inventoryOpen) sendSprint(true);
+  }
+});
+document.addEventListener("keyup", (e) => {
+  if (e.code === "ShiftLeft" || e.code === "ShiftRight") {
+    sendSprint(false);
+  }
+});
 
 /* ============================================================
  * MAIN RENDER LOOP
@@ -1653,9 +1635,6 @@ noa.on("beforeRender", function () {
   // 3rd-person hard camera follow (ONLY in 3rd person)
   hardFollowThirdPersonCamera();
 
-  // debug snapshots (only 3rd person)
-  debugThirdPersonAvatar(now);
-
   // Remote interpolation
   for (const sid in remotePlayers) {
     const rp = remotePlayers[sid];
@@ -1691,9 +1670,22 @@ noa.on("beforeRender", function () {
     MESH.frontCube.position.copyFrom(cam.position).addInPlace(fwd.scale(3));
   }
 
-  // Keep HUD up to date
-  hudUI.setHp(LOCAL_STATS.hp, LOCAL_STATS.maxHp);
-  hudUI.setStamina(LOCAL_STATS.stamina, LOCAL_STATS.maxStamina);
+  // send move at 10Hz
+  // (simple throttle without setInterval, keeps it in sync with render loop)
+  if (colyRoom) {
+    STATE._moveAccum = (STATE._moveAccum || 0) + dt;
+    if (STATE._moveAccum >= 0.1) {
+      STATE._moveAccum = 0;
+
+      const p = getSafePlayerPos();
+      const yaw = noa.camera.heading;
+      const pitch = noa.camera.pitch;
+
+      try {
+        colyRoom.send("move", { x: p[0], y: p[1], z: p[2], yaw, pitch, viewMode });
+      } catch (e) {}
+    }
+  }
 });
 
 /* ============================================================
@@ -1706,13 +1698,13 @@ const ENDPOINT =
     ? import.meta.env.VITE_COLYSEUS_ENDPOINT
     : "ws://localhost:2567";
 
-const colyseusClient = new Client(ENDPOINT);
+const colyseusClient = new ColyClient(ENDPOINT);
 
 async function connectColyseus() {
   console.log("Connecting to Colyseus at:", ENDPOINT);
 
   try {
-    const room = await colyseusClient.joinOrCreate("my_room");
+    const room = await colyseusClient.joinOrCreate("my_room", { name: "Steve" });
     colyRoom = room;
 
     console.log("Colyseus Connected. Session ID:", room.sessionId);
@@ -1721,30 +1713,18 @@ async function connectColyseus() {
       console.log("[server] welcome:", msg);
     });
 
-    // initial sync
+    room.onMessage("hello_ack", (msg) => {
+      console.log("[server] hello_ack:", msg);
+    });
+
     if (room.state) syncPlayersFromState(room.state);
 
     room.onStateChange((state) => {
       syncPlayersFromState(state);
     });
 
-    // send loop (movement/orientation)
-    setInterval(() => {
-      if (!colyRoom) return;
-
-      const p = getSafePlayerPos();
-      const yaw = noa.camera.heading;
-      const pitch = noa.camera.pitch;
-
-      colyRoom.send("move", {
-        x: p[0],
-        y: p[1],
-        z: p[2],
-        yaw,
-        pitch,
-        viewMode,
-      });
-    }, 100);
+    // optional ping
+    room.send("hello", { hi: true });
   } catch (err) {
     console.error("Colyseus Connection Failed:", err);
   }
