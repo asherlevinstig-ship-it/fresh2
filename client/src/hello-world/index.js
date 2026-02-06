@@ -7,7 +7,11 @@
  *   - F4 toggle, F6 clear, F7 toggle console mirroring
  * - F2 toggles browser context menu (for inspector if you still want it)
  * - F3 toggles build debug logs
- * - World generation: grass top layer, dirt below
+ * - Texture atlas materials (NOA atlasIndex vertical strip)
+ *   - /public/textures/atlas.png (tile 0..3 top->bottom)
+ *   - 0 grass_top, 1 dirt, 2 grass_side, 3 stone
+ * - Nearest-neighbor texture sampling (crisp pixels)
+ * - World generation: grass top layer, dirt below, stone deep
  * - First/Third person view mode enforcement EVERY FRAME
  * - FPS rig + 3rd-person avatar rigs (local + remote)
  * - Crosshair overlay
@@ -33,13 +37,19 @@ import * as BABYLON from "babylonjs";
 const opts = {
   debug: true,
   showFPS: true,
+
   chunkSize: 32,
   chunkAddDistance: 2.5,
   chunkRemoveDistance: 3.5,
+
   stickyPointerLock: true,
   dragCameraOutsidePointerLock: true,
+
   initialZoom: 0,
   zoomSpeed: 0.25,
+
+  // IMPORTANT: Vite serves from /public, so /textures/atlas.png is public/textures/atlas.png
+  texturePath: "/textures/",
 };
 
 const noa = new Engine(opts);
@@ -141,7 +151,7 @@ const LOCAL_STATS = {
  */
 
 const UI_CONSOLE = (() => {
-  const MAX_LINES = 140;
+  const MAX_LINES = 160;
 
   const wrap = document.createElement("div");
   wrap.id = "ui-console";
@@ -149,8 +159,8 @@ const UI_CONSOLE = (() => {
     position: "fixed",
     left: "14px",
     bottom: "90px",
-    width: "min(560px, 92vw)",
-    maxHeight: "36vh",
+    width: "min(620px, 94vw)",
+    maxHeight: "40vh",
     zIndex: "10050",
     display: "none",
     pointerEvents: "none",
@@ -193,7 +203,7 @@ const UI_CONSOLE = (() => {
 
   const scroller = document.createElement("div");
   Object.assign(scroller.style, {
-    maxHeight: "30vh",
+    maxHeight: "32vh",
     overflow: "auto",
     paddingRight: "4px",
     pointerEvents: "auto",
@@ -378,16 +388,16 @@ const uiError = (...a) => UI_CONSOLE.error(...a);
  * ============================================================
  */
 
-function safeNum(v, fallback = 0) {
-  return typeof v === "number" && Number.isFinite(v) ? v : fallback;
-}
-
 function clamp(v, a, b) {
   return Math.max(a, Math.min(b, v));
 }
 
 function lerp(a, b, t) {
   return a + (b - a) * t;
+}
+
+function safeNum(v, fallback = 0) {
+  return typeof v === "number" && Number.isFinite(v) ? v : fallback;
 }
 
 function resolveScene() {
@@ -404,18 +414,6 @@ function noaAddMesh(mesh, isStatic = false, pos = null) {
   } catch (e) {
     uiWarn("[NOA_RENDER] addMeshToScene failed:", e);
   }
-}
-
-function createSolidMat(scene, name, color3) {
-  const existing = scene.getMaterialByName(name);
-  if (existing) return existing;
-
-  const mat = new BABYLON.StandardMaterial(name, scene);
-  mat.diffuseColor = color3;
-  mat.emissiveColor = color3.scale(0.35);
-  mat.specularColor = new BABYLON.Color3(0, 0, 0);
-  mat.backFaceCulling = false;
-  return mat;
 }
 
 function setEnabled(meshOrNode, on) {
@@ -1021,21 +1019,41 @@ function createInventoryOverlay() {
 const inventoryUI = createInventoryOverlay();
 
 /* ============================================================
- * WORLD GENERATION (FIXED LAYERING)
+ * TEXTURE ATLAS MATERIALS + BLOCK REGISTRY
+ * ============================================================
+ * atlas.png MUST be a vertical strip (tiles stacked top->bottom)
+ * client/public/textures/atlas.png
+ *
+ * tile 0: grass_top
+ * tile 1: dirt
+ * tile 2: grass_side
+ * tile 3: stone
  * ============================================================
  */
 
-const brownish = [0.45, 0.36, 0.22];
-const greenish = [0.1, 0.8, 0.2];
+const atlasURL = "atlas.png";
 
-noa.registry.registerMaterial("dirt", { color: brownish });
-noa.registry.registerMaterial("grass", { color: greenish });
+// register materials (atlasIndex refers to vertical strip tile index)
+noa.registry.registerMaterial("grass_top", { textureURL: atlasURL, atlasIndex: 0 });
+noa.registry.registerMaterial("dirt", { textureURL: atlasURL, atlasIndex: 1 });
+noa.registry.registerMaterial("grass_side", { textureURL: atlasURL, atlasIndex: 2 });
+noa.registry.registerMaterial("stone", { textureURL: atlasURL, atlasIndex: 3 });
 
+// register blocks
 const dirtID = noa.registry.registerBlock(1, { material: "dirt" });
-const grassID = noa.registry.registerBlock(2, { material: "grass" });
+const grassID = noa.registry.registerBlock(2, { material: ["grass_top", "dirt", "grass_side"] });
+const stoneID = noa.registry.registerBlock(3, { material: "stone" });
+
+/* ============================================================
+ * WORLD GENERATION (grass/dirt/stone)
+ * ============================================================
+ */
 
 function getVoxelID(x, y, z) {
+  if (y < -6) return stoneID;
+
   const height = 2 * Math.sin(x / 10) + 3 * Math.cos(z / 20);
+
   if (y < height - 1) return dirtID;
   if (y < height) return grassID;
   return 0;
@@ -1054,9 +1072,27 @@ noa.world.on("worldDataNeeded", function (id, data, x, y, z) {
 });
 
 /* ============================================================
- * SCENE INIT
+ * SCENE INIT + PIXEL TEXTURE SETTINGS
  * ============================================================
  */
+
+function forceNearestNeighborTextures(scene) {
+  try {
+    for (const tex of scene.textures) {
+      try {
+        tex.updateSamplingMode(BABYLON.Texture.NEAREST_SAMPLINGMODE);
+      } catch (e) {}
+    }
+  } catch (e) {}
+}
+
+function resolveCamera(scene) {
+  try {
+    return scene.activeCamera || noaAny.rendering?.camera || null;
+  } catch (e) {
+    return null;
+  }
+}
 
 function ensureSceneReady() {
   if (STATE.scene) return true;
@@ -1066,11 +1102,13 @@ function ensureSceneReady() {
 
   STATE.scene = scene;
 
-  if (scene.activeCamera) {
-    scene.activeCamera.minZ = 0.01;
-    scene.activeCamera.maxZ = 5000;
+  const cam = resolveCamera(scene);
+  if (cam) {
+    cam.minZ = 0.01;
+    cam.maxZ = 5000;
   }
 
+  // attempt to cache NOA follow offset state if present
   try {
     const st = noa.ents.getState(noa.camera.cameraTarget, "followsEntity");
     if (st?.offset) {
@@ -1078,6 +1116,9 @@ function ensureSceneReady() {
       STATE.baseFollowOffset = [...st.offset];
     }
   } catch (e) {}
+
+  // Make textures crispy
+  forceNearestNeighborTextures(scene);
 
   uiLog("[SCENE] ready");
   return true;
@@ -1087,6 +1128,18 @@ function ensureSceneReady() {
  * RIGS
  * ============================================================
  */
+
+function createSolidMat(scene, name, color3) {
+  const existing = scene.getMaterialByName(name);
+  if (existing) return existing;
+
+  const mat = new BABYLON.StandardMaterial(name, scene);
+  mat.diffuseColor = color3;
+  mat.emissiveColor = color3.scale(0.35);
+  mat.specularColor = new BABYLON.Color3(0, 0, 0);
+  mat.backFaceCulling = false;
+  return mat;
+}
 
 function createAvatarRig(scene, namePrefix) {
   const root = new BABYLON.TransformNode(namePrefix + "_root", scene);
@@ -1167,7 +1220,8 @@ function createAvatarRig(scene, namePrefix) {
 function initFpsRig() {
   if (MESH.weaponRoot) return;
   const scene = STATE.scene;
-  const cam = scene.activeCamera;
+  const cam = resolveCamera(scene);
+  if (!cam) return;
 
   const weaponRoot = new BABYLON.TransformNode("weaponRoot", scene);
   weaponRoot.parent = cam;
@@ -1257,6 +1311,7 @@ function enforceViewModeEveryFrame() {
     noa.camera.currentZoom = z;
   }
 
+  // enforce NOA follow offset, if available
   try {
     const st = STATE.camFollowState;
     if (st?.offset) {
@@ -1272,6 +1327,7 @@ function enforceViewModeEveryFrame() {
     }
   } catch (e) {}
 
+  // enforce mesh visibility
   setEnabled(MESH.armsRoot, isFirst);
   setEnabled(MESH.tool, isFirst);
   setEnabled(MESH.avatarRoot, !isFirst);
@@ -1295,10 +1351,11 @@ function applyViewModeOnce() {
 
 function hardFollowThirdPersonCamera() {
   if (viewMode !== 1) return;
-  if (!STATE.scene || !STATE.scene.activeCamera) return;
+  if (!STATE.scene) return;
   if (!MESH.avatarRoot) return;
 
-  const cam = STATE.scene.activeCamera;
+  const cam = resolveCamera(STATE.scene);
+  if (!cam) return;
 
   cam.upVector = new BABYLON.Vector3(0, 1, 0);
   if (cam.rotation) cam.rotation.z = 0;
@@ -1339,14 +1396,17 @@ function updateFpsRig(dt, speed) {
   STATE.lastHeading = heading;
   STATE.lastPitch = pitch;
 
+  // bob
   const bobRate = clamp(speed * 7, 0, 12);
   STATE.bobPhase += bobRate * dt;
   const bobY = Math.sin(STATE.bobPhase) * 0.03;
   const bobX = Math.sin(STATE.bobPhase * 0.5) * 0.015;
 
+  // sway
   const swayX = clamp(-dHeading * 1.6, -0.08, 0.08);
   const swayY = clamp(dPitch * 1.2, -0.06, 0.06);
 
+  // swing
   let swingAmt = 0;
   if (STATE.swingT < STATE.swingDuration) {
     const t = clamp(STATE.swingT / STATE.swingDuration, 0, 1);
@@ -1356,7 +1416,11 @@ function updateFpsRig(dt, speed) {
   const wr = MESH.weaponRoot;
   const s = clamp(dt * 12, 0, 1);
 
-  const targetPos = new BABYLON.Vector3(bobX + swayX * 0.8, -0.02 + bobY - swingAmt * 0.04, 0);
+  const targetPos = new BABYLON.Vector3(
+    bobX + swayX * 0.8,
+    -0.02 + bobY - swingAmt * 0.04,
+    0
+  );
 
   const targetRot = new BABYLON.Vector3(
     swayY + swingAmt * 0.9,
@@ -1449,12 +1513,14 @@ function getSelectedHotbarItem() {
 function kindToBlockId(kind) {
   if (kind === "block:dirt") return dirtID;
   if (kind === "block:grass") return grassID;
+  if (kind === "block:stone") return stoneID;
   return 0;
 }
 
 function blockIdToKind(blockId) {
   if (blockId === dirtID) return "block:dirt";
   if (blockId === grassID) return "block:grass";
+  if (blockId === stoneID) return "block:stone";
   return "";
 }
 
@@ -1467,6 +1533,7 @@ function getPlayersSnapshot(players) {
   const out = {};
   if (!players) return out;
 
+  // MapSchema often provides forEach
   if (typeof players.forEach === "function") {
     try {
       players.forEach((player, sessionId) => {
@@ -1476,6 +1543,7 @@ function getPlayersSnapshot(players) {
     } catch (e) {}
   }
 
+  // fallback
   try {
     for (const k of Object.keys(players)) out[k] = players[k];
   } catch (e) {}
@@ -1681,7 +1749,6 @@ function sendInvAdd(kind, qty = 1) {
  */
 
 function canPlaceAt(x, y, z) {
-  // prevent placing inside player
   const p = getSafePlayerPos();
   const px = p[0],
     py = p[1],
@@ -1694,7 +1761,6 @@ function canPlaceAt(x, y, z) {
   const insidePlayer = dx < 0.45 && dz < 0.45 && dy < 1.0;
   if (insidePlayer) return false;
 
-  // must be empty
   return noa.getBlock(x, y, z) === 0;
 }
 
@@ -1736,7 +1802,8 @@ function placeSelectedBlock(source = "unknown") {
     y = pos[1],
     z = pos[2];
 
-  const camPos = STATE.scene?.activeCamera?.position;
+  const cam = resolveCamera(STATE.scene);
+  const camPos = cam?.position;
   if (camPos) {
     const dx = x + 0.5 - camPos.x;
     const dy = y + 0.5 - camPos.y;
@@ -1767,14 +1834,11 @@ function placeSelectedBlock(source = "unknown") {
 window.addEventListener(
   "keydown",
   (e) => {
-    // F2: toggle browser context menu availability (for inspector)
+    // F2: toggle browser context menu availability
     if (e.code === "F2") {
       e.preventDefault();
       ALLOW_BROWSER_CONTEXT_MENU = !ALLOW_BROWSER_CONTEXT_MENU;
-      uiLog(
-        "[DEBUG] Browser context menu:",
-        ALLOW_BROWSER_CONTEXT_MENU ? "ENABLED" : "DISABLED"
-      );
+      uiLog("[DEBUG] Browser context menu:", ALLOW_BROWSER_CONTEXT_MENU ? "ENABLED" : "DISABLED");
       return;
     }
 
@@ -1818,7 +1882,7 @@ window.addEventListener(
       }
     }
 
-    // building via keyboard ALWAYS works (even when context menu is enabled)
+    // build via keyboard ALWAYS works
     if (!inventoryOpen && (e.code === "KeyB" || e.code === "KeyE")) {
       placeSelectedBlock(e.code);
     }
@@ -1839,7 +1903,7 @@ window.addEventListener(
 );
 
 // Context menu handling:
-// - If ALLOW_BROWSER_CONTEXT_MENU = true, do NOT prevent default
+// - If enabled, do NOT prevent default
 // - Else prevent on canvas/pointer lock so right click can be used for building
 document.addEventListener(
   "contextmenu",
@@ -1894,7 +1958,7 @@ window.addEventListener(
   true
 );
 
-// Mine (left click default "fire")
+// Mine (left click "fire")
 noa.inputs.down.on("fire", function () {
   if (inventoryOpen) return;
 
@@ -1909,7 +1973,7 @@ noa.inputs.down.on("fire", function () {
   // remove locally
   noa.setBlock(0, tgt[0], tgt[1], tgt[2]);
 
-  // add to inventory server-side if known
+  // add to inventory server-side
   const kind = blockIdToKind(existingId);
   if (kind) {
     sendInvAdd(kind, 1);
@@ -1919,7 +1983,7 @@ noa.inputs.down.on("fire", function () {
   }
 });
 
-// Build (right click) only when browser context menu is disabled
+// Build (right click) only when context menu is disabled
 noa.inputs.down.on("alt-fire", function () {
   if (ALLOW_BROWSER_CONTEXT_MENU) return;
   placeSelectedBlock("mouse2");
@@ -1936,10 +2000,15 @@ noa.inputs.bind("alt-fire", "mouse2");
 noa.on("beforeRender", function () {
   if (!ensureSceneReady()) return;
 
+  // keep updating sampling mode in case textures load later
+  forceNearestNeighborTextures(STATE.scene);
+
+  // ensure rigs exist
   initFpsRig();
   initLocalAvatar();
   initDebugMeshes();
 
+  // enforce view mode EVERY frame
   enforceViewModeEveryFrame();
 
   const now = performance.now();
@@ -1949,9 +2018,10 @@ noa.on("beforeRender", function () {
 
   const { speed, grounded } = getLocalPhysics(dt);
 
+  // FPS rig animation
   updateFpsRig(dt, speed);
 
-  // local avatar
+  // Local avatar follows physics
   if (MESH.avatarRoot) {
     const p = getSafePlayerPos();
     MESH.avatarRoot.position.set(p[0], p[1] + 0.075, p[2]);
@@ -1961,9 +2031,10 @@ noa.on("beforeRender", function () {
     updateAvatarAnim(MESH.avParts, speed, grounded, STATE.swingT < STATE.swingDuration);
   }
 
+  // 3rd-person camera follow
   hardFollowThirdPersonCamera();
 
-  // remote interpolation
+  // Remote interpolation
   for (const sid in remotePlayers) {
     const rp = remotePlayers[sid];
     if (!rp || !rp.mesh) continue;
@@ -1978,6 +2049,7 @@ noa.on("beforeRender", function () {
 
     forceRigBounds(rp.parts);
 
+    // basic speed estimate for animation
     const dx = rp.mesh.position.x - rp.lastPos.x;
     const dz = rp.mesh.position.z - rp.lastPos.z;
     const dist = Math.sqrt(dx * dx + dz * dz);
@@ -1990,11 +2062,13 @@ noa.on("beforeRender", function () {
     updateAvatarAnim(rp.parts, remoteSpeed, true, false);
   }
 
-  // debug cube
-  if (showDebugProof && MESH.frontCube && STATE.scene?.activeCamera) {
-    const cam = STATE.scene.activeCamera;
-    const fwd = cam.getForwardRay(3).direction;
-    MESH.frontCube.position.copyFrom(cam.position).addInPlace(fwd.scale(3));
+  // debug cube in front of camera
+  if (showDebugProof && MESH.frontCube && STATE.scene) {
+    const cam = resolveCamera(STATE.scene);
+    if (cam && cam.getForwardRay) {
+      const fwd = cam.getForwardRay(3).direction;
+      MESH.frontCube.position.copyFrom(cam.position).addInPlace(fwd.scale(3));
+    }
   }
 
   // send move at ~10Hz
@@ -2062,6 +2136,7 @@ const bootInterval = setInterval(() => {
     clearInterval(bootInterval);
     applyViewModeOnce();
     uiLog("[BOOT] scene ready");
-    uiLog("[HELP] F4 debug console • F3 build logs • B/E build • 1..9 hotbar • I inventory");
+    uiLog("[HELP] F4 console • F3 logs • B/E build • 1..9 hotbar • I inventory");
+    uiLog("[TEXTURES] atlas: /textures/atlas.png (vertical strip: grass_top, dirt, grass_side, stone)");
   }
 }, 100);
