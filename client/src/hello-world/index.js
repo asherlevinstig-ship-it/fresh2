@@ -2,22 +2,15 @@
 /*
  * fresh2 - client main/index (NOA main entry) - FULL REWRITE (NO OMITS)
  * -------------------------------------------------------------------
- * Includes:
- * - NOA world generation (grass top layer, dirt underneath)
- * - First/Third person view mode enforcement EVERY FRAME
- * - FPS rig + 3rd-person avatar rigs (local + remote)
- * - Crosshair overlay
- * - Hotbar overlay (inv:0..8), server-authoritative hotbarIndex
- * - Inventory overlay (toggle with I), drag/drop slot-to-slot, split stacks
- * - Colyseus (@colyseus/sdk) state sync + remote interpolation
- * - Sends: move, sprint, swing, hotbar:set, inv:move, inv:split, inv:consumeHotbar, inv:add
- * - Mining: breaks block locally + tells server inv:add(kind)
- * - Building: RIGHT CLICK (mouse2) places selected hotbar block locally + tells server inv:consumeHotbar
- * - Extra: placement safety checks + optional debug logs
- *
- * Assumptions:
- * - Server room is "my_room"
- * - Server schema includes: players->PlayerState with items/inventory/equip/hotbarIndex
+ * Fixes included in THIS version:
+ * - F2 toggles browser right-click context menu (so you can inspect)
+ * - While context menu is enabled, building still works via KEYB (and KeyE)
+ * - Right-click build only active when context menu is disabled
+ * - Robust placement logs via DEBUG_BUILD (toggle F3)
+ * - Robust terrain layering (grass top, dirt under)
+ * - Hotbar scroll / 1..9 selection (server-authoritative)
+ * - Mining adds to server inventory; building consumes from server hotbar
+ * - Inventory UI (I) with drag/drop and split (right-click inside UI)
  */
 
 import { Engine } from "noa-engine";
@@ -28,7 +21,6 @@ import * as BABYLON from "babylonjs";
  * NOA BOOTSTRAP
  * ============================================================
  */
-let ALLOW_BROWSER_CONTEXT_MENU = false; // toggle for debugging
 
 const opts = {
   debug: true,
@@ -57,7 +49,9 @@ let forceCrosshair = true;
 let showDebugProof = false;
 let inventoryOpen = false;
 
-let DEBUG_BUILD = false; // flip true for placement logs
+// Debug / inspector helpers
+let ALLOW_BROWSER_CONTEXT_MENU = false; // F2 toggles this
+let DEBUG_BUILD = false; // F3 toggles this
 
 // Multiplayer
 let colyRoom = null;
@@ -796,8 +790,8 @@ const grassID = noa.registry.registerBlock(2, { material: "grass" });
 function getVoxelID(x, y, z) {
   const height = 2 * Math.sin(x / 10) + 3 * Math.cos(z / 20);
 
-  if (y < height - 1) return dirtID; // dirt below surface
-  if (y < height) return grassID; // top layer grass
+  if (y < height - 1) return dirtID;
+  if (y < height) return grassID;
   return 0;
 }
 
@@ -1429,12 +1423,11 @@ function sendInvAdd(kind, qty = 1) {
 }
 
 /* ============================================================
- * BUILDING (RIGHT CLICK)
+ * BUILDING (RIGHT CLICK when context menu disabled; always via B/E)
  * ============================================================
  */
 
 function canPlaceAt(x, y, z) {
-  // prevent placing inside player
   const p = getSafePlayerPos();
   const px = p[0],
     py = p[1],
@@ -1447,15 +1440,12 @@ function canPlaceAt(x, y, z) {
   const insidePlayer = dx < 0.45 && dz < 0.45 && dy < 1.0;
   if (insidePlayer) return false;
 
-  // must be empty
   return noa.getBlock(x, y, z) === 0;
 }
 
 function placeSelectedBlock() {
-  // do not build while inventory open
   if (inventoryOpen) return;
 
-  // local swing visual + server swing stamina
   STATE.swingT = 0;
   sendSwing();
 
@@ -1482,7 +1472,6 @@ function placeSelectedBlock() {
     y = pos[1],
     z = pos[2];
 
-  // reach guard (optional but useful)
   const camPos = STATE.scene?.activeCamera?.position;
   if (camPos) {
     const dx = x + 0.5 - camPos.x;
@@ -1500,10 +1489,7 @@ function placeSelectedBlock() {
     return;
   }
 
-  // place locally
   noa.setBlock(blockId, x, y, z);
-
-  // consume from inventory on server
   sendConsumeHotbar(1);
 
   if (DEBUG_BUILD) console.log("[BUILD] placed", kind, "at", x, y, z);
@@ -1514,65 +1500,97 @@ function placeSelectedBlock() {
  * ============================================================
  */
 
-document.addEventListener("keydown", (e) => {
-  if (e.code === "KeyV") {
-    viewMode = (viewMode + 1) % 2;
-    applyViewModeOnce();
-  }
-
-  if (e.code === "KeyC") {
-    forceCrosshair = !forceCrosshair;
-    crosshairUI.refresh();
-  }
-
-  if (e.code === "KeyP") {
-    showDebugProof = !showDebugProof;
-    refreshDebugProofMeshes();
-  }
-
-  if (e.code === "KeyI") {
-    e.preventDefault();
-    inventoryOpen = !inventoryOpen;
-    inventoryUI.setVisible(inventoryOpen);
-
-    if (inventoryOpen && document.pointerLockElement === noa.container.canvas) {
-      document.exitPointerLock?.();
+// IMPORTANT: make sure we see key events even when canvas is focused
+window.addEventListener(
+  "keydown",
+  (e) => {
+    // F2: toggle browser context menu availability
+    if (e.code === "F2") {
+      ALLOW_BROWSER_CONTEXT_MENU = !ALLOW_BROWSER_CONTEXT_MENU;
+      console.log(
+        "[DEBUG] Browser context menu:",
+        ALLOW_BROWSER_CONTEXT_MENU ? "ENABLED" : "DISABLED"
+      );
+      return;
     }
-  }
 
-  if (e.code === "Escape") {
-    if (inventoryOpen) {
-      inventoryOpen = false;
-      inventoryUI.setVisible(false);
+    // F3: toggle build logs
+    if (e.code === "F3") {
+      DEBUG_BUILD = !DEBUG_BUILD;
+      console.log("[DEBUG] Build logs:", DEBUG_BUILD ? "ON" : "OFF");
+      return;
     }
-  }
 
-  if (!inventoryOpen) {
-    if (e.code === "Digit1") sendHotbarIndex(0);
-    if (e.code === "Digit2") sendHotbarIndex(1);
-    if (e.code === "Digit3") sendHotbarIndex(2);
-    if (e.code === "Digit4") sendHotbarIndex(3);
-    if (e.code === "Digit5") sendHotbarIndex(4);
-    if (e.code === "Digit6") sendHotbarIndex(5);
-    if (e.code === "Digit7") sendHotbarIndex(6);
-    if (e.code === "Digit8") sendHotbarIndex(7);
-    if (e.code === "Digit9") sendHotbarIndex(8);
-  }
-});
+    if (e.code === "KeyV") {
+      viewMode = (viewMode + 1) % 2;
+      applyViewModeOnce();
+    }
 
-// Prevent browser context menu on right click (important for build)
-document.addEventListener("contextmenu", (e) => {
-  if (ALLOW_BROWSER_CONTEXT_MENU) return; // let browser menu/inspector work
+    if (e.code === "KeyC") {
+      forceCrosshair = !forceCrosshair;
+      crosshairUI.refresh();
+    }
 
-  const overCanvas =
-    e.target === noa.container.canvas ||
-    (noa.container.canvas && noa.container.canvas.contains?.(e.target));
+    if (e.code === "KeyP") {
+      showDebugProof = !showDebugProof;
+      refreshDebugProofMeshes();
+    }
 
-  if (document.pointerLockElement === noa.container.canvas || overCanvas) {
-    e.preventDefault();
-  }
-});
+    if (e.code === "KeyI") {
+      e.preventDefault();
+      inventoryOpen = !inventoryOpen;
+      inventoryUI.setVisible(inventoryOpen);
 
+      if (inventoryOpen && document.pointerLockElement === noa.container.canvas) {
+        document.exitPointerLock?.();
+      }
+    }
+
+    if (e.code === "Escape") {
+      if (inventoryOpen) {
+        inventoryOpen = false;
+        inventoryUI.setVisible(false);
+      }
+    }
+
+    // build via keyboard ALWAYS works (even when context menu is enabled)
+    if (!inventoryOpen && (e.code === "KeyB" || e.code === "KeyE")) {
+      placeSelectedBlock();
+    }
+
+    if (!inventoryOpen) {
+      if (e.code === "Digit1") sendHotbarIndex(0);
+      if (e.code === "Digit2") sendHotbarIndex(1);
+      if (e.code === "Digit3") sendHotbarIndex(2);
+      if (e.code === "Digit4") sendHotbarIndex(3);
+      if (e.code === "Digit5") sendHotbarIndex(4);
+      if (e.code === "Digit6") sendHotbarIndex(5);
+      if (e.code === "Digit7") sendHotbarIndex(6);
+      if (e.code === "Digit8") sendHotbarIndex(7);
+      if (e.code === "Digit9") sendHotbarIndex(8);
+    }
+  },
+  true
+);
+
+// Context menu handling:
+// - If ALLOW_BROWSER_CONTEXT_MENU = true, do NOT prevent default (lets inspect)
+// - Else prevent on canvas / pointer lock so right click can be used for building
+document.addEventListener(
+  "contextmenu",
+  (e) => {
+    if (ALLOW_BROWSER_CONTEXT_MENU) return;
+
+    const canvas = noa?.container?.canvas;
+    const overCanvas =
+      e.target === canvas || (canvas && typeof canvas.contains === "function" && canvas.contains(e.target));
+
+    if (document.pointerLockElement === canvas || overCanvas) {
+      e.preventDefault();
+    }
+  },
+  true
+);
 
 // Zoom + hotbar scroll
 noa.on("tick", function () {
@@ -1591,23 +1609,24 @@ noa.on("tick", function () {
 });
 
 // Sprint intent (Shift)
-document.addEventListener("keydown", (e) => {
-  if (e.code === "ShiftLeft" || e.code === "ShiftRight") {
-    if (!inventoryOpen) sendSprint(true);
-  }
-});
-document.addEventListener("keyup", (e) => {
-  if (e.code === "ShiftLeft" || e.code === "ShiftRight") {
-    sendSprint(false);
-  }
-});
-
-document.addEventListener("keydown", (e) => {
-  if (e.code === "F2") {
-    ALLOW_BROWSER_CONTEXT_MENU = !ALLOW_BROWSER_CONTEXT_MENU;
-    console.log("[DEBUG] Browser context menu:", ALLOW_BROWSER_CONTEXT_MENU ? "ENABLED" : "DISABLED");
-  }
-});
+window.addEventListener(
+  "keydown",
+  (e) => {
+    if (e.code === "ShiftLeft" || e.code === "ShiftRight") {
+      if (!inventoryOpen) sendSprint(true);
+    }
+  },
+  true
+);
+window.addEventListener(
+  "keyup",
+  (e) => {
+    if (e.code === "ShiftLeft" || e.code === "ShiftRight") {
+      sendSprint(false);
+    }
+  },
+  true
+);
 
 // Mine (left click default "fire")
 noa.inputs.down.on("fire", function () {
@@ -1621,26 +1640,26 @@ noa.inputs.down.on("fire", function () {
   const tgt = noa.targetedBlock.position;
   const existingId = noa.getBlock(tgt[0], tgt[1], tgt[2]);
 
-  // remove locally
   noa.setBlock(0, tgt[0], tgt[1], tgt[2]);
 
-  // add to inventory server-side if known
   const kind = blockIdToKind(existingId);
   if (kind) sendInvAdd(kind, 1);
 });
 
-// Build (RIGHT CLICK)
-noa.inputs.down.on("alt-fire", placeSelectedBlock);
+// Build (right click) only when browser context menu is disabled
+noa.inputs.down.on("alt-fire", function () {
+  if (ALLOW_BROWSER_CONTEXT_MENU) return; // let browser right click happen
+  placeSelectedBlock();
+});
 
 // Ensure right mouse triggers alt-fire
 noa.inputs.bind("alt-fire", "mouse2");
 
-// Optional: keep KeyE build too
-noa.inputs.bind("alt-fire", "KeyE");
-noa.inputs.bind("alt-fire", "KeyB"); // press B to place
+// Also bind build to B (and keep E build separate above via keydown handler)
+noa.inputs.bind("alt-fire", "KeyB");
 
 /* ============================================================
- * RENDER LOOP
+ * MAIN RENDER LOOP
  * ============================================================
  */
 
@@ -1662,7 +1681,6 @@ noa.on("beforeRender", function () {
 
   updateFpsRig(dt, speed);
 
-  // local avatar
   if (MESH.avatarRoot) {
     const p = getSafePlayerPos();
     MESH.avatarRoot.position.set(p[0], p[1] + 0.075, p[2]);
@@ -1674,7 +1692,6 @@ noa.on("beforeRender", function () {
 
   hardFollowThirdPersonCamera();
 
-  // remote players
   for (const sid in remotePlayers) {
     const rp = remotePlayers[sid];
     if (!rp || !rp.mesh) continue;
@@ -1699,21 +1716,21 @@ noa.on("beforeRender", function () {
     updateAvatarAnim(rp.parts, remoteSpeed, true, false);
   }
 
-  // debug cube
   if (showDebugProof && MESH.frontCube && STATE.scene?.activeCamera) {
     const cam = STATE.scene.activeCamera;
     const fwd = cam.getForwardRay(3).direction;
     MESH.frontCube.position.copyFrom(cam.position).addInPlace(fwd.scale(3));
   }
 
-  // send move at 10Hz
   if (colyRoom) {
     STATE._moveAccum += dt;
     if (STATE._moveAccum >= 0.1) {
       STATE._moveAccum = 0;
+
       const p = getSafePlayerPos();
       const yaw = noa.camera.heading;
       const pitch = noa.camera.pitch;
+
       try {
         colyRoom.send("move", { x: p[0], y: p[1], z: p[2], yaw, pitch, viewMode });
       } catch (e) {}
