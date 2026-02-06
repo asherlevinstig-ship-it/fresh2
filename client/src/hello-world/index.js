@@ -2,15 +2,23 @@
 /*
  * fresh2 - client main/index (NOA main entry) - FULL REWRITE (NO OMITS)
  * -------------------------------------------------------------------
- * Fixes included in THIS version:
- * - F2 toggles browser right-click context menu (so you can inspect)
- * - While context menu is enabled, building still works via KEYB (and KeyE)
- * - Right-click build only active when context menu is disabled
- * - Robust placement logs via DEBUG_BUILD (toggle F3)
- * - Robust terrain layering (grass top, dirt under)
- * - Hotbar scroll / 1..9 selection (server-authoritative)
- * - Mining adds to server inventory; building consumes from server hotbar
- * - Inventory UI (I) with drag/drop and split (right-click inside UI)
+ * Includes:
+ * - In-game UI Debug Console overlay (NO DevTools needed)
+ *   - F4 toggle, F6 clear, F7 toggle console mirroring
+ * - F2 toggles browser context menu (for inspector if you still want it)
+ * - F3 toggles build debug logs
+ * - World generation: grass top layer, dirt below
+ * - First/Third person view mode enforcement EVERY FRAME
+ * - FPS rig + 3rd-person avatar rigs (local + remote)
+ * - Crosshair overlay
+ * - Hotbar overlay (inv:0..8), server-authoritative hotbarIndex
+ * - Inventory overlay (I) with drag/drop and split (right-click inside UI)
+ * - Colyseus (@colyseus/sdk) state sync + remote interpolation
+ * - Mining: breaks block locally + tells server inv:add(kind)
+ * - Building:
+ *    - Right-click places ONLY when context menu is disabled
+ *    - Always available via KeyB / KeyE (even when context menu is enabled)
+ *    - Logs reasons to UI console so you can debug in-game
  */
 
 import { Engine } from "noa-engine";
@@ -127,6 +135,245 @@ const LOCAL_STATS = {
 };
 
 /* ============================================================
+ * UI DEBUG CONSOLE (NO DEVTOOLS NEEDED)
+ * Toggle: F4  |  Clear: F6  |  Mirror console: F7
+ * ============================================================
+ */
+
+const UI_CONSOLE = (() => {
+  const MAX_LINES = 140;
+
+  const wrap = document.createElement("div");
+  wrap.id = "ui-console";
+  Object.assign(wrap.style, {
+    position: "fixed",
+    left: "14px",
+    bottom: "90px",
+    width: "min(560px, 92vw)",
+    maxHeight: "36vh",
+    zIndex: "10050",
+    display: "none",
+    pointerEvents: "none",
+    fontFamily:
+      "ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, 'Liberation Mono', 'Courier New', monospace",
+  });
+
+  const panel = document.createElement("div");
+  Object.assign(panel.style, {
+    background: "rgba(0,0,0,0.72)",
+    border: "1px solid rgba(255,255,255,0.14)",
+    borderRadius: "14px",
+    boxShadow: "0 16px 50px rgba(0,0,0,0.55)",
+    padding: "10px 10px 8px",
+    backdropFilter: "blur(6px)",
+    overflow: "hidden",
+  });
+
+  const header = document.createElement("div");
+  Object.assign(header.style, {
+    display: "flex",
+    alignItems: "center",
+    justifyContent: "space-between",
+    gap: "10px",
+    marginBottom: "8px",
+    opacity: "0.9",
+    pointerEvents: "none",
+  });
+
+  const title = document.createElement("div");
+  title.textContent = "Debug Console";
+  Object.assign(title.style, { fontWeight: "800", fontSize: "12px" });
+
+  const hint = document.createElement("div");
+  hint.textContent = "F4 toggle • F6 clear • F7 mirror";
+  Object.assign(hint.style, { fontSize: "11px", opacity: "0.65" });
+
+  header.appendChild(title);
+  header.appendChild(hint);
+
+  const scroller = document.createElement("div");
+  Object.assign(scroller.style, {
+    maxHeight: "30vh",
+    overflow: "auto",
+    paddingRight: "4px",
+    pointerEvents: "auto",
+  });
+  scroller.style.scrollbarWidth = "thin";
+
+  const list = document.createElement("div");
+  Object.assign(list.style, {
+    display: "flex",
+    flexDirection: "column",
+    gap: "4px",
+  });
+
+  scroller.appendChild(list);
+
+  const toast = document.createElement("div");
+  Object.assign(toast.style, {
+    marginTop: "8px",
+    padding: "8px 10px",
+    borderRadius: "12px",
+    background: "rgba(255,255,255,0.06)",
+    border: "1px solid rgba(255,255,255,0.10)",
+    fontSize: "12px",
+    opacity: "0.9",
+    pointerEvents: "none",
+    whiteSpace: "nowrap",
+    overflow: "hidden",
+    textOverflow: "ellipsis",
+  });
+  toast.textContent = "Ready.";
+
+  panel.appendChild(header);
+  panel.appendChild(scroller);
+  panel.appendChild(toast);
+  wrap.appendChild(panel);
+  document.body.appendChild(wrap);
+
+  function fmtArg(a) {
+    if (a == null) return String(a);
+    if (typeof a === "string") return a;
+    if (typeof a === "number" || typeof a === "boolean") return String(a);
+    try {
+      return JSON.stringify(a);
+    } catch {
+      return String(a);
+    }
+  }
+
+  function append(kind, args) {
+    const t = new Date();
+    const hh = String(t.getHours()).padStart(2, "0");
+    const mm = String(t.getMinutes()).padStart(2, "0");
+    const ss = String(t.getSeconds()).padStart(2, "0");
+
+    const msg = args.map(fmtArg).join(" ");
+    const line = `[${hh}:${mm}:${ss}] ${msg}`;
+
+    const row = document.createElement("div");
+    row.textContent = line;
+    Object.assign(row.style, {
+      fontSize: "11.5px",
+      lineHeight: "1.25",
+      padding: "3px 6px",
+      borderRadius: "10px",
+      background: "rgba(255,255,255,0.04)",
+      border: "1px solid rgba(255,255,255,0.06)",
+      whiteSpace: "pre-wrap",
+      wordBreak: "break-word",
+    });
+
+    if (kind === "warn") {
+      row.style.background = "rgba(255, 193, 7, 0.10)";
+      row.style.borderColor = "rgba(255, 193, 7, 0.18)";
+    }
+    if (kind === "error") {
+      row.style.background = "rgba(244, 67, 54, 0.14)";
+      row.style.borderColor = "rgba(244, 67, 54, 0.22)";
+    }
+
+    list.appendChild(row);
+
+    while (list.childNodes.length > MAX_LINES) {
+      list.removeChild(list.firstChild);
+    }
+
+    scroller.scrollTop = scroller.scrollHeight;
+    toast.textContent = msg || "(empty)";
+  }
+
+  function clear() {
+    list.innerHTML = "";
+    toast.textContent = "Cleared.";
+  }
+
+  function show(on) {
+    wrap.style.display = on ? "block" : "none";
+  }
+
+  function toggle() {
+    show(wrap.style.display === "none");
+  }
+
+  function log(...args) {
+    append("log", args);
+  }
+  function warn(...args) {
+    append("warn", args);
+  }
+  function error(...args) {
+    append("error", args);
+  }
+
+  const orig = {
+    log: console.log.bind(console),
+    warn: console.warn.bind(console),
+    error: console.error.bind(console),
+  };
+
+  let mirrorConsole = true;
+
+  function setMirror(on) {
+    mirrorConsole = !!on;
+    if (mirrorConsole) {
+      console.log = (...args) => {
+        try {
+          log(...args);
+        } catch {}
+        orig.log(...args);
+      };
+      console.warn = (...args) => {
+        try {
+          warn(...args);
+        } catch {}
+        orig.warn(...args);
+      };
+      console.error = (...args) => {
+        try {
+          error(...args);
+        } catch {}
+        orig.error(...args);
+      };
+      orig.log("[UI_CONSOLE] mirroring enabled");
+      log("[UI_CONSOLE] mirroring enabled");
+    } else {
+      console.log = orig.log;
+      console.warn = orig.warn;
+      console.error = orig.error;
+      orig.log("[UI_CONSOLE] mirroring disabled");
+    }
+  }
+
+  setMirror(true);
+
+  window.addEventListener(
+    "keydown",
+    (e) => {
+      if (e.code === "F4") {
+        e.preventDefault();
+        toggle();
+      }
+      if (e.code === "F6") {
+        e.preventDefault();
+        clear();
+      }
+      if (e.code === "F7") {
+        e.preventDefault();
+        setMirror(!mirrorConsole);
+      }
+    },
+    true
+  );
+
+  return { log, warn, error, clear, show, toggle, setMirror };
+})();
+
+const uiLog = (...a) => UI_CONSOLE.log(...a);
+const uiWarn = (...a) => UI_CONSOLE.warn(...a);
+const uiError = (...a) => UI_CONSOLE.error(...a);
+
+/* ============================================================
  * HELPERS
  * ============================================================
  */
@@ -155,7 +402,7 @@ function noaAddMesh(mesh, isStatic = false, pos = null) {
     noa.rendering.addMeshToScene(mesh, !!isStatic, pos || null);
     mesh.alwaysSelectAsActiveMesh = true;
   } catch (e) {
-    console.warn("[NOA_RENDER] addMeshToScene failed:", e);
+    uiWarn("[NOA_RENDER] addMeshToScene failed:", e);
   }
 }
 
@@ -789,7 +1036,6 @@ const grassID = noa.registry.registerBlock(2, { material: "grass" });
 
 function getVoxelID(x, y, z) {
   const height = 2 * Math.sin(x / 10) + 3 * Math.cos(z / 20);
-
   if (y < height - 1) return dirtID;
   if (y < height) return grassID;
   return 0;
@@ -833,6 +1079,7 @@ function ensureSceneReady() {
     }
   } catch (e) {}
 
+  uiLog("[SCENE] ready");
   return true;
 }
 
@@ -1242,6 +1489,8 @@ function spawnRemotePlayer(sessionId, player) {
   if (remotePlayers[sessionId]) return;
   if (!ensureSceneReady()) return;
 
+  uiLog("[MP] remote joined:", sessionId);
+
   const rig = createAvatarRig(STATE.scene, "remote_" + sessionId);
 
   const px = safeNum(player.x, 0);
@@ -1266,9 +1515,13 @@ function spawnRemotePlayer(sessionId, player) {
 function removeRemotePlayer(sessionId) {
   const rp = remotePlayers[sessionId];
   if (!rp) return;
+
+  uiLog("[MP] remote left:", sessionId);
+
   try {
     if (rp.mesh) rp.mesh.dispose();
   } catch (e) {}
+
   delete remotePlayers[sessionId];
 }
 
@@ -1423,11 +1676,12 @@ function sendInvAdd(kind, qty = 1) {
 }
 
 /* ============================================================
- * BUILDING (RIGHT CLICK when context menu disabled; always via B/E)
+ * BUILDING
  * ============================================================
  */
 
 function canPlaceAt(x, y, z) {
+  // prevent placing inside player
   const p = getSafePlayerPos();
   const px = p[0],
     py = p[1],
@@ -1440,30 +1694,40 @@ function canPlaceAt(x, y, z) {
   const insidePlayer = dx < 0.45 && dz < 0.45 && dy < 1.0;
   if (insidePlayer) return false;
 
+  // must be empty
   return noa.getBlock(x, y, z) === 0;
 }
 
-function placeSelectedBlock() {
-  if (inventoryOpen) return;
+function placeSelectedBlock(source = "unknown") {
+  if (inventoryOpen) {
+    if (DEBUG_BUILD) uiWarn("[BUILD] blocked: inventory open");
+    return;
+  }
 
   STATE.swingT = 0;
   sendSwing();
 
   if (!noa.targetedBlock) {
-    if (DEBUG_BUILD) console.log("[BUILD] no targetedBlock (aim at a block face)");
+    if (DEBUG_BUILD) uiWarn("[BUILD] no targetedBlock (aim at a block face)", "src=", source);
     return;
   }
 
-  const { it } = getSelectedHotbarItem();
+  const { idx, uid, it } = getSelectedHotbarItem();
+
+  if (!uid || !it) {
+    if (DEBUG_BUILD) uiWarn("[BUILD] selected hotbar is empty", "idx=", idx, "src=", source);
+    return;
+  }
+
   const kind = it?.kind || "";
   if (!kind.startsWith("block:")) {
-    if (DEBUG_BUILD) console.log("[BUILD] selected item is not a block:", kind);
+    if (DEBUG_BUILD) uiWarn("[BUILD] selected item is not a block:", kind, "src=", source);
     return;
   }
 
   const blockId = kindToBlockId(kind);
   if (!blockId) {
-    if (DEBUG_BUILD) console.log("[BUILD] no blockId mapping for:", kind);
+    if (DEBUG_BUILD) uiWarn("[BUILD] no blockId mapping for:", kind, "src=", source);
     return;
   }
 
@@ -1479,20 +1743,20 @@ function placeSelectedBlock() {
     const dz = z + 0.5 - camPos.z;
     const dist = Math.sqrt(dx * dx + dy * dy + dz * dz);
     if (dist > 8.0) {
-      if (DEBUG_BUILD) console.log("[BUILD] out of reach:", dist.toFixed(2));
+      if (DEBUG_BUILD) uiWarn("[BUILD] out of reach:", dist.toFixed(2), "src=", source);
       return;
     }
   }
 
   if (!canPlaceAt(x, y, z)) {
-    if (DEBUG_BUILD) console.log("[BUILD] blocked (occupied or inside player) at:", x, y, z);
+    if (DEBUG_BUILD) uiWarn("[BUILD] blocked (occupied or inside player) at:", x, y, z, "src=", source);
     return;
   }
 
   noa.setBlock(blockId, x, y, z);
   sendConsumeHotbar(1);
 
-  if (DEBUG_BUILD) console.log("[BUILD] placed", kind, "at", x, y, z);
+  if (DEBUG_BUILD) uiLog("[BUILD] placed", kind, "at", x, y, z, "src=", source);
 }
 
 /* ============================================================
@@ -1500,14 +1764,14 @@ function placeSelectedBlock() {
  * ============================================================
  */
 
-// IMPORTANT: make sure we see key events even when canvas is focused
 window.addEventListener(
   "keydown",
   (e) => {
-    // F2: toggle browser context menu availability
+    // F2: toggle browser context menu availability (for inspector)
     if (e.code === "F2") {
+      e.preventDefault();
       ALLOW_BROWSER_CONTEXT_MENU = !ALLOW_BROWSER_CONTEXT_MENU;
-      console.log(
+      uiLog(
         "[DEBUG] Browser context menu:",
         ALLOW_BROWSER_CONTEXT_MENU ? "ENABLED" : "DISABLED"
       );
@@ -1516,8 +1780,9 @@ window.addEventListener(
 
     // F3: toggle build logs
     if (e.code === "F3") {
+      e.preventDefault();
       DEBUG_BUILD = !DEBUG_BUILD;
-      console.log("[DEBUG] Build logs:", DEBUG_BUILD ? "ON" : "OFF");
+      uiLog("[DEBUG] Build logs:", DEBUG_BUILD ? "ON" : "OFF");
       return;
     }
 
@@ -1553,9 +1818,9 @@ window.addEventListener(
       }
     }
 
-    // build via keyboard ALWAYS works (even when context menu is enabled)
+    // building via keyboard ALWAYS works (even when context menu is enabled)
     if (!inventoryOpen && (e.code === "KeyB" || e.code === "KeyE")) {
-      placeSelectedBlock();
+      placeSelectedBlock(e.code);
     }
 
     if (!inventoryOpen) {
@@ -1574,8 +1839,8 @@ window.addEventListener(
 );
 
 // Context menu handling:
-// - If ALLOW_BROWSER_CONTEXT_MENU = true, do NOT prevent default (lets inspect)
-// - Else prevent on canvas / pointer lock so right click can be used for building
+// - If ALLOW_BROWSER_CONTEXT_MENU = true, do NOT prevent default
+// - Else prevent on canvas/pointer lock so right click can be used for building
 document.addEventListener(
   "contextmenu",
   (e) => {
@@ -1583,7 +1848,8 @@ document.addEventListener(
 
     const canvas = noa?.container?.canvas;
     const overCanvas =
-      e.target === canvas || (canvas && typeof canvas.contains === "function" && canvas.contains(e.target));
+      e.target === canvas ||
+      (canvas && typeof canvas.contains === "function" && canvas.contains(e.target));
 
     if (document.pointerLockElement === canvas || overCanvas) {
       e.preventDefault();
@@ -1640,23 +1906,27 @@ noa.inputs.down.on("fire", function () {
   const tgt = noa.targetedBlock.position;
   const existingId = noa.getBlock(tgt[0], tgt[1], tgt[2]);
 
+  // remove locally
   noa.setBlock(0, tgt[0], tgt[1], tgt[2]);
 
+  // add to inventory server-side if known
   const kind = blockIdToKind(existingId);
-  if (kind) sendInvAdd(kind, 1);
+  if (kind) {
+    sendInvAdd(kind, 1);
+    if (DEBUG_BUILD) uiLog("[MINE] got", kind);
+  } else {
+    if (DEBUG_BUILD) uiWarn("[MINE] unknown block id:", existingId);
+  }
 });
 
 // Build (right click) only when browser context menu is disabled
 noa.inputs.down.on("alt-fire", function () {
-  if (ALLOW_BROWSER_CONTEXT_MENU) return; // let browser right click happen
-  placeSelectedBlock();
+  if (ALLOW_BROWSER_CONTEXT_MENU) return;
+  placeSelectedBlock("mouse2");
 });
 
 // Ensure right mouse triggers alt-fire
 noa.inputs.bind("alt-fire", "mouse2");
-
-// Also bind build to B (and keep E build separate above via keydown handler)
-noa.inputs.bind("alt-fire", "KeyB");
 
 /* ============================================================
  * MAIN RENDER LOOP
@@ -1681,6 +1951,7 @@ noa.on("beforeRender", function () {
 
   updateFpsRig(dt, speed);
 
+  // local avatar
   if (MESH.avatarRoot) {
     const p = getSafePlayerPos();
     MESH.avatarRoot.position.set(p[0], p[1] + 0.075, p[2]);
@@ -1692,14 +1963,17 @@ noa.on("beforeRender", function () {
 
   hardFollowThirdPersonCamera();
 
+  // remote interpolation
   for (const sid in remotePlayers) {
     const rp = remotePlayers[sid];
     if (!rp || !rp.mesh) continue;
 
     const t = 0.2;
+
     rp.mesh.position.x = lerp(rp.mesh.position.x, rp.targetPos.x, t);
     rp.mesh.position.y = lerp(rp.mesh.position.y, rp.targetPos.y + 0.075, t);
     rp.mesh.position.z = lerp(rp.mesh.position.z, rp.targetPos.z, t);
+
     rp.mesh.rotation.y = lerp(rp.mesh.rotation.y, rp.targetRot, t);
 
     forceRigBounds(rp.parts);
@@ -1716,12 +1990,14 @@ noa.on("beforeRender", function () {
     updateAvatarAnim(rp.parts, remoteSpeed, true, false);
   }
 
+  // debug cube
   if (showDebugProof && MESH.frontCube && STATE.scene?.activeCamera) {
     const cam = STATE.scene.activeCamera;
     const fwd = cam.getForwardRay(3).direction;
     MESH.frontCube.position.copyFrom(cam.position).addInPlace(fwd.scale(3));
   }
 
+  // send move at ~10Hz
   if (colyRoom) {
     STATE._moveAccum += dt;
     if (STATE._moveAccum >= 0.1) {
@@ -1751,16 +2027,16 @@ const ENDPOINT =
 const colyseusClient = new ColyClient(ENDPOINT);
 
 async function connectColyseus() {
-  console.log("Connecting to Colyseus at:", ENDPOINT);
+  uiLog("[MP] connecting:", ENDPOINT);
 
   try {
     const room = await colyseusClient.joinOrCreate("my_room", { name: "Steve" });
     colyRoom = room;
 
-    console.log("Colyseus Connected. Session ID:", room.sessionId);
+    uiLog("[MP] connected session:", room.sessionId);
 
-    room.onMessage("welcome", (msg) => console.log("[server] welcome:", msg));
-    room.onMessage("hello_ack", (msg) => console.log("[server] hello_ack:", msg));
+    room.onMessage("welcome", (msg) => uiLog("[server] welcome:", msg));
+    room.onMessage("hello_ack", (msg) => uiLog("[server] hello_ack:", msg));
 
     if (room.state) syncPlayersFromState(room.state);
 
@@ -1770,7 +2046,7 @@ async function connectColyseus() {
 
     room.send("hello", { hi: true });
   } catch (err) {
-    console.error("Colyseus Connection Failed:", err);
+    uiError("[MP] connection failed:", err);
   }
 }
 
@@ -1785,6 +2061,7 @@ const bootInterval = setInterval(() => {
   if (ensureSceneReady()) {
     clearInterval(bootInterval);
     applyViewModeOnce();
-    console.log("Scene Ready.");
+    uiLog("[BOOT] scene ready");
+    uiLog("[HELP] F4 debug console • F3 build logs • B/E build • 1..9 hotbar • I inventory");
   }
 }, 100);
