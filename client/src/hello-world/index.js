@@ -1,3 +1,8 @@
+// ============================================================
+// 2) FRONTEND MAIN ENTRY (NOA + COLYSEUS + HUD + INVENTORY UI)
+// File: main.ts  (FULL REWRITE - NO OMITS)
+// ============================================================
+
 // @ts-nocheck
 /*
  * Fresh2 - hello-world (NOA main entry) - FULL REWRITE (NO OMITS)
@@ -9,6 +14,7 @@
  * - Multiplayer: Colyseus SDK (state-diff sync; no MapSchema hooks required)
  * - Debug: Avatar/camera snapshots in 3rd person
  * - HUD: Hearts + Stamina overlay synced from Colyseus schema (local player)
+ * - Inventory UI: Hybrid grid + equipment, drag/drop, server-intent messages
  */
 
 import { Engine } from "noa-engine";
@@ -46,6 +52,9 @@ let viewMode = 0; // 0 = first, 1 = third
 let forceCrosshair = true;
 let showDebugProof = false;
 
+// Inventory UI
+let inventoryOpen = false;
+
 // Multiplayer
 let colyRoom = null;
 /**
@@ -62,6 +71,15 @@ const LOCAL_STATS = {
   maxStamina: 100,
   sprinting: false,
   swinging: false,
+};
+
+// Local replicated inventory snapshot (derived from server state)
+const LOCAL_INV = {
+  cols: 9,
+  rows: 4,
+  slots: [], // string[] item uid or ""
+  items: {}, // { [uid]: { uid, kind, qty, durability, maxDurability, meta } }
+  equip: { head: "", chest: "", legs: "", feet: "", tool: "", offhand: "" },
 };
 
 const STATE = {
@@ -404,6 +422,401 @@ function createHudOverlay() {
 }
 
 const hudUI = createHudOverlay();
+
+/* ============================================================
+ * UI: INVENTORY OVERLAY (GRID + EQUIPMENT + DRAG/DROP)
+ * ============================================================
+ */
+
+function createInventoryOverlay() {
+  const overlay = document.createElement("div");
+  overlay.id = "noa-inventory";
+  Object.assign(overlay.style, {
+    position: "fixed",
+    inset: "0",
+    background: "rgba(0,0,0,0.55)",
+    zIndex: "10000",
+    display: "none",
+    pointerEvents: "auto",
+    fontFamily: "system-ui, -apple-system, Segoe UI, Roboto, Arial",
+    color: "white",
+  });
+
+  const panel = document.createElement("div");
+  Object.assign(panel.style, {
+    position: "absolute",
+    left: "50%",
+    top: "50%",
+    transform: "translate(-50%, -50%)",
+    width: "820px",
+    maxWidth: "92vw",
+    borderRadius: "16px",
+    background: "rgba(20,20,26,0.95)",
+    border: "1px solid rgba(255,255,255,0.15)",
+    boxShadow: "0 12px 40px rgba(0,0,0,0.5)",
+    padding: "16px",
+  });
+
+  const header = document.createElement("div");
+  Object.assign(header.style, {
+    display: "flex",
+    alignItems: "center",
+    justifyContent: "space-between",
+    marginBottom: "12px",
+  });
+
+  const title = document.createElement("div");
+  title.textContent = "Inventory";
+  Object.assign(title.style, { fontSize: "18px", fontWeight: "700", letterSpacing: "0.2px" });
+
+  const hint = document.createElement("div");
+  hint.textContent = "Drag items • Right-click slot to split (client intent) • Press I to close";
+  Object.assign(hint.style, { fontSize: "12px", opacity: "0.75", textAlign: "right" });
+
+  header.appendChild(title);
+  header.appendChild(hint);
+
+  const body = document.createElement("div");
+  Object.assign(body.style, {
+    display: "grid",
+    gridTemplateColumns: "240px 1fr",
+    gap: "14px",
+  });
+
+  // Equipment column
+  const equipCol = document.createElement("div");
+  Object.assign(equipCol.style, {
+    borderRadius: "14px",
+    padding: "12px",
+    background: "rgba(255,255,255,0.05)",
+    border: "1px solid rgba(255,255,255,0.08)",
+  });
+
+  const equipTitle = document.createElement("div");
+  equipTitle.textContent = "Equipment";
+  Object.assign(equipTitle.style, { fontWeight: "700", marginBottom: "10px", opacity: "0.9" });
+
+  const equipGrid = document.createElement("div");
+  Object.assign(equipGrid.style, {
+    display: "grid",
+    gridTemplateColumns: "1fr 1fr",
+    gap: "10px",
+  });
+
+  // Inventory column
+  const invCol = document.createElement("div");
+  Object.assign(invCol.style, {
+    borderRadius: "14px",
+    padding: "12px",
+    background: "rgba(255,255,255,0.05)",
+    border: "1px solid rgba(255,255,255,0.08)",
+  });
+
+  const invTitleRow = document.createElement("div");
+  Object.assign(invTitleRow.style, {
+    display: "flex",
+    alignItems: "center",
+    justifyContent: "space-between",
+    marginBottom: "10px",
+  });
+
+  const invTitle = document.createElement("div");
+  invTitle.textContent = "Backpack";
+  Object.assign(invTitle.style, { fontWeight: "700", opacity: "0.9" });
+
+  const invMeta = document.createElement("div");
+  invMeta.textContent = "";
+  Object.assign(invMeta.style, { fontSize: "12px", opacity: "0.7" });
+
+  invTitleRow.appendChild(invTitle);
+  invTitleRow.appendChild(invMeta);
+
+  const slotsWrap = document.createElement("div");
+  Object.assign(slotsWrap.style, {
+    display: "grid",
+    gap: "8px",
+    gridTemplateColumns: "repeat(9, 1fr)",
+  });
+
+  // Quick tooltip
+  const tooltip = document.createElement("div");
+  Object.assign(tooltip.style, {
+    position: "fixed",
+    left: "0",
+    top: "0",
+    transform: "translate(-9999px, -9999px)",
+    background: "rgba(10,10,12,0.92)",
+    border: "1px solid rgba(255,255,255,0.12)",
+    padding: "8px 10px",
+    borderRadius: "10px",
+    fontSize: "12px",
+    zIndex: "10001",
+    pointerEvents: "none",
+    whiteSpace: "pre",
+    maxWidth: "320px",
+    boxShadow: "0 8px 28px rgba(0,0,0,0.45)",
+  });
+
+  document.body.appendChild(tooltip);
+
+  const equipSlots = {};
+  const equipOrder = [
+    ["head", "Head"],
+    ["chest", "Chest"],
+    ["legs", "Legs"],
+    ["feet", "Feet"],
+    ["tool", "Tool"],
+    ["offhand", "Offhand"],
+  ];
+
+  function makeSlotEl(slotId, labelText) {
+    const slot = document.createElement("div");
+    slot.dataset.slotId = slotId;
+    Object.assign(slot.style, {
+      width: "100%",
+      aspectRatio: "1 / 1",
+      borderRadius: "12px",
+      background: "rgba(0,0,0,0.25)",
+      border: "1px solid rgba(255,255,255,0.12)",
+      display: "flex",
+      alignItems: "center",
+      justifyContent: "center",
+      position: "relative",
+      overflow: "hidden",
+    });
+
+    const label = document.createElement("div");
+    label.textContent = labelText || "";
+    Object.assign(label.style, {
+      position: "absolute",
+      left: "8px",
+      bottom: "6px",
+      fontSize: "11px",
+      opacity: "0.65",
+      pointerEvents: "none",
+    });
+
+    const icon = document.createElement("div");
+    icon.textContent = "";
+    Object.assign(icon.style, {
+      fontSize: "12px",
+      opacity: "0.9",
+      textAlign: "center",
+      padding: "6px",
+      lineHeight: "1.15",
+      pointerEvents: "none",
+    });
+
+    const qty = document.createElement("div");
+    qty.textContent = "";
+    Object.assign(qty.style, {
+      position: "absolute",
+      right: "8px",
+      bottom: "6px",
+      fontSize: "12px",
+      fontWeight: "700",
+      opacity: "0.9",
+      textShadow: "0 1px 2px rgba(0,0,0,0.85)",
+      pointerEvents: "none",
+    });
+
+    slot.appendChild(icon);
+    slot.appendChild(qty);
+    slot.appendChild(label);
+
+    // Drag/drop
+    slot.draggable = true;
+
+    slot.addEventListener("dragstart", (e) => {
+      const sid = slot.dataset.slotId;
+      if (!sid) return;
+      const payload = { from: sid };
+      e.dataTransfer?.setData("application/json", JSON.stringify(payload));
+      e.dataTransfer?.setData("text/plain", sid);
+    });
+
+    slot.addEventListener("dragover", (e) => {
+      e.preventDefault();
+      slot.style.borderColor = "rgba(255,255,255,0.35)";
+    });
+
+    slot.addEventListener("dragleave", () => {
+      slot.style.borderColor = "rgba(255,255,255,0.12)";
+    });
+
+    slot.addEventListener("drop", (e) => {
+      e.preventDefault();
+      slot.style.borderColor = "rgba(255,255,255,0.12)";
+
+      const raw = e.dataTransfer?.getData("application/json") || "";
+      let from = "";
+      try {
+        from = JSON.parse(raw).from || "";
+      } catch (_) {
+        from = e.dataTransfer?.getData("text/plain") || "";
+      }
+      const to = slot.dataset.slotId || "";
+      if (!from || !to || from === to) return;
+
+      // send move intent to server
+      sendMoveItem(from, to);
+    });
+
+    // Right click => split stack intent
+    slot.addEventListener("contextmenu", (e) => {
+      e.preventDefault();
+      const sid = slot.dataset.slotId || "";
+      if (!sid) return;
+      sendSplitStack(sid);
+    });
+
+    // tooltip
+    slot.addEventListener("mousemove", (e) => {
+      const sid = slot.dataset.slotId || "";
+      const info = getSlotTooltip(sid);
+      if (!info) {
+        tooltip.style.transform = "translate(-9999px, -9999px)";
+        return;
+      }
+      tooltip.textContent = info;
+      tooltip.style.transform = `translate(${e.clientX + 12}px, ${e.clientY + 12}px)`;
+    });
+
+    slot.addEventListener("mouseleave", () => {
+      tooltip.style.transform = "translate(-9999px, -9999px)";
+    });
+
+    return { slot, icon, qty };
+  }
+
+  function getSlotTooltip(slotId) {
+    // slotId formats:
+    // inv:12
+    // eq:tool
+    if (!slotId) return "";
+
+    let uid = "";
+    if (slotId.startsWith("inv:")) {
+      const idx = Number(slotId.slice(4));
+      uid = LOCAL_INV.slots[idx] || "";
+    } else if (slotId.startsWith("eq:")) {
+      const key = slotId.slice(3);
+      uid = LOCAL_INV.equip[key] || "";
+    }
+
+    if (!uid) return "";
+
+    const it = LOCAL_INV.items[uid];
+    if (!it) return "";
+
+    const lines = [];
+    lines.push(`${it.kind || "Unknown Item"}`);
+    if (safeNum(it.qty, 0) > 1) lines.push(`Qty: ${it.qty}`);
+    if (safeNum(it.maxDurability, 0) > 0) lines.push(`Durability: ${it.durability}/${it.maxDurability}`);
+    if (it.meta) lines.push(`${it.meta}`);
+
+    return lines.join("\n");
+  }
+
+  function renderEquipment() {
+    equipGrid.innerHTML = "";
+    for (const [key, label] of equipOrder) {
+      const el = makeSlotEl(`eq:${key}`, label);
+      equipSlots[key] = el;
+      equipGrid.appendChild(el.slot);
+    }
+  }
+
+  // build inventory slots
+  const invSlotEls = [];
+  function buildInventorySlots(cols, rows) {
+    slotsWrap.innerHTML = "";
+    invSlotEls.length = 0;
+
+    slotsWrap.style.gridTemplateColumns = `repeat(${cols}, 1fr)`;
+
+    const total = cols * rows;
+    for (let i = 0; i < total; i++) {
+      const el = makeSlotEl(`inv:${i}`, "");
+      invSlotEls.push(el);
+      slotsWrap.appendChild(el.slot);
+    }
+
+    invMeta.textContent = `${cols}×${rows} (${total} slots)`;
+  }
+
+  function itemShort(kind) {
+    // tiny label for slot icon
+    if (!kind) return "";
+    // cheap “prettify”: pick last segment and cap
+    const k = String(kind).split("/").pop();
+    return k.length > 14 ? k.slice(0, 14) + "…" : k;
+  }
+
+  function refresh() {
+    // build slots if dimensions changed
+    const cols = safeNum(LOCAL_INV.cols, 9);
+    const rows = safeNum(LOCAL_INV.rows, 4);
+    const total = cols * rows;
+
+    if (invSlotEls.length !== total) {
+      buildInventorySlots(cols, rows);
+    }
+
+    // equipment
+    for (const [key] of equipOrder) {
+      const uid = LOCAL_INV.equip[key] || "";
+      const it = uid ? LOCAL_INV.items[uid] : null;
+      const el = equipSlots[key];
+      if (!el) continue;
+      el.icon.textContent = it ? itemShort(it.kind) : "";
+      el.qty.textContent = it && safeNum(it.qty, 0) > 1 ? String(it.qty) : "";
+    }
+
+    // grid
+    for (let i = 0; i < invSlotEls.length; i++) {
+      const uid = LOCAL_INV.slots[i] || "";
+      const it = uid ? LOCAL_INV.items[uid] : null;
+      const el = invSlotEls[i];
+      el.icon.textContent = it ? itemShort(it.kind) : "";
+      el.qty.textContent = it && safeNum(it.qty, 0) > 1 ? String(it.qty) : "";
+    }
+  }
+
+  function setOpen(on) {
+    overlay.style.display = on ? "block" : "none";
+  }
+
+  // click background to close
+  overlay.addEventListener("mousedown", (e) => {
+    if (e.target === overlay) {
+      inventoryOpen = false;
+      syncPointerLockForInventory();
+      setOpen(false);
+    }
+  });
+
+  panel.appendChild(header);
+  equipCol.appendChild(equipTitle);
+  equipCol.appendChild(equipGrid);
+
+  invCol.appendChild(invTitleRow);
+  invCol.appendChild(slotsWrap);
+
+  body.appendChild(equipCol);
+  body.appendChild(invCol);
+
+  panel.appendChild(body);
+  overlay.appendChild(panel);
+  document.body.appendChild(overlay);
+
+  renderEquipment();
+  buildInventorySlots(LOCAL_INV.cols, LOCAL_INV.rows);
+
+  return { setOpen, refresh };
+}
+
+const invUI = createInventoryOverlay();
 
 /* ============================================================
  * WORLD GENERATION
@@ -998,22 +1411,46 @@ function syncPlayersFromState(state) {
   updateRemoteTargetsFromState(playersObj);
   lastPlayersKeys = newKeys;
 
-  // also refresh local HUD stats whenever state changes
-  updateLocalStatsFromState(playersObj);
+  // Refresh local HUD + inventory snapshot whenever state changes
+  updateLocalFromState(playersObj);
 }
 
 /* ============================================================
- * HUD SYNC (LOCAL PLAYER)
+ * LOCAL SYNC: STATS + INVENTORY (FROM SERVER STATE)
  * ============================================================
  */
 
-function updateLocalStatsFromState(playersObj) {
-  if (!colyRoom) return;
-  if (!playersObj) return;
+function snapshotMapSchema(mapSchemaLike) {
+  const out = {};
+  if (!mapSchemaLike) return out;
+  if (typeof mapSchemaLike.forEach === "function") {
+    try {
+      mapSchemaLike.forEach((v, k) => (out[k] = v));
+      return out;
+    } catch (e) {}
+  }
+  try {
+    for (const k of Object.keys(mapSchemaLike)) out[k] = mapSchemaLike[k];
+  } catch (e) {}
+  return out;
+}
 
+function snapshotArraySchema(arrLike) {
+  if (!arrLike) return [];
+  try {
+    // ArraySchema behaves like array
+    return Array.from(arrLike);
+  } catch (e) {
+    return [];
+  }
+}
+
+function updateLocalFromState(playersObj) {
+  if (!colyRoom) return;
   const me = playersObj[colyRoom.sessionId];
   if (!me) return;
 
+  // stats
   LOCAL_STATS.hp = safeNum(me.hp, LOCAL_STATS.hp);
   LOCAL_STATS.maxHp = safeNum(me.maxHp, LOCAL_STATS.maxHp);
   LOCAL_STATS.stamina = safeNum(me.stamina, LOCAL_STATS.stamina);
@@ -1023,16 +1460,74 @@ function updateLocalStatsFromState(playersObj) {
 
   hudUI.setHp(LOCAL_STATS.hp, LOCAL_STATS.maxHp);
   hudUI.setStamina(LOCAL_STATS.stamina, LOCAL_STATS.maxStamina);
+  hudUI.setHint(LOCAL_STATS.sprinting ? "Sprinting" : "");
 
-  // optional hint label
-  const hint = LOCAL_STATS.sprinting ? "Sprinting" : "";
-  hudUI.setHint(hint);
+  // inventory
+  LOCAL_INV.cols = safeNum(me.inventory?.cols, LOCAL_INV.cols);
+  LOCAL_INV.rows = safeNum(me.inventory?.rows, LOCAL_INV.rows);
+  LOCAL_INV.slots = snapshotArraySchema(me.inventory?.slots);
+
+  const itemsObj = snapshotMapSchema(me.items);
+  const itemsOut = {};
+  for (const uid of Object.keys(itemsObj)) {
+    const it = itemsObj[uid];
+    itemsOut[uid] = {
+      uid: String(it.uid || uid),
+      kind: String(it.kind || ""),
+      qty: safeNum(it.qty, 0),
+      durability: safeNum(it.durability, 0),
+      maxDurability: safeNum(it.maxDurability, 0),
+      meta: String(it.meta || ""),
+    };
+  }
+  LOCAL_INV.items = itemsOut;
+
+  LOCAL_INV.equip = {
+    head: String(me.equip?.head || ""),
+    chest: String(me.equip?.chest || ""),
+    legs: String(me.equip?.legs || ""),
+    feet: String(me.equip?.feet || ""),
+    tool: String(me.equip?.tool || ""),
+    offhand: String(me.equip?.offhand || ""),
+  };
+
+  if (inventoryOpen) invUI.refresh();
+}
+
+/* ============================================================
+ * INVENTORY SERVER-INTENT MESSAGES
+ * ============================================================
+ */
+
+function sendMoveItem(fromSlotId, toSlotId) {
+  if (!colyRoom) return;
+  try {
+    colyRoom.send("inv:move", { from: String(fromSlotId), to: String(toSlotId) });
+  } catch (e) {}
+}
+
+function sendSplitStack(slotId) {
+  if (!colyRoom) return;
+  try {
+    colyRoom.send("inv:split", { slot: String(slotId) });
+  } catch (e) {}
 }
 
 /* ============================================================
  * INPUTS
  * ============================================================
  */
+
+function syncPointerLockForInventory() {
+  // If inventory is open, release pointer lock so the mouse can drag items
+  try {
+    if (inventoryOpen) {
+      if (document.pointerLockElement) document.exitPointerLock?.();
+    } else {
+      // do nothing; NOA will re-lock when user clicks canvas
+    }
+  } catch (e) {}
+}
 
 document.addEventListener("keydown", (e) => {
   if (e.code === "KeyV") {
@@ -1046,6 +1541,14 @@ document.addEventListener("keydown", (e) => {
   if (e.code === "KeyP") {
     showDebugProof = !showDebugProof;
     refreshDebugProofMeshes();
+  }
+
+  // Inventory toggle
+  if (e.code === "KeyI") {
+    inventoryOpen = !inventoryOpen;
+    invUI.setOpen(inventoryOpen);
+    if (inventoryOpen) invUI.refresh();
+    syncPointerLockForInventory();
   }
 
   // Sprint start (Shift)
@@ -1063,7 +1566,6 @@ document.addEventListener("keyup", (e) => {
 
 function sendSprintIntent(on) {
   if (!colyRoom) return;
-  // send intent (server decides if stamina allows it)
   try {
     colyRoom.send("sprint", { on: !!on });
   } catch (e) {}
@@ -1080,7 +1582,6 @@ noa.on("tick", function () {
 function triggerSwing() {
   STATE.swingT = 0;
 
-  // send swing intent for stamina drain / animation replication
   if (colyRoom) {
     try {
       colyRoom.send("swing", { t: performance.now() });
@@ -1089,6 +1590,8 @@ function triggerSwing() {
 }
 
 noa.inputs.down.on("fire", function () {
+  if (inventoryOpen) return;
+
   triggerSwing();
   if (noa.targetedBlock) {
     const pos = noa.targetedBlock.position;
@@ -1097,6 +1600,8 @@ noa.inputs.down.on("fire", function () {
 });
 
 noa.inputs.down.on("alt-fire", function () {
+  if (inventoryOpen) return;
+
   triggerSwing();
   if (noa.targetedBlock) {
     const pos = noa.targetedBlock.adjacent;
@@ -1186,7 +1691,7 @@ noa.on("beforeRender", function () {
     MESH.frontCube.position.copyFrom(cam.position).addInPlace(fwd.scale(3));
   }
 
-  // Keep HUD updated even between state-change callbacks (cheap + smooth)
+  // Keep HUD up to date
   hudUI.setHp(LOCAL_STATS.hp, LOCAL_STATS.maxHp);
   hudUI.setStamina(LOCAL_STATS.stamina, LOCAL_STATS.maxStamina);
 });
@@ -1231,14 +1736,13 @@ async function connectColyseus() {
       const yaw = noa.camera.heading;
       const pitch = noa.camera.pitch;
 
-      // include optional client hints (server may ignore)
       colyRoom.send("move", {
         x: p[0],
         y: p[1],
         z: p[2],
         yaw,
         pitch,
-        viewMode, // optional
+        viewMode,
       });
     }, 100);
   } catch (err) {
