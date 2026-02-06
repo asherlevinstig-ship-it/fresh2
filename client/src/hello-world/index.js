@@ -2,7 +2,13 @@
 /*
  * Fresh2 - hello-world (NOA main entry) - FULL REWRITE (NO OMITS)
  * -------------------------------------------------------------
- * Adds: 3rd person avatar debug monitor to catch disappearance cause.
+ * Features:
+ * - NOA controller (movement/physics/world)
+ * - FPS Rig: Arms + Tool (Sway/Bob/Swing)
+ * - 3rd Person Rig: Blocky Avatar (Walk/Swing)
+ * - Multiplayer: Colyseus SDK (STATE-DIFF SYNC, no MapSchema hooks needed)
+ * - Debug: Avatar + Camera tracking logger (distance, frustum, bounds, enabled/visible)
+ * - Fix: Hard-follow 3rd person camera to avatar to prevent "camera stuck / looks vanished"
  */
 
 import { Engine } from "noa-engine";
@@ -42,15 +48,20 @@ let showDebugProof = false;
 
 // Multiplayer State
 let colyRoom = null;
-const remotePlayers = {};
-let lastPlayersKeys = new Set();
+const remotePlayers = {}; // { [sessionId]: { mesh, parts, targetPos, targetRot, lastPos } }
+let lastPlayersKeys = new Set(); // state-diff tracking
 
 const STATE = {
   scene: null,
+
+  // Camera/Follow state
   camFollowState: null,
   baseFollowOffset: [0, 0, 0],
+
+  // Time tracking
   lastTime: performance.now(),
 
+  // Animation State
   lastHeading: 0,
   lastPitch: 0,
   bobPhase: 0,
@@ -59,6 +70,7 @@ const STATE = {
   swingT: 999,
   swingDuration: 0.22,
 
+  // Safe position cache
   lastValidPlayerPos: [0, 2, 0],
 
   // Debug throttling
@@ -67,17 +79,20 @@ const STATE = {
 };
 
 const MESH = {
+  // Debug
   proofA: null,
   frontCube: null,
 
+  // FPS Rig (Local)
   weaponRoot: null,
   armsRoot: null,
   armL: null,
   armR: null,
   tool: null,
 
+  // 3rd Person Rig (Local)
   avatarRoot: null,
-  avParts: {},
+  avParts: {}, // { root, head, body, armL, armR, legL, legR, tool }
 };
 
 /* ============================================================
@@ -182,7 +197,42 @@ function forceRigBounds(parts) {
 }
 
 /* ============================================================
- * 3RD PERSON AVATAR DEBUG MONITOR
+ * HARD FOLLOW CAMERA (3RD PERSON)
+ * ============================================================
+ * This avoids NOA follow glitches at extreme Y by directly
+ * placing the Babylon camera behind the avatar each frame.
+ */
+
+function hardFollowThirdPersonCamera() {
+  if (viewMode !== 1) return;
+  if (!STATE.scene || !STATE.scene.activeCamera) return;
+  if (!MESH.avatarRoot) return;
+
+  const cam = STATE.scene.activeCamera;
+
+  const target = MESH.avatarRoot.position.clone();
+  const heading = safeNum(noa.camera.heading, 0);
+
+  const dist = clamp(noa.camera.zoomDistance || 6, 2, 12);
+
+  // Behind direction based on heading
+  const backDir = new BABYLON.Vector3(Math.sin(heading), 0, Math.cos(heading));
+  const back = backDir.scale(-dist);
+
+  // Up / shoulder
+  const up = new BABYLON.Vector3(0, 1.7, 0);
+
+  const desired = target.add(back).add(up);
+
+  // Smooth camera motion
+  cam.position = BABYLON.Vector3.Lerp(cam.position, desired, 0.25);
+
+  // Look at the player (slightly above center)
+  cam.setTarget(target.add(new BABYLON.Vector3(0, 1.2, 0)));
+}
+
+/* ============================================================
+ * 3RD PERSON AVATAR + CAMERA DEBUG MONITOR
  * ============================================================
  */
 
@@ -200,7 +250,6 @@ function meshEnabled(m) {
 
 function meshInFrustum(mesh, camera) {
   try {
-    // Babylon has isInFrustum(frustumPlanes)
     if (mesh && typeof mesh.isInFrustum === "function" && camera && camera._frustumPlanes) {
       return mesh.isInFrustum(camera._frustumPlanes);
     }
@@ -221,9 +270,6 @@ function getMeshesFromRig(parts) {
   ].filter(Boolean);
 }
 
-/**
- * Logs a snapshot regularly + logs "anomalies" immediately.
- */
 function debugThirdPersonAvatar(nowMs) {
   if (viewMode !== 1) return;
   if (!STATE.scene) return;
@@ -233,10 +279,12 @@ function debugThirdPersonAvatar(nowMs) {
   const root = MESH.avParts.root;
   const meshes = getMeshesFromRig(MESH.avParts);
 
-  // Build snapshot
   const rootPos = root.position;
   const rootRot = root.rotation;
   const rootEnabled = meshEnabled(root);
+
+  const camPos = cam?.position;
+  const distToCam = camPos ? BABYLON.Vector3.Distance(camPos, root.position) : null;
 
   let anyDisabled = !rootEnabled;
   let anyInvisible = false;
@@ -252,12 +300,10 @@ function debugThirdPersonAvatar(nowMs) {
     if (!en) anyDisabled = true;
     if (!vis) anyInvisible = true;
 
-    // NaN transforms?
     if (!isVecFinite(m.position) || !isVecFinite(m.rotation) || !isVecFinite(m.scaling)) {
       anyNaN = true;
     }
 
-    // Bounds sanity
     try {
       const bi = m.getBoundingInfo?.();
       const bs = bi?.boundingSphere;
@@ -275,15 +321,12 @@ function debugThirdPersonAvatar(nowMs) {
         }
       }
 
-      // Frustum test (best effort)
       const inF = meshInFrustum(m, cam);
       if (inF === false) anyNotInFrustum = true;
 
-      // Track a "worst" mesh for logging
       if (!worst) {
         worst = { name: m.name, enabled: en, visible: vis, radius: r, inFrustum: inF };
       } else {
-        // Prefer disabled/invisible/bad bounds
         const score =
           (en ? 0 : 4) +
           (vis ? 0 : 3) +
@@ -299,29 +342,30 @@ function debugThirdPersonAvatar(nowMs) {
     } catch (e) {}
   }
 
-  // Camera clip sanity (if avatar y is huge or near cam, etc.)
   const camMinZ = safeNum(cam?.minZ, 0.01);
-  const camPos = cam?.position;
-  const camForward = cam?.getForwardRay?.(1)?.direction;
+  const camMaxZ = safeNum(cam?.maxZ, 5000);
 
-  // Throttle periodic logs
   const due = nowMs - STATE.avDbgLastLog >= STATE.avDbgIntervalMs;
-
-  // Determine if we should "anomaly log" immediately
   const anomaly = anyNaN || anyDisabled || anyInvisible || anyBadBounds;
 
   if (anomaly || due) {
     STATE.avDbgLastLog = nowMs;
 
     const snap = {
+      rootPos: { x: rootPos.x, y: rootPos.y, z: rootPos.z },
+      rootRot: { x: rootRot.x, y: rootRot.y, z: rootRot.z },
       y: safeNum(rootPos.y, null),
       rootEnabled,
       rootVisible: root.isVisible !== false,
+
+      camPos: camPos ? { x: camPos.x, y: camPos.y, z: camPos.z } : null,
+      distToCam,
+      camMinZ,
+      camMaxZ,
+
       rootPosFinite: isVecFinite(rootPos),
       rootRotFinite: isVecFinite(rootRot),
-      camMinZ,
-      camPos: camPos ? { x: camPos.x, y: camPos.y, z: camPos.z } : null,
-      camFwd: camForward ? { x: camForward.x, y: camForward.y, z: camForward.z } : null,
+
       anyDisabled,
       anyInvisible,
       anyNaN,
@@ -896,7 +940,10 @@ noa.on("beforeRender", function () {
     updateAvatarAnim(MESH.avParts, speed, grounded, STATE.swingT < STATE.swingDuration);
   }
 
-  // Debug monitor (local avatar only)
+  // Hard-follow camera in 3rd person (prevents camera "stuck" feeling)
+  hardFollowThirdPersonCamera();
+
+  // Debug monitor (local avatar + camera)
   debugThirdPersonAvatar(now);
 
   // Remote interpolation
