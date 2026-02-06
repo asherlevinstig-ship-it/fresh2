@@ -2,13 +2,10 @@
 /*
  * Fresh2 - hello-world (NOA main entry) - FULL REWRITE (NO OMITS)
  * -------------------------------------------------------------
- * Features:
- * - NOA controller (movement/physics/world)
- * - FPS Rig: Arms + Tool (Sway/Bob/Swing)
- * - 3rd Person Rig: Blocky Avatar (Walk/Swing)
- * - Multiplayer: Colyseus SDK (STATE-DIFF SYNC, no MapSchema hooks needed)
+ * Adds:
+ * - Hard-follow 3rd person camera to avatar (prevents camera getting "stuck")
+ * - FIX: remove camera roll/slant in 3rd person (clear rotation.z / stabilize upVector)
  * - Debug: Avatar + Camera tracking logger (distance, frustum, bounds, enabled/visible)
- * - Fix: Hard-follow 3rd person camera to avatar to prevent "camera stuck / looks vanished"
  */
 
 import { Engine } from "noa-engine";
@@ -48,20 +45,15 @@ let showDebugProof = false;
 
 // Multiplayer State
 let colyRoom = null;
-const remotePlayers = {}; // { [sessionId]: { mesh, parts, targetPos, targetRot, lastPos } }
-let lastPlayersKeys = new Set(); // state-diff tracking
+const remotePlayers = {};
+let lastPlayersKeys = new Set();
 
 const STATE = {
   scene: null,
-
-  // Camera/Follow state
   camFollowState: null,
   baseFollowOffset: [0, 0, 0],
-
-  // Time tracking
   lastTime: performance.now(),
 
-  // Animation State
   lastHeading: 0,
   lastPitch: 0,
   bobPhase: 0,
@@ -70,29 +62,24 @@ const STATE = {
   swingT: 999,
   swingDuration: 0.22,
 
-  // Safe position cache
   lastValidPlayerPos: [0, 2, 0],
 
-  // Debug throttling
   avDbgLastLog: 0,
   avDbgIntervalMs: 200,
 };
 
 const MESH = {
-  // Debug
   proofA: null,
   frontCube: null,
 
-  // FPS Rig (Local)
   weaponRoot: null,
   armsRoot: null,
   armL: null,
   armR: null,
   tool: null,
 
-  // 3rd Person Rig (Local)
   avatarRoot: null,
-  avParts: {}, // { root, head, body, armL, armR, legL, legR, tool }
+  avParts: {},
 };
 
 /* ============================================================
@@ -199,8 +186,6 @@ function forceRigBounds(parts) {
 /* ============================================================
  * HARD FOLLOW CAMERA (3RD PERSON)
  * ============================================================
- * This avoids NOA follow glitches at extreme Y by directly
- * placing the Babylon camera behind the avatar each frame.
  */
 
 function hardFollowThirdPersonCamera() {
@@ -210,25 +195,30 @@ function hardFollowThirdPersonCamera() {
 
   const cam = STATE.scene.activeCamera;
 
+  // FIX: remove roll/slant (critical)
+  // Some camera controllers (or inertia) can leave a non-zero roll.
+  // Force an upright camera each frame.
+  cam.upVector = new BABYLON.Vector3(0, 1, 0);
+  if (cam.rotation) cam.rotation.z = 0;
+
   const target = MESH.avatarRoot.position.clone();
   const heading = safeNum(noa.camera.heading, 0);
 
   const dist = clamp(noa.camera.zoomDistance || 6, 2, 12);
 
-  // Behind direction based on heading
   const backDir = new BABYLON.Vector3(Math.sin(heading), 0, Math.cos(heading));
   const back = backDir.scale(-dist);
 
-  // Up / shoulder
   const up = new BABYLON.Vector3(0, 1.7, 0);
-
   const desired = target.add(back).add(up);
 
-  // Smooth camera motion
   cam.position = BABYLON.Vector3.Lerp(cam.position, desired, 0.25);
 
-  // Look at the player (slightly above center)
+  // Look target slightly above player center
   cam.setTarget(target.add(new BABYLON.Vector3(0, 1.2, 0)));
+
+  // FIX: ensure roll stays cleared after target update too
+  if (cam.rotation) cam.rotation.z = 0;
 }
 
 /* ============================================================
@@ -311,14 +301,10 @@ function debugThirdPersonAvatar(nowMs) {
       const c = bs?.centerWorld;
 
       if (r != null) {
-        if (!Number.isFinite(r) || r <= 0 || r > 10000) {
-          anyBadBounds = true;
-        }
+        if (!Number.isFinite(r) || r <= 0 || r > 10000) anyBadBounds = true;
       }
       if (c) {
-        if (!Number.isFinite(c.x) || !Number.isFinite(c.y) || !Number.isFinite(c.z)) {
-          anyBadBounds = true;
-        }
+        if (!Number.isFinite(c.x) || !Number.isFinite(c.y) || !Number.isFinite(c.z)) anyBadBounds = true;
       }
 
       const inF = meshInFrustum(m, cam);
@@ -362,6 +348,8 @@ function debugThirdPersonAvatar(nowMs) {
       distToCam,
       camMinZ,
       camMaxZ,
+      camRollZ: cam?.rotation ? cam.rotation.z : null,
+      camUp: cam?.upVector ? { x: cam.upVector.x, y: cam.upVector.y, z: cam.upVector.z } : null,
 
       rootPosFinite: isVecFinite(rootPos),
       rootRotFinite: isVecFinite(rootRot),
@@ -374,11 +362,8 @@ function debugThirdPersonAvatar(nowMs) {
       worst,
     };
 
-    if (anomaly) {
-      console.warn("⚠️ AVATAR ANOMALY:", snap);
-    } else {
-      console.log("AVATAR SNAP:", snap);
-    }
+    if (anomaly) console.warn("⚠️ AVATAR ANOMALY:", snap);
+    else console.log("AVATAR SNAP:", snap);
   }
 }
 
@@ -927,7 +912,6 @@ noa.on("beforeRender", function () {
 
   updateFpsRig(dt, speed);
 
-  // Local avatar update
   if (MESH.avatarRoot) {
     const p = getSafePlayerPos();
 
@@ -940,13 +924,9 @@ noa.on("beforeRender", function () {
     updateAvatarAnim(MESH.avParts, speed, grounded, STATE.swingT < STATE.swingDuration);
   }
 
-  // Hard-follow camera in 3rd person (prevents camera "stuck" feeling)
   hardFollowThirdPersonCamera();
-
-  // Debug monitor (local avatar + camera)
   debugThirdPersonAvatar(now);
 
-  // Remote interpolation
   for (let sid in remotePlayers) {
     const rp = remotePlayers[sid];
     if (!rp || !rp.mesh) continue;
