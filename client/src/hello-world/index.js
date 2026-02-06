@@ -2,16 +2,7 @@
 /*
  * Fresh2 - hello-world (NOA main entry) - FULL REWRITE (NO OMITS)
  * -------------------------------------------------------------
- * Features:
- * - NOA controller (movement/physics/world)
- * - FPS Rig: Arms + Tool (Sway/Bob/Swing)
- * - 3rd Person Rig: Blocky Avatar (Walk/Swing)
- * - Multiplayer: Colyseus SDK (STATE-DIFF SYNC, no MapSchema hooks needed)
- * - Fixes:
- *    - "n.onAdd is not a function" (no onAdd/onRemove usage)
- *    - "onMessage() not registered for type 'welcome'" (register handler)
- *    - Jump invisibility in 3rd person (force bounds refresh)
- *    - Extreme jump (spam space) -> NaN/Infinity position guard + clamp + last valid pos cache
+ * Adds: 3rd person avatar debug monitor to catch disappearance cause.
  */
 
 import { Engine } from "noa-engine";
@@ -51,20 +42,15 @@ let showDebugProof = false;
 
 // Multiplayer State
 let colyRoom = null;
-const remotePlayers = {}; // { [sessionId]: { mesh, parts, targetPos, targetRot, lastPos } }
-let lastPlayersKeys = new Set(); // state-diff tracking
+const remotePlayers = {};
+let lastPlayersKeys = new Set();
 
 const STATE = {
   scene: null,
-
-  // Camera/Follow state
   camFollowState: null,
   baseFollowOffset: [0, 0, 0],
-
-  // Time tracking
   lastTime: performance.now(),
 
-  // Animation State
   lastHeading: 0,
   lastPitch: 0,
   bobPhase: 0,
@@ -73,23 +59,23 @@ const STATE = {
   swingT: 999,
   swingDuration: 0.22,
 
-  // CRITICAL: last valid player pos cache to prevent NaN transforms
   lastValidPlayerPos: [0, 2, 0],
+
+  // Debug throttling
+  avDbgLastLog: 0,
+  avDbgIntervalMs: 200,
 };
 
 const MESH = {
-  // Debug
   proofA: null,
   frontCube: null,
 
-  // FPS Rig (Local)
   weaponRoot: null,
   armsRoot: null,
   armL: null,
   armR: null,
   tool: null,
 
-  // 3rd Person Rig (Local)
   avatarRoot: null,
   avParts: {},
 };
@@ -154,11 +140,6 @@ function isFinite3(p) {
   );
 }
 
-/**
- * CRITICAL: returns a safe, finite player position for rendering/network.
- * - caches last valid value
- * - clamps Y so Babylon never receives extreme values
- */
 function getSafePlayerPos() {
   let p = null;
   try {
@@ -167,7 +148,7 @@ function getSafePlayerPos() {
 
   if (isFinite3(p)) {
     const x = p[0];
-    const y = clamp(p[1], -1000, 1000);
+    const y = clamp(p[1], -100000, 100000);
     const z = p[2];
     STATE.lastValidPlayerPos = [x, y, z];
     return STATE.lastValidPlayerPos;
@@ -176,10 +157,6 @@ function getSafePlayerPos() {
   return STATE.lastValidPlayerPos;
 }
 
-/**
- * CRITICAL FIX (3rd person jump invisibility):
- * Force computeWorldMatrix + refreshBoundingInfo for all avatar meshes.
- */
 function forceRigBounds(parts) {
   if (!parts) return;
 
@@ -201,6 +178,163 @@ function forceRigBounds(parts) {
     m.computeWorldMatrix(true);
     m.refreshBoundingInfo(true);
     if (m._updateSubMeshesBoundingInfo) m._updateSubMeshesBoundingInfo();
+  }
+}
+
+/* ============================================================
+ * 3RD PERSON AVATAR DEBUG MONITOR
+ * ============================================================
+ */
+
+function isVecFinite(v) {
+  return v && Number.isFinite(v.x) && Number.isFinite(v.y) && Number.isFinite(v.z);
+}
+
+function meshEnabled(m) {
+  try {
+    return typeof m.isEnabled === "function" ? m.isEnabled() : !!m._isEnabled;
+  } catch (e) {
+    return true;
+  }
+}
+
+function meshInFrustum(mesh, camera) {
+  try {
+    // Babylon has isInFrustum(frustumPlanes)
+    if (mesh && typeof mesh.isInFrustum === "function" && camera && camera._frustumPlanes) {
+      return mesh.isInFrustum(camera._frustumPlanes);
+    }
+  } catch (e) {}
+  return null;
+}
+
+function getMeshesFromRig(parts) {
+  if (!parts) return [];
+  return [
+    parts.head,
+    parts.body,
+    parts.armL,
+    parts.armR,
+    parts.legL,
+    parts.legR,
+    parts.tool,
+  ].filter(Boolean);
+}
+
+/**
+ * Logs a snapshot regularly + logs "anomalies" immediately.
+ */
+function debugThirdPersonAvatar(nowMs) {
+  if (viewMode !== 1) return;
+  if (!STATE.scene) return;
+  if (!MESH.avatarRoot || !MESH.avParts || !MESH.avParts.root) return;
+
+  const cam = STATE.scene.activeCamera;
+  const root = MESH.avParts.root;
+  const meshes = getMeshesFromRig(MESH.avParts);
+
+  // Build snapshot
+  const rootPos = root.position;
+  const rootRot = root.rotation;
+  const rootEnabled = meshEnabled(root);
+
+  let anyDisabled = !rootEnabled;
+  let anyInvisible = false;
+  let anyNaN = !isVecFinite(rootPos) || !isVecFinite(rootRot);
+  let anyBadBounds = false;
+  let anyNotInFrustum = false;
+
+  let worst = null;
+
+  for (const m of meshes) {
+    const en = meshEnabled(m);
+    const vis = m.isVisible !== false && (typeof m.visibility === "number" ? m.visibility > 0 : true);
+    if (!en) anyDisabled = true;
+    if (!vis) anyInvisible = true;
+
+    // NaN transforms?
+    if (!isVecFinite(m.position) || !isVecFinite(m.rotation) || !isVecFinite(m.scaling)) {
+      anyNaN = true;
+    }
+
+    // Bounds sanity
+    try {
+      const bi = m.getBoundingInfo?.();
+      const bs = bi?.boundingSphere;
+      const r = bs?.radiusWorld;
+      const c = bs?.centerWorld;
+
+      if (r != null) {
+        if (!Number.isFinite(r) || r <= 0 || r > 10000) {
+          anyBadBounds = true;
+        }
+      }
+      if (c) {
+        if (!Number.isFinite(c.x) || !Number.isFinite(c.y) || !Number.isFinite(c.z)) {
+          anyBadBounds = true;
+        }
+      }
+
+      // Frustum test (best effort)
+      const inF = meshInFrustum(m, cam);
+      if (inF === false) anyNotInFrustum = true;
+
+      // Track a "worst" mesh for logging
+      if (!worst) {
+        worst = { name: m.name, enabled: en, visible: vis, radius: r, inFrustum: inF };
+      } else {
+        // Prefer disabled/invisible/bad bounds
+        const score =
+          (en ? 0 : 4) +
+          (vis ? 0 : 3) +
+          (Number.isFinite(r) ? 0 : 2) +
+          (inF === false ? 1 : 0);
+        const wscore =
+          (worst.enabled ? 0 : 4) +
+          (worst.visible ? 0 : 3) +
+          (Number.isFinite(worst.radius) ? 0 : 2) +
+          (worst.inFrustum === false ? 1 : 0);
+        if (score > wscore) worst = { name: m.name, enabled: en, visible: vis, radius: r, inFrustum: inF };
+      }
+    } catch (e) {}
+  }
+
+  // Camera clip sanity (if avatar y is huge or near cam, etc.)
+  const camMinZ = safeNum(cam?.minZ, 0.01);
+  const camPos = cam?.position;
+  const camForward = cam?.getForwardRay?.(1)?.direction;
+
+  // Throttle periodic logs
+  const due = nowMs - STATE.avDbgLastLog >= STATE.avDbgIntervalMs;
+
+  // Determine if we should "anomaly log" immediately
+  const anomaly = anyNaN || anyDisabled || anyInvisible || anyBadBounds;
+
+  if (anomaly || due) {
+    STATE.avDbgLastLog = nowMs;
+
+    const snap = {
+      y: safeNum(rootPos.y, null),
+      rootEnabled,
+      rootVisible: root.isVisible !== false,
+      rootPosFinite: isVecFinite(rootPos),
+      rootRotFinite: isVecFinite(rootRot),
+      camMinZ,
+      camPos: camPos ? { x: camPos.x, y: camPos.y, z: camPos.z } : null,
+      camFwd: camForward ? { x: camForward.x, y: camForward.y, z: camForward.z } : null,
+      anyDisabled,
+      anyInvisible,
+      anyNaN,
+      anyBadBounds,
+      anyNotInFrustum,
+      worst,
+    };
+
+    if (anomaly) {
+      console.warn("⚠️ AVATAR ANOMALY:", snap);
+    } else {
+      console.log("AVATAR SNAP:", snap);
+    }
   }
 }
 
@@ -729,7 +863,6 @@ function syncPlayersFromState(state) {
   }
 
   updateRemoteTargetsFromState(playersObj);
-
   lastPlayersKeys = newKeys;
 }
 
@@ -750,7 +883,7 @@ noa.on("beforeRender", function () {
 
   updateFpsRig(dt, speed);
 
-  // Local avatar update (safe pos + clamp + bounds refresh)
+  // Local avatar update
   if (MESH.avatarRoot) {
     const p = getSafePlayerPos();
 
@@ -762,6 +895,9 @@ noa.on("beforeRender", function () {
 
     updateAvatarAnim(MESH.avParts, speed, grounded, STATE.swingT < STATE.swingDuration);
   }
+
+  // Debug monitor (local avatar only)
+  debugThirdPersonAvatar(now);
 
   // Remote interpolation
   for (let sid in remotePlayers) {
@@ -877,7 +1013,6 @@ async function connectColyseus() {
       syncPlayersFromState(state);
     });
 
-    // Send loop (uses safe pos cache)
     setInterval(() => {
       if (!colyRoom) return;
 
@@ -895,7 +1030,7 @@ async function connectColyseus() {
 connectColyseus();
 
 /* ============================================================
- * FORCE SCENE INIT CHECK LOOP
+ * BOOT / APPLY VIEW
  * ============================================================
  */
 
