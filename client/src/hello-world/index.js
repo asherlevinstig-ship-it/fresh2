@@ -28,6 +28,7 @@ import * as BABYLON from "babylonjs";
  * NOA BOOTSTRAP
  * ============================================================
  */
+let ALLOW_BROWSER_CONTEXT_MENU = false; // toggle for debugging
 
 const opts = {
   debug: true,
@@ -1561,10 +1562,17 @@ document.addEventListener("keydown", (e) => {
 
 // Prevent browser context menu on right click (important for build)
 document.addEventListener("contextmenu", (e) => {
-  // only prevent while pointer locked or over canvas
-  const overCanvas = e.target === noa.container.canvas || (noa.container.canvas && noa.container.canvas.contains?.(e.target));
-  if (document.pointerLockElement === noa.container.canvas || overCanvas) e.preventDefault();
+  if (ALLOW_BROWSER_CONTEXT_MENU) return; // let browser menu/inspector work
+
+  const overCanvas =
+    e.target === noa.container.canvas ||
+    (noa.container.canvas && noa.container.canvas.contains?.(e.target));
+
+  if (document.pointerLockElement === noa.container.canvas || overCanvas) {
+    e.preventDefault();
+  }
 });
+
 
 // Zoom + hotbar scroll
 noa.on("tick", function () {
@@ -1591,6 +1599,13 @@ document.addEventListener("keydown", (e) => {
 document.addEventListener("keyup", (e) => {
   if (e.code === "ShiftLeft" || e.code === "ShiftRight") {
     sendSprint(false);
+  }
+});
+
+document.addEventListener("keydown", (e) => {
+  if (e.code === "F2") {
+    ALLOW_BROWSER_CONTEXT_MENU = !ALLOW_BROWSER_CONTEXT_MENU;
+    console.log("[DEBUG] Browser context menu:", ALLOW_BROWSER_CONTEXT_MENU ? "ENABLED" : "DISABLED");
   }
 });
 
@@ -1622,6 +1637,7 @@ noa.inputs.bind("alt-fire", "mouse2");
 
 // Optional: keep KeyE build too
 noa.inputs.bind("alt-fire", "KeyE");
+noa.inputs.bind("alt-fire", "KeyB"); // press B to place
 
 /* ============================================================
  * RENDER LOOP
