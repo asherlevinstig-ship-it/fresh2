@@ -2,10 +2,12 @@
 /*
  * Fresh2 - hello-world (NOA main entry) - FULL REWRITE (NO OMITS)
  * -------------------------------------------------------------
- * Adds:
- * - Hard-follow 3rd person camera to avatar (prevents camera getting "stuck")
- * - FIX: remove camera roll/slant in 3rd person (clear rotation.z / stabilize upVector)
- * - Debug: Avatar + Camera tracking logger (distance, frustum, bounds, enabled/visible)
+ * Fixes:
+ * - "1st person on ground, 3rd in the air" by enforcing view mode EVERY FRAME
+ *   (NOA sometimes adjusts zoomDistance/currentZoom internally)
+ * - Keeps 3rd-person hard-follow camera (optional) ONLY when viewMode===1
+ * - Debug: Avatar + Camera tracking logger
+ * - Multiplayer: Colyseus SDK (state-diff sync)
  */
 
 import { Engine } from "noa-engine";
@@ -184,7 +186,51 @@ function forceRigBounds(parts) {
 }
 
 /* ============================================================
- * HARD FOLLOW CAMERA (3RD PERSON)
+ * VIEW MODE ENFORCEMENT (CRITICAL FIX)
+ * ============================================================
+ * NOA can internally adjust zoom/currentZoom depending on conditions.
+ * We enforce the intended mode every frame so it can never "flip"
+ * into 3rd-person while airborne.
+ */
+
+function enforceViewModeEveryFrame() {
+  const isFirst = viewMode === 0;
+
+  // Enforce camera zoom every frame (critical)
+  if (isFirst) {
+    noa.camera.zoomDistance = 0;
+    noa.camera.currentZoom = 0;
+  } else {
+    const z = clamp(noa.camera.zoomDistance || 6, 2, 12);
+    noa.camera.zoomDistance = z;
+    noa.camera.currentZoom = z;
+  }
+
+  // Enforce follow offset every frame (optional but stabilizing)
+  try {
+    const st = STATE.camFollowState;
+    if (st && st.offset) {
+      if (isFirst) {
+        st.offset[0] = STATE.baseFollowOffset[0];
+        st.offset[1] = STATE.baseFollowOffset[1];
+        st.offset[2] = STATE.baseFollowOffset[2];
+      } else {
+        st.offset[0] = STATE.baseFollowOffset[0] + 0.5;
+        st.offset[1] = STATE.baseFollowOffset[1];
+        st.offset[2] = STATE.baseFollowOffset[2];
+      }
+    }
+  } catch (e) {}
+
+  // Enforce mesh visibility every frame (also critical)
+  // Prevents any accidental re-enable/hide from other code paths.
+  setEnabled(MESH.armsRoot, isFirst);
+  setEnabled(MESH.tool, isFirst);
+  setEnabled(MESH.avatarRoot, !isFirst);
+}
+
+/* ============================================================
+ * HARD FOLLOW CAMERA (ONLY IN 3RD PERSON)
  * ============================================================
  */
 
@@ -195,29 +241,23 @@ function hardFollowThirdPersonCamera() {
 
   const cam = STATE.scene.activeCamera;
 
-  // FIX: remove roll/slant (critical)
-  // Some camera controllers (or inertia) can leave a non-zero roll.
-  // Force an upright camera each frame.
+  // Keep camera upright (no roll)
   cam.upVector = new BABYLON.Vector3(0, 1, 0);
   if (cam.rotation) cam.rotation.z = 0;
 
   const target = MESH.avatarRoot.position.clone();
   const heading = safeNum(noa.camera.heading, 0);
-
   const dist = clamp(noa.camera.zoomDistance || 6, 2, 12);
 
   const backDir = new BABYLON.Vector3(Math.sin(heading), 0, Math.cos(heading));
   const back = backDir.scale(-dist);
-
   const up = new BABYLON.Vector3(0, 1.7, 0);
+
   const desired = target.add(back).add(up);
 
   cam.position = BABYLON.Vector3.Lerp(cam.position, desired, 0.25);
-
-  // Look target slightly above player center
   cam.setTarget(target.add(new BABYLON.Vector3(0, 1.2, 0)));
 
-  // FIX: ensure roll stays cleared after target update too
   if (cam.rotation) cam.rotation.z = 0;
 }
 
@@ -312,18 +352,6 @@ function debugThirdPersonAvatar(nowMs) {
 
       if (!worst) {
         worst = { name: m.name, enabled: en, visible: vis, radius: r, inFrustum: inF };
-      } else {
-        const score =
-          (en ? 0 : 4) +
-          (vis ? 0 : 3) +
-          (Number.isFinite(r) ? 0 : 2) +
-          (inF === false ? 1 : 0);
-        const wscore =
-          (worst.enabled ? 0 : 4) +
-          (worst.visible ? 0 : 3) +
-          (Number.isFinite(worst.radius) ? 0 : 2) +
-          (worst.inFrustum === false ? 1 : 0);
-        if (score > wscore) worst = { name: m.name, enabled: en, visible: vis, radius: r, inFrustum: inF };
       }
     } catch (e) {}
   }
@@ -338,6 +366,7 @@ function debugThirdPersonAvatar(nowMs) {
     STATE.avDbgLastLog = nowMs;
 
     const snap = {
+      viewMode,
       rootPos: { x: rootPos.x, y: rootPos.y, z: rootPos.z },
       rootRot: { x: rootRot.x, y: rootRot.y, z: rootRot.z },
       y: safeNum(rootPos.y, null),
@@ -349,10 +378,6 @@ function debugThirdPersonAvatar(nowMs) {
       camMinZ,
       camMaxZ,
       camRollZ: cam?.rotation ? cam.rotation.z : null,
-      camUp: cam?.upVector ? { x: cam.upVector.x, y: cam.upVector.y, z: cam.upVector.z } : null,
-
-      rootPosFinite: isVecFinite(rootPos),
-      rootRotFinite: isVecFinite(rootRot),
 
       anyDisabled,
       anyInvisible,
@@ -630,40 +655,15 @@ function refreshDebugProofMeshes() {
 }
 
 /* ============================================================
- * VIEW MODE
+ * INITIAL APPLY VIEW MODE (ON TOGGLE ONLY)
  * ============================================================
  */
 
-function applyViewMode() {
+function applyViewModeOnce() {
   initFpsRig();
   initLocalAvatar();
   initDebugMeshes();
-
-  const isFirst = viewMode === 0;
-
-  const z = isFirst ? 0 : 6;
-  noa.camera.zoomDistance = z;
-  noa.camera.currentZoom = z;
-
-  try {
-    const st = STATE.camFollowState;
-    if (st && st.offset) {
-      if (isFirst) {
-        st.offset[0] = STATE.baseFollowOffset[0];
-        st.offset[1] = STATE.baseFollowOffset[1];
-        st.offset[2] = STATE.baseFollowOffset[2];
-      } else {
-        st.offset[0] = STATE.baseFollowOffset[0] + 0.5;
-        st.offset[1] = STATE.baseFollowOffset[1];
-        st.offset[2] = STATE.baseFollowOffset[2];
-      }
-    }
-  } catch (e) {}
-
-  setEnabled(MESH.armsRoot, isFirst);
-  setEnabled(MESH.tool, isFirst);
-  setEnabled(MESH.avatarRoot, !isFirst);
-
+  enforceViewModeEveryFrame();
   crosshairUI.refresh();
 }
 
@@ -760,14 +760,12 @@ function updateAvatarAnim(parts, speed, grounded, isSwing) {
 function getLocalPhysics(dt) {
   let speed = 0;
   let grounded = false;
-  let vy = 0;
 
   try {
     const body = noa.entities.getPhysicsBody(noa.playerEntity);
     if (body) {
       const v = body.velocity;
       speed = Math.sqrt(v[0] * v[0] + v[2] * v[2]);
-      vy = v[1];
       if (body.resting[1] < 0) grounded = true;
     }
   } catch (e) {}
@@ -781,7 +779,7 @@ function getLocalPhysics(dt) {
 
   if (p) STATE.lastPlayerPos = [...p];
 
-  return { speed, grounded, vy };
+  return { speed, grounded };
 }
 
 /* ============================================================
@@ -803,9 +801,7 @@ function getPlayersSnapshot(players) {
   }
 
   try {
-    for (const k of Object.keys(players)) {
-      out[k] = players[k];
-    }
+    for (const k of Object.keys(players)) out[k] = players[k];
   } catch (e) {}
 
   return out;
@@ -879,86 +875,12 @@ function syncPlayersFromState(state) {
   const playersObj = getPlayersSnapshot(state.players);
   const newKeys = new Set(Object.keys(playersObj));
 
-  for (const k of newKeys) {
-    if (!lastPlayersKeys.has(k)) {
-      spawnRemotePlayer(k, playersObj[k]);
-    }
-  }
-
-  for (const k of lastPlayersKeys) {
-    if (!newKeys.has(k)) {
-      removeRemotePlayer(k);
-    }
-  }
+  for (const k of newKeys) if (!lastPlayersKeys.has(k)) spawnRemotePlayer(k, playersObj[k]);
+  for (const k of lastPlayersKeys) if (!newKeys.has(k)) removeRemotePlayer(k);
 
   updateRemoteTargetsFromState(playersObj);
   lastPlayersKeys = newKeys;
 }
-
-/* ============================================================
- * MAIN RENDER LOOP
- * ============================================================
- */
-
-noa.on("beforeRender", function () {
-  if (!ensureSceneReady()) return;
-
-  const now = performance.now();
-  const dt = clamp((now - STATE.lastTime) / 1000, 0, 0.05);
-  STATE.lastTime = now;
-  STATE.swingT += dt;
-
-  const { speed, grounded } = getLocalPhysics(dt);
-
-  updateFpsRig(dt, speed);
-
-  if (MESH.avatarRoot) {
-    const p = getSafePlayerPos();
-
-    MESH.avatarRoot.position.set(p[0], p[1] + 0.075, p[2]);
-    MESH.avatarRoot.rotation.y = safeNum(noa.camera.heading, 0);
-
-    MESH.avatarRoot.computeWorldMatrix(true);
-    forceRigBounds(MESH.avParts);
-
-    updateAvatarAnim(MESH.avParts, speed, grounded, STATE.swingT < STATE.swingDuration);
-  }
-
-  hardFollowThirdPersonCamera();
-  debugThirdPersonAvatar(now);
-
-  for (let sid in remotePlayers) {
-    const rp = remotePlayers[sid];
-    if (!rp || !rp.mesh) continue;
-
-    const t = 0.2;
-
-    rp.mesh.position.x = lerp(rp.mesh.position.x, rp.targetPos.x, t);
-    rp.mesh.position.y = lerp(rp.mesh.position.y, rp.targetPos.y + 0.075, t);
-    rp.mesh.position.z = lerp(rp.mesh.position.z, rp.targetPos.z, t);
-
-    rp.mesh.rotation.y = lerp(rp.mesh.rotation.y, rp.targetRot, t);
-
-    forceRigBounds(rp.parts);
-
-    const dx = rp.mesh.position.x - rp.lastPos.x;
-    const dz = rp.mesh.position.z - rp.lastPos.z;
-    const dist = Math.sqrt(dx * dx + dz * dz);
-    const remoteSpeed = dt > 0 ? dist / dt : 0;
-
-    rp.lastPos.x = rp.mesh.position.x;
-    rp.lastPos.y = rp.mesh.position.y;
-    rp.lastPos.z = rp.mesh.position.z;
-
-    updateAvatarAnim(rp.parts, remoteSpeed, true, false);
-  }
-
-  if (showDebugProof && MESH.frontCube) {
-    const cam = STATE.scene.activeCamera;
-    const fwd = cam.getForwardRay(3).direction;
-    MESH.frontCube.position.copyFrom(cam.position).addInPlace(fwd.scale(3));
-  }
-});
 
 /* ============================================================
  * INPUTS
@@ -968,7 +890,7 @@ noa.on("beforeRender", function () {
 document.addEventListener("keydown", (e) => {
   if (e.code === "KeyV") {
     viewMode = (viewMode + 1) % 2;
-    applyViewMode();
+    applyViewModeOnce();
   }
   if (e.code === "KeyC") {
     forceCrosshair = !forceCrosshair;
@@ -1009,6 +931,196 @@ noa.inputs.down.on("alt-fire", function () {
 });
 
 noa.inputs.bind("alt-fire", "KeyE");
+
+/* ============================================================
+ * UI: CROSSHAIR OVERLAY
+ * ============================================================
+ */
+
+function createCrosshairOverlay() {
+  const div = document.createElement("div");
+  div.id = "noa-crosshair";
+  Object.assign(div.style, {
+    position: "fixed",
+    top: "50%",
+    left: "50%",
+    width: "22px",
+    height: "22px",
+    transform: "translate(-50%, -50%)",
+    pointerEvents: "none",
+    zIndex: "9999",
+    display: "none",
+  });
+
+  const lineStyle = {
+    position: "absolute",
+    backgroundColor: "rgba(255,255,255,0.9)",
+    boxShadow: "0 0 2px black",
+  };
+
+  const h = document.createElement("div");
+  Object.assign(h.style, lineStyle, { width: "100%", height: "2px", top: "10px", left: "0" });
+
+  const v = document.createElement("div");
+  Object.assign(v.style, lineStyle, { width: "2px", height: "100%", left: "10px", top: "0" });
+
+  div.appendChild(h);
+  div.appendChild(v);
+  document.body.appendChild(div);
+
+  function refresh() {
+    const locked = document.pointerLockElement === noa.container.canvas;
+    const show = forceCrosshair || viewMode === 0 || locked;
+    div.style.display = show ? "block" : "none";
+  }
+
+  document.addEventListener("pointerlockchange", refresh);
+  setInterval(refresh, 500);
+
+  return { refresh };
+}
+
+const crosshairUI = createCrosshairOverlay();
+
+/* ============================================================
+ * WORLD GENERATION
+ * ============================================================
+ */
+
+const brownish = [0.45, 0.36, 0.22];
+const greenish = [0.1, 0.8, 0.2];
+
+noa.registry.registerMaterial("dirt", { color: brownish });
+noa.registry.registerMaterial("grass", { color: greenish });
+
+const dirtID = noa.registry.registerBlock(1, { material: "dirt" });
+const grassID = noa.registry.registerBlock(2, { material: "grass" });
+
+function getVoxelID(x, y, z) {
+  if (y < -3) return dirtID;
+  const height = 2 * Math.sin(x / 10) + 3 * Math.cos(z / 20);
+  if (y < height) return grassID;
+  return 0;
+}
+
+noa.world.on("worldDataNeeded", function (id, data, x, y, z) {
+  for (let i = 0; i < data.shape[0]; i++) {
+    for (let j = 0; j < data.shape[1]; j++) {
+      for (let k = 0; k < data.shape[2]; k++) {
+        const voxelID = getVoxelID(x + i, y + j, z + k);
+        data.set(i, j, k, voxelID);
+      }
+    }
+  }
+  noa.world.setChunkData(id, data);
+});
+
+/* ============================================================
+ * DEBUG MESHES
+ * ============================================================
+ */
+
+function initDebugMeshes() {
+  if (MESH.proofA) return;
+  const scene = STATE.scene;
+
+  const proofA = BABYLON.MeshBuilder.CreateBox("proofA", { size: 3 }, scene);
+  proofA.material = createSolidMat(scene, "mat_proofA", new BABYLON.Color3(0, 1, 0));
+  proofA.position.set(0, 14, 0);
+  noaAddMesh(proofA, true);
+
+  const frontCube = BABYLON.MeshBuilder.CreateBox("frontCube", { size: 1.5 }, scene);
+  frontCube.material = createSolidMat(scene, "mat_frontCube", new BABYLON.Color3(0, 0.6, 1));
+  noaAddMesh(frontCube, false);
+
+  MESH.proofA = proofA;
+  MESH.frontCube = frontCube;
+
+  refreshDebugProofMeshes();
+}
+
+function refreshDebugProofMeshes() {
+  setEnabled(MESH.proofA, showDebugProof);
+  setEnabled(MESH.frontCube, showDebugProof);
+}
+
+/* ============================================================
+ * MAIN RENDER LOOP
+ * ============================================================
+ */
+
+noa.on("beforeRender", function () {
+  if (!ensureSceneReady()) return;
+
+  // Ensure rigs exist
+  initFpsRig();
+  initLocalAvatar();
+  initDebugMeshes();
+
+  // Enforce the view mode EVERY FRAME (critical fix)
+  enforceViewModeEveryFrame();
+
+  const now = performance.now();
+  const dt = clamp((now - STATE.lastTime) / 1000, 0, 0.05);
+  STATE.lastTime = now;
+  STATE.swingT += dt;
+
+  const { speed, grounded } = getLocalPhysics(dt);
+
+  updateFpsRig(dt, speed);
+
+  // Local avatar update (always keeps it aligned to player)
+  if (MESH.avatarRoot) {
+    const p = getSafePlayerPos();
+
+    MESH.avatarRoot.position.set(p[0], p[1] + 0.075, p[2]);
+    MESH.avatarRoot.rotation.y = safeNum(noa.camera.heading, 0);
+
+    MESH.avatarRoot.computeWorldMatrix(true);
+    forceRigBounds(MESH.avParts);
+
+    updateAvatarAnim(MESH.avParts, speed, grounded, STATE.swingT < STATE.swingDuration);
+  }
+
+  // Only hard-follow in 3rd person
+  hardFollowThirdPersonCamera();
+
+  // Only spam logs in 3rd person
+  debugThirdPersonAvatar(now);
+
+  // Remote interpolation
+  for (let sid in remotePlayers) {
+    const rp = remotePlayers[sid];
+    if (!rp || !rp.mesh) continue;
+
+    const t = 0.2;
+
+    rp.mesh.position.x = lerp(rp.mesh.position.x, rp.targetPos.x, t);
+    rp.mesh.position.y = lerp(rp.mesh.position.y, rp.targetPos.y + 0.075, t);
+    rp.mesh.position.z = lerp(rp.mesh.position.z, rp.targetPos.z, t);
+
+    rp.mesh.rotation.y = lerp(rp.mesh.rotation.y, rp.targetRot, t);
+
+    forceRigBounds(rp.parts);
+
+    const dx = rp.mesh.position.x - rp.lastPos.x;
+    const dz = rp.mesh.position.z - rp.lastPos.z;
+    const dist = Math.sqrt(dx * dx + dz * dz);
+    const remoteSpeed = dt > 0 ? dist / dt : 0;
+
+    rp.lastPos.x = rp.mesh.position.x;
+    rp.lastPos.y = rp.mesh.position.y;
+    rp.lastPos.z = rp.mesh.position.z;
+
+    updateAvatarAnim(rp.parts, remoteSpeed, true, false);
+  }
+
+  if (showDebugProof && MESH.frontCube) {
+    const cam = STATE.scene.activeCamera;
+    const fwd = cam.getForwardRay(3).direction;
+    MESH.frontCube.position.copyFrom(cam.position).addInPlace(fwd.scale(3));
+  }
+});
 
 /* ============================================================
  * COLYSEUS MULTIPLAYER CLIENT
@@ -1057,14 +1169,14 @@ async function connectColyseus() {
 connectColyseus();
 
 /* ============================================================
- * BOOT / APPLY VIEW
+ * BOOT
  * ============================================================
  */
 
 const bootInterval = setInterval(() => {
   if (ensureSceneReady()) {
     clearInterval(bootInterval);
-    applyViewMode();
+    applyViewModeOnce();
     console.log("Scene Ready.");
   }
 }, 100);
