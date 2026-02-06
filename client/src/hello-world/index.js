@@ -3,26 +3,25 @@
  * fresh2 - client main/index (NOA main entry) - FULL REWRITE (NO OMITS)
  * -------------------------------------------------------------------
  * Includes:
- * - NOA world generation
- * - First/Third person view mode enforcement EVERY FRAME (prevents mid-air flip)
+ * - NOA world generation (grass top layer, dirt underneath)
+ * - First/Third person view mode enforcement EVERY FRAME
  * - FPS rig + 3rd-person avatar rigs (local + remote)
  * - Crosshair overlay
  * - Hotbar overlay (inv:0..8), server-authoritative hotbarIndex
  * - Inventory overlay (toggle with I), drag/drop slot-to-slot, split stacks
  * - Colyseus (@colyseus/sdk) state sync + remote interpolation
- * - Sends: move, sprint, swing, hotbar:set, inv:move, inv:split
+ * - Sends: move, sprint, swing, hotbar:set, inv:move, inv:split, inv:consumeHotbar, inv:add
+ * - Mining: breaks block locally + tells server inv:add(kind)
+ * - Building: places selected hotbar block locally + tells server inv:consumeHotbar
  *
  * Assumptions:
  * - Server room is "my_room"
- * - Schema matches your MyRoomState / PlayerState / ItemState
+ * - Server schema includes: players->PlayerState with items/inventory/equip/hotbarIndex
  */
 
 import { Engine } from "noa-engine";
 import { Client as ColyClient } from "@colyseus/sdk";
 import * as BABYLON from "babylonjs";
-
-// ---- If you have shared schema types in the client, import them (optional). ----
-// import type { MyRoomState, PlayerState, ItemState } from "../server/src/schema/MyRoomState"; // example
 
 /* ============================================================
  * NOA BOOTSTRAP
@@ -58,10 +57,7 @@ let inventoryOpen = false;
 
 // Multiplayer
 let colyRoom = null;
-/**
- * remotePlayers[sessionId] = { mesh, parts, targetPos, targetRot, lastPos }
- */
-const remotePlayers = {};
+const remotePlayers = {}; // { [sessionId]: { mesh, parts, targetPos, targetRot, lastPos } }
 let lastPlayersKeys = new Set();
 
 const STATE = {
@@ -73,6 +69,7 @@ const STATE = {
 
   // time
   lastTime: performance.now(),
+  _moveAccum: 0,
 
   // animation
   lastHeading: 0,
@@ -85,10 +82,6 @@ const STATE = {
 
   // safe pos cache
   lastValidPlayerPos: [0, 2, 0],
-
-  // debug throttle
-  avDbgLastLog: 0,
-  avDbgIntervalMs: 250,
 };
 
 const MESH = {
@@ -114,21 +107,17 @@ const MESH = {
 /* ============================================================
  * CLIENT REPLICATED SNAPSHOT
  * ============================================================
- * We keep local copies of our own player state (from Colyseus)
- * so UI can render consistently.
  */
 
 const LOCAL_INV = {
   cols: 9,
   rows: 4,
-  slots: [], // string[] (uids)
-  items: {}, // uid -> {uid, kind, qty, durability, maxDurability, meta}
+  slots: [], // string[] uids
+  items: {}, // uid -> { uid, kind, qty, durability, maxDurability, meta }
   equip: { head: "", chest: "", legs: "", feet: "", tool: "", offhand: "" },
 };
 
-const LOCAL_HOTBAR = {
-  index: 0,
-};
+const LOCAL_HOTBAR = { index: 0 };
 
 const LOCAL_STATS = {
   hp: 20,
@@ -243,7 +232,7 @@ function forceRigBounds(parts) {
 }
 
 /* ============================================================
- * UI: CROSSHAIR OVERLAY (DECLARE ONCE!)
+ * UI: CROSSHAIR
  * ============================================================
  */
 
@@ -293,7 +282,7 @@ function createCrosshairOverlay() {
 const crosshairUI = createCrosshairOverlay();
 
 /* ============================================================
- * UI: HOTBAR OVERLAY
+ * UI: HOTBAR
  * ============================================================
  */
 
@@ -409,17 +398,13 @@ function createHotbarOverlay() {
     }
   }
 
-  function setVisible(on) {
-    wrap.style.display = on ? "grid" : "none";
-  }
-
-  return { refresh, setVisible };
+  return { refresh };
 }
 
 const hotbarUI = createHotbarOverlay();
 
 /* ============================================================
- * UI: INVENTORY OVERLAY (drag/drop, split)
+ * UI: INVENTORY (drag/drop + split)
  * ============================================================
  */
 
@@ -465,23 +450,15 @@ function createInventoryOverlay() {
   Object.assign(title.style, { fontSize: "18px", fontWeight: "800", letterSpacing: "0.2px" });
 
   const hint = document.createElement("div");
-  hint.textContent = "Drag to move • Right-click: split stack • Esc/I to close";
+  hint.textContent = "Drag to move • Right-click: split • Esc/I to close";
   Object.assign(hint.style, { fontSize: "12px", opacity: "0.75" });
 
   topRow.appendChild(title);
   topRow.appendChild(hint);
 
   const gridWrap = document.createElement("div");
-  Object.assign(gridWrap.style, {
-    display: "grid",
-    gridTemplateColumns: "1fr 260px",
-    gap: "16px",
-  });
+  Object.assign(gridWrap.style, { display: "grid", gridTemplateColumns: "1fr 260px", gap: "16px" });
 
-  const invArea = document.createElement("div");
-  const eqArea = document.createElement("div");
-
-  // Inventory grid
   const invGrid = document.createElement("div");
   Object.assign(invGrid.style, {
     display: "grid",
@@ -494,17 +471,21 @@ function createInventoryOverlay() {
     justifyContent: "center",
   });
 
-  // Equipment
+  const eqArea = document.createElement("div");
+  Object.assign(eqArea.style, {
+    padding: "12px",
+    borderRadius: "16px",
+    background: "rgba(0,0,0,0.25)",
+    border: "1px solid rgba(255,255,255,0.10)",
+    height: "fit-content",
+  });
+
   const eqTitle = document.createElement("div");
   eqTitle.textContent = "Equipment";
   Object.assign(eqTitle.style, { fontSize: "14px", fontWeight: "800", marginBottom: "10px" });
 
   const eqGrid = document.createElement("div");
-  Object.assign(eqGrid.style, {
-    display: "grid",
-    gridTemplateColumns: "repeat(2, 1fr)",
-    gap: "10px",
-  });
+  Object.assign(eqGrid.style, { display: "grid", gridTemplateColumns: "repeat(2, 1fr)", gap: "10px" });
 
   const eqKeys = ["head", "chest", "legs", "feet", "tool", "offhand"];
   const eqCells = {};
@@ -569,7 +550,7 @@ function createInventoryOverlay() {
     return { cell, icon, qty };
   }
 
-  // build inv slots (max 9*4 by default)
+  // build inv grid
   const invCells = [];
   function rebuildInvGrid() {
     invGrid.innerHTML = "";
@@ -577,21 +558,17 @@ function createInventoryOverlay() {
 
     const cols = LOCAL_INV.cols || 9;
     const rows = LOCAL_INV.rows || 4;
-
     invGrid.style.gridTemplateColumns = `repeat(${cols}, 64px)`;
 
     const total = cols * rows;
     for (let i = 0; i < total; i++) {
       const { cell, icon, qty } = makeSlotBox("", `inv:${i}`);
-      // remove label for inv
-      cell.firstChild.style.display = "none";
-
+      cell.firstChild.style.display = "none"; // hide label
       invGrid.appendChild(cell);
       invCells.push({ cell, icon, qty });
     }
   }
 
-  // build equip cells
   for (const k of eqKeys) {
     const pretty = k[0].toUpperCase() + k.slice(1);
     const { cell, icon, qty } = makeSlotBox(pretty, `eq:${k}`);
@@ -599,20 +576,10 @@ function createInventoryOverlay() {
     eqCells[k] = { cell, icon, qty };
   }
 
-  invArea.appendChild(invGrid);
-
-  Object.assign(eqArea.style, {
-    padding: "12px",
-    borderRadius: "16px",
-    background: "rgba(0,0,0,0.25)",
-    border: "1px solid rgba(255,255,255,0.10)",
-    height: "fit-content",
-  });
-
   eqArea.appendChild(eqTitle);
   eqArea.appendChild(eqGrid);
 
-  gridWrap.appendChild(invArea);
+  gridWrap.appendChild(invGrid);
   gridWrap.appendChild(eqArea);
 
   panel.appendChild(topRow);
@@ -620,20 +587,12 @@ function createInventoryOverlay() {
   overlay.appendChild(panel);
   document.body.appendChild(overlay);
 
-  // Drag state
-  const drag = {
-    active: false,
-    from: "",
-    over: "",
-    uid: "",
-    startX: 0,
-    startY: 0,
-  };
+  // drag state
+  const drag = { active: false, from: "", over: "", uid: "" };
 
   function itemShort(kind) {
     if (!kind) return "";
-    const k = String(kind);
-    const last = k.includes(":") ? k.split(":").pop() : k;
+    const last = String(kind).includes(":") ? String(kind).split(":").pop() : String(kind);
     return last.length > 18 ? last.slice(0, 18) + "…" : last;
   }
 
@@ -645,43 +604,34 @@ function createInventoryOverlay() {
     }
     if (slotId.startsWith("eq:")) {
       const key = slotId.slice(3);
-      return (LOCAL_INV.equip && LOCAL_INV.equip[key]) ? LOCAL_INV.equip[key] : "";
+      return LOCAL_INV.equip?.[key] || "";
     }
     return "";
   }
 
-  function renderCell(cellObj, uid, isSelectedHotbarSlot) {
+  function renderCell(cellObj, uid, isHotbarSelected) {
     const it = uid ? LOCAL_INV.items[uid] : null;
     cellObj.icon.textContent = it ? itemShort(it.kind) : "";
     cellObj.qty.textContent = it && safeNum(it.qty, 0) > 1 ? String(it.qty | 0) : "";
 
-    cellObj.cell.style.borderColor = isSelectedHotbarSlot
-      ? "rgba(255,255,255,0.65)"
-      : "rgba(255,255,255,0.12)";
-    cellObj.cell.style.boxShadow = isSelectedHotbarSlot
-      ? "0 0 0 2px rgba(255,255,255,0.18) inset"
-      : "none";
+    cellObj.cell.style.borderColor = isHotbarSelected ? "rgba(255,255,255,0.65)" : "rgba(255,255,255,0.12)";
+    cellObj.cell.style.boxShadow = isHotbarSelected ? "0 0 0 2px rgba(255,255,255,0.18) inset" : "none";
   }
 
   function refresh() {
-    // Ensure grid matches cols/rows
     if (invCells.length !== (LOCAL_INV.cols || 9) * (LOCAL_INV.rows || 4)) {
       rebuildInvGrid();
       bindCells();
     }
 
-    // render inv
-    const total = invCells.length;
-    for (let i = 0; i < total; i++) {
+    for (let i = 0; i < invCells.length; i++) {
       const uid = LOCAL_INV.slots?.[i] || "";
       const isHotbarSelected = i >= 0 && i <= 8 && i === (LOCAL_HOTBAR.index | 0);
       renderCell(invCells[i], uid, isHotbarSelected);
     }
 
-    // render equip
     for (const k of eqKeys) {
-      const uid = LOCAL_INV.equip?.[k] || "";
-      renderCell(eqCells[k], uid, false);
+      renderCell(eqCells[k], LOCAL_INV.equip?.[k] || "", false);
     }
   }
 
@@ -742,8 +692,6 @@ function createInventoryOverlay() {
     drag.from = slotId;
     drag.over = "";
     drag.uid = uid;
-    drag.startX = x;
-    drag.startY = y;
 
     const label = it ? `${itemShort(it.kind)}${safeNum(it.qty, 0) > 1 ? ` x${it.qty | 0}` : ""}` : uid;
 
@@ -756,13 +704,8 @@ function createInventoryOverlay() {
   function endDrag() {
     if (!drag.active) return;
 
-    if (MESH.dragGhost) {
-      MESH.dragGhost.style.transform = "translate(-9999px, -9999px)";
-    }
-
-    if (drag.over && drag.over !== drag.from) {
-      sendInvMove(drag.from, drag.over);
-    }
+    if (MESH.dragGhost) MESH.dragGhost.style.transform = "translate(-9999px, -9999px)";
+    if (drag.over && drag.over !== drag.from) sendInvMove(drag.from, drag.over);
 
     drag.active = false;
     drag.from = "";
@@ -771,14 +714,11 @@ function createInventoryOverlay() {
   }
 
   function onCellDown(slotId, e) {
-    // right click = split
     if (e.button === 2) {
       e.preventDefault();
       sendInvSplit(slotId);
       return;
     }
-
-    // left click start drag
     if (e.button === 0) {
       e.preventDefault();
       beginDrag(slotId, e.clientX, e.clientY);
@@ -791,22 +731,18 @@ function createInventoryOverlay() {
   }
 
   function bindCells() {
-    // prevent context menu over inventory UI
     overlay.addEventListener("contextmenu", (e) => e.preventDefault());
 
-    // Bind inv cells
     for (const c of invCells) {
       const slotId = c.cell.dataset.slot;
       c.cell.style.pointerEvents = "auto";
-
       c.cell.onmousedown = (e) => onCellDown(slotId, e);
       c.cell.onmouseenter = () => onCellEnter(slotId);
     }
 
-    // Bind eq cells
     for (const k of eqKeys) {
-      const slotId = `eq:${k}`;
       const c = eqCells[k];
+      const slotId = `eq:${k}`;
       c.cell.style.pointerEvents = "auto";
       c.cell.onmousedown = (e) => onCellDown(slotId, e);
       c.cell.onmouseenter = () => onCellEnter(slotId);
@@ -826,29 +762,23 @@ function createInventoryOverlay() {
     endDrag();
   });
 
-  function open() {
-    overlay.style.display = "block";
-    refresh();
-  }
-
-  function close() {
-    overlay.style.display = "none";
-    endDrag();
-  }
-
   function setVisible(on) {
     overlay.style.display = on ? "block" : "none";
-    if (on) refresh();
-    else endDrag();
+    if (!on) endDrag();
+    else refresh();
   }
 
-  return { open, close, setVisible, refresh, isOpen: () => overlay.style.display !== "none" };
+  function isOpen() {
+    return overlay.style.display !== "none";
+  }
+
+  return { setVisible, refresh, isOpen };
 }
 
 const inventoryUI = createInventoryOverlay();
 
 /* ============================================================
- * WORLD GENERATION
+ * WORLD GENERATION (FIXED LAYERING)
  * ============================================================
  */
 
@@ -862,8 +792,10 @@ const dirtID = noa.registry.registerBlock(1, { material: "dirt" });
 const grassID = noa.registry.registerBlock(2, { material: "grass" });
 
 function getVoxelID(x, y, z) {
-  if (y < -3) return dirtID;
   const height = 2 * Math.sin(x / 10) + 3 * Math.cos(z / 20);
+
+  // Dirt below the surface, grass only on the top layer.
+  if (y < height - 1) return dirtID;
   if (y < height) return grassID;
   return 0;
 }
@@ -893,13 +825,11 @@ function ensureSceneReady() {
 
   STATE.scene = scene;
 
-  // camera clip planes
   if (scene.activeCamera) {
     scene.activeCamera.minZ = 0.01;
     scene.activeCamera.maxZ = 5000;
   }
 
-  // attempt to cache NOA follow offset state if present
   try {
     const st = noa.ents.getState(noa.camera.cameraTarget, "followsEntity");
     if (st?.offset) {
@@ -1069,14 +999,13 @@ function refreshDebugProofMeshes() {
 }
 
 /* ============================================================
- * VIEW MODE ENFORCEMENT (CRITICAL FIX)
+ * VIEW MODE ENFORCEMENT
  * ============================================================
  */
 
 function enforceViewModeEveryFrame() {
   const isFirst = viewMode === 0;
 
-  // enforce camera zoom
   if (isFirst) {
     noa.camera.zoomDistance = 0;
     noa.camera.currentZoom = 0;
@@ -1086,7 +1015,6 @@ function enforceViewModeEveryFrame() {
     noa.camera.currentZoom = z;
   }
 
-  // enforce NOA follow offset, if available
   try {
     const st = STATE.camFollowState;
     if (st?.offset) {
@@ -1102,13 +1030,13 @@ function enforceViewModeEveryFrame() {
     }
   } catch (e) {}
 
-  // enforce mesh visibility
   setEnabled(MESH.armsRoot, isFirst);
   setEnabled(MESH.tool, isFirst);
   setEnabled(MESH.avatarRoot, !isFirst);
 
   crosshairUI.refresh();
   hotbarUI.refresh();
+  if (inventoryUI.isOpen()) inventoryUI.refresh();
 }
 
 function applyViewModeOnce() {
@@ -1119,7 +1047,7 @@ function applyViewModeOnce() {
 }
 
 /* ============================================================
- * 3RD PERSON CAMERA HARD FOLLOW (ONLY WHEN viewMode===1)
+ * 3RD PERSON CAMERA HARD FOLLOW
  * ============================================================
  */
 
@@ -1130,7 +1058,6 @@ function hardFollowThirdPersonCamera() {
 
   const cam = STATE.scene.activeCamera;
 
-  // keep camera upright (prevents slant/roll)
   cam.upVector = new BABYLON.Vector3(0, 1, 0);
   if (cam.rotation) cam.rotation.z = 0;
 
@@ -1170,17 +1097,14 @@ function updateFpsRig(dt, speed) {
   STATE.lastHeading = heading;
   STATE.lastPitch = pitch;
 
-  // bob
   const bobRate = clamp(speed * 7, 0, 12);
   STATE.bobPhase += bobRate * dt;
   const bobY = Math.sin(STATE.bobPhase) * 0.03;
   const bobX = Math.sin(STATE.bobPhase * 0.5) * 0.015;
 
-  // sway
   const swayX = clamp(-dHeading * 1.6, -0.08, 0.08);
   const swayY = clamp(dPitch * 1.2, -0.06, 0.06);
 
-  // swing
   let swingAmt = 0;
   if (STATE.swingT < STATE.swingDuration) {
     const t = clamp(STATE.swingT / STATE.swingDuration, 0, 1);
@@ -1190,11 +1114,7 @@ function updateFpsRig(dt, speed) {
   const wr = MESH.weaponRoot;
   const s = clamp(dt * 12, 0, 1);
 
-  const targetPos = new BABYLON.Vector3(
-    bobX + swayX * 0.8,
-    -0.02 + bobY - swingAmt * 0.04,
-    0
-  );
+  const targetPos = new BABYLON.Vector3(bobX + swayX * 0.8, -0.02 + bobY - swingAmt * 0.04, 0);
 
   const targetRot = new BABYLON.Vector3(
     swayY + swingAmt * 0.9,
@@ -1273,7 +1193,31 @@ function getLocalPhysics(dt) {
 }
 
 /* ============================================================
- * MULTIPLAYER STATE SNAPSHOT + SYNC
+ * ITEM <-> BLOCK HELPERS
+ * ============================================================
+ */
+
+function getSelectedHotbarItem() {
+  const idx = LOCAL_HOTBAR.index | 0;
+  const uid = LOCAL_INV.slots?.[idx] || "";
+  const it = uid ? LOCAL_INV.items?.[uid] : null;
+  return { idx, uid, it };
+}
+
+function kindToBlockId(kind) {
+  if (kind === "block:dirt") return dirtID;
+  if (kind === "block:grass") return grassID;
+  return 0;
+}
+
+function blockIdToKind(blockId) {
+  if (blockId === dirtID) return "block:dirt";
+  if (blockId === grassID) return "block:grass";
+  return "";
+}
+
+/* ============================================================
+ * MULTIPLAYER SYNC
  * ============================================================
  */
 
@@ -1327,11 +1271,9 @@ function spawnRemotePlayer(sessionId, player) {
 function removeRemotePlayer(sessionId) {
   const rp = remotePlayers[sessionId];
   if (!rp) return;
-
   try {
     if (rp.mesh) rp.mesh.dispose();
   } catch (e) {}
-
   delete remotePlayers[sessionId];
 }
 
@@ -1358,7 +1300,6 @@ function updateRemoteTargetsFromState(playersObj) {
 function snapshotMyState(me) {
   if (!me) return;
 
-  // stats
   LOCAL_STATS.hp = safeNum(me.hp, LOCAL_STATS.hp);
   LOCAL_STATS.maxHp = safeNum(me.maxHp, LOCAL_STATS.maxHp);
   LOCAL_STATS.stamina = safeNum(me.stamina, LOCAL_STATS.stamina);
@@ -1366,14 +1307,11 @@ function snapshotMyState(me) {
   LOCAL_STATS.sprinting = !!me.sprinting;
   LOCAL_STATS.swinging = !!me.swinging;
 
-  // hotbar
   LOCAL_HOTBAR.index = safeNum(me.hotbarIndex, LOCAL_HOTBAR.index) | 0;
 
-  // inventory sizes
   LOCAL_INV.cols = safeNum(me.inventory?.cols, LOCAL_INV.cols) | 0;
   LOCAL_INV.rows = safeNum(me.inventory?.rows, LOCAL_INV.rows) | 0;
 
-  // slots
   const slots = [];
   try {
     const src = me.inventory?.slots;
@@ -1383,7 +1321,6 @@ function snapshotMyState(me) {
   } catch (e) {}
   LOCAL_INV.slots = slots;
 
-  // equip
   const eq = me.equip || {};
   LOCAL_INV.equip = {
     head: String(eq.head || ""),
@@ -1394,7 +1331,6 @@ function snapshotMyState(me) {
     offhand: String(eq.offhand || ""),
   };
 
-  // items map
   const items = {};
   try {
     const m = me.items;
@@ -1423,10 +1359,8 @@ function snapshotMyState(me) {
       }
     }
   } catch (e) {}
-
   LOCAL_INV.items = items;
 
-  // refresh UI
   hotbarUI.refresh();
   if (inventoryUI.isOpen()) inventoryUI.refresh();
 }
@@ -1448,7 +1382,6 @@ function syncPlayersFromState(state) {
   updateRemoteTargetsFromState(playersObj);
   lastPlayersKeys = newKeys;
 
-  // snapshot my player for UI
   if (colyRoom && playersObj[colyRoom.sessionId]) {
     snapshotMyState(playersObj[colyRoom.sessionId]);
   }
@@ -1480,6 +1413,20 @@ function sendSwing() {
   } catch (e) {}
 }
 
+function sendConsumeHotbar(qty = 1) {
+  if (!colyRoom) return;
+  try {
+    colyRoom.send("inv:consumeHotbar", { qty });
+  } catch (e) {}
+}
+
+function sendInvAdd(kind, qty = 1) {
+  if (!colyRoom) return;
+  try {
+    colyRoom.send("inv:add", { kind, qty });
+  } catch (e) {}
+}
+
 /* ============================================================
  * INPUTS
  * ============================================================
@@ -1502,12 +1449,11 @@ document.addEventListener("keydown", (e) => {
   }
 
   // Inventory toggle
-  if (e.code === "KeyI" || e.code === "Tab") {
+  if (e.code === "KeyI") {
     e.preventDefault();
     inventoryOpen = !inventoryOpen;
     inventoryUI.setVisible(inventoryOpen);
 
-    // When inventory opens, release pointer lock if locked
     if (inventoryOpen && document.pointerLockElement === noa.container.canvas) {
       document.exitPointerLock?.();
     }
@@ -1521,7 +1467,7 @@ document.addEventListener("keydown", (e) => {
     }
   }
 
-  // Hotbar number keys (only when inventory closed)
+  // Hotbar number keys
   if (!inventoryOpen) {
     if (e.code === "Digit1") sendHotbarIndex(0);
     if (e.code === "Digit2") sendHotbarIndex(1);
@@ -1535,17 +1481,15 @@ document.addEventListener("keydown", (e) => {
   }
 });
 
-// 3rd-person zoom + hotbar scroll
+// Zoom + hotbar scroll
 noa.on("tick", function () {
   const scroll = noa.inputs.pointerState.scrolly;
 
-  // 3rd-person zoom
   if (scroll !== 0 && viewMode === 1 && !inventoryOpen) {
     noa.camera.zoomDistance = clamp(noa.camera.zoomDistance + (scroll > 0 ? 1 : -1), 2, 12);
     noa.camera.currentZoom = noa.camera.zoomDistance;
   }
 
-  // hotbar wheel selection (Minecraft-like)
   if (!inventoryOpen && scroll !== 0) {
     const dir = scroll > 0 ? 1 : -1;
     const next = (LOCAL_HOTBAR.index + dir + 9) % 9;
@@ -1553,35 +1497,7 @@ noa.on("tick", function () {
   }
 });
 
-function triggerSwingLocalOnly() {
-  STATE.swingT = 0;
-}
-
-noa.inputs.down.on("fire", function () {
-  triggerSwingLocalOnly();
-  sendSwing();
-
-  // mine
-  if (noa.targetedBlock) {
-    const pos = noa.targetedBlock.position;
-    noa.setBlock(0, pos[0], pos[1], pos[2]);
-  }
-});
-
-noa.inputs.down.on("alt-fire", function () {
-  triggerSwingLocalOnly();
-  sendSwing();
-
-  // place
-  if (noa.targetedBlock) {
-    const pos = noa.targetedBlock.adjacent;
-    noa.setBlock(grassID, pos[0], pos[1], pos[2]);
-  }
-});
-
-noa.inputs.bind("alt-fire", "KeyE");
-
-// Sprint intent: Shift key
+// Sprint intent (Shift)
 document.addEventListener("keydown", (e) => {
   if (e.code === "ShiftLeft" || e.code === "ShiftRight") {
     if (!inventoryOpen) sendSprint(true);
@@ -1593,20 +1509,66 @@ document.addEventListener("keyup", (e) => {
   }
 });
 
+// Swing local visuals
+function triggerSwingLocalOnly() {
+  STATE.swingT = 0;
+}
+
+// Mine
+noa.inputs.down.on("fire", function () {
+  triggerSwingLocalOnly();
+  sendSwing();
+
+  if (!noa.targetedBlock) return;
+
+  const tgt = noa.targetedBlock.position;
+  const existingId = noa.getBlock(tgt[0], tgt[1], tgt[2]);
+
+  // remove locally
+  noa.setBlock(0, tgt[0], tgt[1], tgt[2]);
+
+  // add to inventory server-side if known
+  const kind = blockIdToKind(existingId);
+  if (kind) sendInvAdd(kind, 1);
+});
+
+// Place (Minecraft right-click / E bound as alt-fire)
+noa.inputs.down.on("alt-fire", function () {
+  triggerSwingLocalOnly();
+  sendSwing();
+
+  if (!noa.targetedBlock) return;
+
+  const { it } = getSelectedHotbarItem();
+  const kind = it?.kind || "";
+  if (!kind.startsWith("block:")) return;
+
+  const blockId = kindToBlockId(kind);
+  if (!blockId) return;
+
+  const pos = noa.targetedBlock.adjacent;
+
+  // place locally
+  noa.setBlock(blockId, pos[0], pos[1], pos[2]);
+
+  // consume server-side from selected hotbar stack
+  sendConsumeHotbar(1);
+});
+
+noa.inputs.bind("alt-fire", "KeyE");
+
 /* ============================================================
- * MAIN RENDER LOOP
+ * RENDER LOOP
  * ============================================================
  */
 
 noa.on("beforeRender", function () {
   if (!ensureSceneReady()) return;
 
-  // ensure rigs exist
   initFpsRig();
   initLocalAvatar();
   initDebugMeshes();
 
-  // enforce view mode EVERY frame (prevents mid-air flip)
   enforceViewModeEveryFrame();
 
   const now = performance.now();
@@ -1616,41 +1578,33 @@ noa.on("beforeRender", function () {
 
   const { speed, grounded } = getLocalPhysics(dt);
 
-  // FPS rig animation
   updateFpsRig(dt, speed);
 
-  // Local avatar update (always follows physics position)
+  // local avatar
   if (MESH.avatarRoot) {
     const p = getSafePlayerPos();
-
     MESH.avatarRoot.position.set(p[0], p[1] + 0.075, p[2]);
     MESH.avatarRoot.rotation.y = safeNum(noa.camera.heading, 0);
-
     MESH.avatarRoot.computeWorldMatrix(true);
     forceRigBounds(MESH.avParts);
-
     updateAvatarAnim(MESH.avParts, speed, grounded, STATE.swingT < STATE.swingDuration);
   }
 
-  // 3rd-person hard camera follow (ONLY in 3rd person)
   hardFollowThirdPersonCamera();
 
-  // Remote interpolation
+  // remote players
   for (const sid in remotePlayers) {
     const rp = remotePlayers[sid];
     if (!rp || !rp.mesh) continue;
 
     const t = 0.2;
-
     rp.mesh.position.x = lerp(rp.mesh.position.x, rp.targetPos.x, t);
     rp.mesh.position.y = lerp(rp.mesh.position.y, rp.targetPos.y + 0.075, t);
     rp.mesh.position.z = lerp(rp.mesh.position.z, rp.targetPos.z, t);
-
     rp.mesh.rotation.y = lerp(rp.mesh.rotation.y, rp.targetRot, t);
 
     forceRigBounds(rp.parts);
 
-    // basic speed estimate for animation
     const dx = rp.mesh.position.x - rp.lastPos.x;
     const dz = rp.mesh.position.z - rp.lastPos.z;
     const dist = Math.sqrt(dx * dx + dz * dz);
@@ -1671,16 +1625,13 @@ noa.on("beforeRender", function () {
   }
 
   // send move at 10Hz
-  // (simple throttle without setInterval, keeps it in sync with render loop)
   if (colyRoom) {
-    STATE._moveAccum = (STATE._moveAccum || 0) + dt;
+    STATE._moveAccum += dt;
     if (STATE._moveAccum >= 0.1) {
       STATE._moveAccum = 0;
-
       const p = getSafePlayerPos();
       const yaw = noa.camera.heading;
       const pitch = noa.camera.pitch;
-
       try {
         colyRoom.send("move", { x: p[0], y: p[1], z: p[2], yaw, pitch, viewMode });
       } catch (e) {}
@@ -1709,13 +1660,8 @@ async function connectColyseus() {
 
     console.log("Colyseus Connected. Session ID:", room.sessionId);
 
-    room.onMessage("welcome", (msg) => {
-      console.log("[server] welcome:", msg);
-    });
-
-    room.onMessage("hello_ack", (msg) => {
-      console.log("[server] hello_ack:", msg);
-    });
+    room.onMessage("welcome", (msg) => console.log("[server] welcome:", msg));
+    room.onMessage("hello_ack", (msg) => console.log("[server] hello_ack:", msg));
 
     if (room.state) syncPlayersFromState(room.state);
 
@@ -1723,7 +1669,6 @@ async function connectColyseus() {
       syncPlayersFromState(state);
     });
 
-    // optional ping
     room.send("hello", { hi: true });
   } catch (err) {
     console.error("Colyseus Connection Failed:", err);

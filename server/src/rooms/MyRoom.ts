@@ -1,5 +1,18 @@
 // ============================================================
-// rooms/MyRoom.ts  (FULL REWRITE - NO OMITS, TS-NARROW FIXED)
+// rooms/MyRoom.ts  (FULL REWRITE - NO OMITS, ALL LOGIC INCLUDED)
+// ------------------------------------------------------------
+// Includes:
+// - Typed room state (MyRoomState)
+// - Player join/leave
+// - Move replication + sanity clamps
+// - Stamina regen/drain (server authoritative) + sprint toggle
+// - Swing (stamina cost + timed swinging flag)
+// - Hotbar selection (0..8) (server authoritative)
+// - Inventory + equipment slot moves (drag/drop), stacking, split
+// - Build/mining inventory logic:
+//    inv:consumeHotbar  -> consumes blocks from selected hotbar slot
+//    inv:add            -> adds mined blocks into inventory with stacking
+// - equip.tool synced to selected hotbar slot IF item is tool-compatible
 // ============================================================
 
 import { Room, Client, CloseCode } from "colyseus";
@@ -23,6 +36,14 @@ type HotbarSetMsg = { index: number };
 type InvMoveMsg = { from: string; to: string };
 type InvSplitMsg = { slot: string };
 
+// building/mining inventory logic
+type InvConsumeHotbarMsg = { qty?: number };
+type InvAddMsg = { kind: string; qty?: number };
+
+// ------------------------------------------------------------
+// utils
+// ------------------------------------------------------------
+
 function isFiniteNum(n: any): n is number {
   return typeof n === "number" && Number.isFinite(n);
 }
@@ -35,12 +56,12 @@ function nowMs() {
   return Date.now();
 }
 
-/**
- * Slot id formats from client:
- * - "inv:<index>" e.g. inv:12
- * - "eq:<key>"    e.g. eq:tool, eq:head
- */
+// ------------------------------------------------------------
+// slots + inventory
+// ------------------------------------------------------------
+
 type EquipKey = "head" | "chest" | "legs" | "feet" | "tool" | "offhand";
+
 type SlotRef =
   | { kind: "inv"; index: number }
   | { kind: "eq"; key: EquipKey };
@@ -99,6 +120,10 @@ function setSlotUid(p: PlayerState, slot: SlotRef, uid: string) {
   }
 }
 
+// ------------------------------------------------------------
+// item rules
+// ------------------------------------------------------------
+
 function isEquipSlotCompatible(slotKey: EquipKey, itemKind: string) {
   if (!itemKind) return true;
   const k = itemKind.toLowerCase();
@@ -123,7 +148,13 @@ function maxStackForKind(kind: string) {
   return 64;
 }
 
-// ---------------- HOTBAR ----------------
+function isBlockKind(kind: string) {
+  return typeof kind === "string" && kind.startsWith("block:");
+}
+
+// ------------------------------------------------------------
+// hotbar + equip sync
+// ------------------------------------------------------------
 
 function normalizeHotbarIndex(i: any) {
   const n = Number(i);
@@ -132,6 +163,7 @@ function normalizeHotbarIndex(i: any) {
 }
 
 function syncEquipToolToHotbar(p: PlayerState) {
+  // Minecraft-like: selected hotbar slot becomes equipped tool if compatible.
   ensureSlotsLength(p);
 
   const idx = normalizeHotbarIndex(p.hotbarIndex);
@@ -155,11 +187,120 @@ function syncEquipToolToHotbar(p: PlayerState) {
   p.equip.tool = uid;
 }
 
-// ------------- ITEM HELPERS -------------
+// ------------------------------------------------------------
+// inventory add/consume helpers
+// ------------------------------------------------------------
 
 function makeUid(sessionId: string, tag: string) {
   return `${sessionId}:${tag}:${nowMs()}:${Math.floor(Math.random() * 1e9)}`;
 }
+
+function firstEmptyInvIndex(p: PlayerState) {
+  ensureSlotsLength(p);
+  for (let i = 0; i < p.inventory.slots.length; i++) {
+    if (!String(p.inventory.slots[i] || "")) return i;
+  }
+  return -1;
+}
+
+function findStackableUid(p: PlayerState, kind: string) {
+  ensureSlotsLength(p);
+
+  const maxStack = maxStackForKind(kind);
+  if (maxStack <= 1) return "";
+
+  for (let i = 0; i < p.inventory.slots.length; i++) {
+    const uid = String(p.inventory.slots[i] || "");
+    if (!uid) continue;
+
+    const it = p.items.get(uid);
+    if (!it) continue;
+
+    if (String(it.kind || "") !== kind) continue;
+
+    const qty = isFiniteNum(it.qty) ? it.qty : 0;
+    if (qty < maxStack) return uid;
+  }
+
+  return "";
+}
+
+function addKindToInventory(p: PlayerState, kind: string, qty: number) {
+  ensureSlotsLength(p);
+
+  if (!kind || qty <= 0) return 0;
+
+  const maxStack = maxStackForKind(kind);
+  let remaining = qty;
+
+  // stack into existing
+  while (remaining > 0) {
+    const stackUid = findStackableUid(p, kind);
+    if (!stackUid) break;
+
+    const it = p.items.get(stackUid);
+    if (!it) break;
+
+    const cur = isFiniteNum(it.qty) ? it.qty : 0;
+    const space = Math.max(0, maxStack - cur);
+    if (space <= 0) break;
+
+    const add = Math.min(space, remaining);
+    it.qty = cur + add;
+    remaining -= add;
+  }
+
+  // create new stacks
+  while (remaining > 0) {
+    const idx = firstEmptyInvIndex(p);
+    if (idx === -1) break;
+
+    const add = Math.min(maxStack, remaining);
+    remaining -= add;
+
+    const uid = makeUid(p.id || "player", "loot");
+    const it2 = new ItemState();
+    it2.uid = uid;
+    it2.kind = kind;
+    it2.qty = add;
+
+    p.items.set(uid, it2);
+    p.inventory.slots[idx] = uid;
+  }
+
+  return qty - remaining;
+}
+
+function consumeFromHotbar(p: PlayerState, qty: number) {
+  ensureSlotsLength(p);
+
+  const idx = normalizeHotbarIndex(p.hotbarIndex);
+  const uid = String(p.inventory.slots[idx] || "");
+  if (!uid) return 0;
+
+  const it = p.items.get(uid);
+  if (!it) return 0;
+
+  const kind = String(it.kind || "");
+  if (!isBlockKind(kind)) return 0;
+
+  const cur = isFiniteNum(it.qty) ? it.qty : 0;
+  if (cur <= 0) return 0;
+
+  const take = Math.min(cur, qty);
+  it.qty = cur - take;
+
+  if (it.qty <= 0) {
+    p.inventory.slots[idx] = "";
+    p.items.delete(uid);
+  }
+
+  return take;
+}
+
+// ------------------------------------------------------------
+// room
+// ------------------------------------------------------------
 
 export class MyRoom extends Room {
   public maxClients = 16;
@@ -173,6 +314,7 @@ export class MyRoom extends Room {
     const TICK_MS = 50; // 20 Hz
     const STAMINA_DRAIN_PER_SEC = 18;
     const STAMINA_REGEN_PER_SEC = 12;
+
     const SWING_COST = 8;
     const SWING_FLAG_MS = 250;
 
@@ -184,12 +326,14 @@ export class MyRoom extends Room {
       this.state.players.forEach((p: PlayerState, sid: string) => {
         ensureSlotsLength(p);
 
+        // clamp stats
         p.maxHp = clamp(isFiniteNum(p.maxHp) ? p.maxHp : 20, 1, 200);
         p.maxStamina = clamp(isFiniteNum(p.maxStamina) ? p.maxStamina : 100, 1, 1000);
 
         p.hp = clamp(isFiniteNum(p.hp) ? p.hp : p.maxHp, 0, p.maxHp);
         p.stamina = clamp(isFiniteNum(p.stamina) ? p.stamina : p.maxStamina, 0, p.maxStamina);
 
+        // sprint drain/regen
         if (p.sprinting) {
           const drain = STAMINA_DRAIN_PER_SEC * dt;
           p.stamina = clamp(p.stamina - drain, 0, p.maxStamina);
@@ -199,15 +343,19 @@ export class MyRoom extends Room {
           p.stamina = clamp(p.stamina + regen, 0, p.maxStamina);
         }
 
+        // swing flag timeout
         const t0 = lastSwingAt.get(sid) || 0;
         if (p.swinging && nowMs() - t0 > SWING_FLAG_MS) p.swinging = false;
 
+        // hotbar + equip sync
         p.hotbarIndex = normalizeHotbarIndex(p.hotbarIndex);
         syncEquipToolToHotbar(p);
       });
     }, TICK_MS);
 
-    // ---- Messages
+    // --------------------------------------------------------
+    // Messages
+    // --------------------------------------------------------
 
     this.onMessage("move", (client: Client, msg: MoveMsg) => {
       const p = this.state.players.get(client.sessionId);
@@ -238,6 +386,7 @@ export class MyRoom extends Room {
     this.onMessage("swing", (client: Client, _msg: SwingMsg) => {
       const p = this.state.players.get(client.sessionId);
       if (!p) return;
+
       if (p.stamina < SWING_COST) return;
 
       p.stamina = clamp(p.stamina - SWING_COST, 0, p.maxStamina);
@@ -253,6 +402,34 @@ export class MyRoom extends Room {
       syncEquipToolToHotbar(p);
     });
 
+    // ---- CONSUME from selected hotbar slot (blocks only)
+    this.onMessage("inv:consumeHotbar", (client: Client, msg: InvConsumeHotbarMsg) => {
+      const p = this.state.players.get(client.sessionId);
+      if (!p) return;
+
+      const qtyReq = clamp(Math.floor(Number(msg?.qty ?? 1)), 1, 64);
+
+      const took = consumeFromHotbar(p, qtyReq);
+      if (took > 0) {
+        syncEquipToolToHotbar(p);
+      }
+    });
+
+    // ---- ADD items to inventory (blocks only; stacking)
+    this.onMessage("inv:add", (client: Client, msg: InvAddMsg) => {
+      const p = this.state.players.get(client.sessionId);
+      if (!p) return;
+
+      const kind = String(msg?.kind || "");
+      if (!isBlockKind(kind)) return;
+
+      const qtyReq = clamp(Math.floor(Number(msg?.qty ?? 1)), 1, 64);
+
+      addKindToInventory(p, kind, qtyReq);
+      syncEquipToolToHotbar(p);
+    });
+
+    // ---- Inventory slot moves / stacking / swapping
     this.onMessage("inv:move", (client: Client, msg: InvMoveMsg) => {
       const p = this.state.players.get(client.sessionId);
       if (!p) return;
@@ -276,18 +453,15 @@ export class MyRoom extends Room {
       const fromItem = fromUid ? p.items.get(fromUid) : null;
       const toItem = toUid ? p.items.get(toUid) : null;
 
-      // Narrow 'to' before using to.key
+      // equipment compatibility checks
       if (to.kind === "eq") {
-        const toKey: EquipKey = to.key;
-        if (fromItem) {
-          if (!isEquipSlotCompatible(toKey, String(fromItem.kind || ""))) return;
-        }
-        if (toItem) {
-          if (!isEquipSlotCompatible(toKey, String(toItem.kind || ""))) return;
-        }
+        const toKey = to.key;
+
+        if (fromItem && !isEquipSlotCompatible(toKey, String(fromItem.kind || ""))) return;
+        if (toItem && !isEquipSlotCompatible(toKey, String(toItem.kind || ""))) return;
       }
 
-      // destination empty => move
+      // destination empty -> move
       if (!toUid) {
         setSlotUid(p, to, fromUid);
         setSlotUid(p, from, "");
@@ -295,7 +469,7 @@ export class MyRoom extends Room {
         return;
       }
 
-      // source empty => move reverse
+      // source empty -> move reverse
       if (!fromUid) {
         setSlotUid(p, from, toUid);
         setSlotUid(p, to, "");
@@ -303,7 +477,7 @@ export class MyRoom extends Room {
         return;
       }
 
-      // stack if same kind and stackable
+      // try stacking if same kind and stackable
       if (fromItem && toItem && String(fromItem.kind) === String(toItem.kind)) {
         const maxStack = maxStackForKind(String(toItem.kind));
         if (maxStack > 1) {
@@ -334,6 +508,7 @@ export class MyRoom extends Room {
       syncEquipToolToHotbar(p);
     });
 
+    // ---- Split stack in half into first empty slot
     this.onMessage("inv:split", (client: Client, msg: InvSplitMsg) => {
       const p = this.state.players.get(client.sessionId);
       if (!p) return;
@@ -355,14 +530,8 @@ export class MyRoom extends Room {
       if (qty <= 1) return;
 
       // find empty slot
-      let emptyIndex = -1;
-      for (let i = 0; i < total; i++) {
-        if (!String(p.inventory.slots[i] || "")) {
-          emptyIndex = i;
-          break;
-        }
-      }
-      if (emptyIndex === -1) return;
+      const emptyIdx = firstEmptyInvIndex(p);
+      if (emptyIdx === -1) return;
 
       const take = Math.floor(qty / 2);
       const remain = qty - take;
@@ -380,11 +549,12 @@ export class MyRoom extends Room {
       it2.meta = String(it.meta || "");
 
       p.items.set(newUid, it2);
-      p.inventory.slots[emptyIndex] = newUid;
+      p.inventory.slots[emptyIdx] = newUid;
 
       syncEquipToolToHotbar(p);
     });
 
+    // debug
     this.onMessage("hello", (client: Client, message: any) => {
       console.log(client.sessionId, "said hello:", message);
       client.send("hello_ack", { ok: true, serverTime: Date.now() });
@@ -418,12 +588,12 @@ export class MyRoom extends Room {
     p.sprinting = false;
     p.swinging = false;
 
-    // inventory
+    // inventory size
     p.inventory.cols = 9;
     p.inventory.rows = 4;
     ensureSlotsLength(p);
 
-    // hotbar default selection
+    // hotbar
     p.hotbarIndex = 2;
 
     // starter items
@@ -457,6 +627,7 @@ export class MyRoom extends Room {
     p.inventory.slots[1] = grassUid;
     p.inventory.slots[2] = toolUid;
 
+    // sync equip.tool based on hotbar selection
     syncEquipToolToHotbar(p);
 
     this.state.players.set(client.sessionId, p);
