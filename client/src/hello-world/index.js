@@ -2,12 +2,13 @@
 /*
  * Fresh2 - hello-world (NOA main entry) - FULL REWRITE (NO OMITS)
  * -------------------------------------------------------------
- * Fixes:
- * - Prevents "1st person on ground, 3rd in the air" by enforcing view mode EVERY FRAME
- * - 3rd-person camera: optional hard-follow behind avatar (ONLY when viewMode === 1)
+ * Includes:
+ * - View mode enforcement EVERY FRAME (prevents "1st on ground, 3rd in air")
+ * - 3rd-person camera hard-follow behind avatar (ONLY when viewMode === 1)
  * - Prevent camera roll/slant in 3rd person (forces upright camera)
  * - Multiplayer: Colyseus SDK (state-diff sync; no MapSchema hooks required)
  * - Debug: Avatar/camera snapshots in 3rd person
+ * - HUD: Hearts + Stamina overlay synced from Colyseus schema (local player)
  */
 
 import { Engine } from "noa-engine";
@@ -47,8 +48,21 @@ let showDebugProof = false;
 
 // Multiplayer
 let colyRoom = null;
-const remotePlayers = {}; // { [sessionId]: { mesh, parts, targetPos, targetRot, lastPos } }
+/**
+ * remotePlayers: { [sessionId]: { mesh, parts, targetPos, targetRot, lastPos } }
+ */
+const remotePlayers = {};
 let lastPlayersKeys = new Set();
+
+// Local replicated stats (from server)
+const LOCAL_STATS = {
+  hp: 20,
+  maxHp: 20,
+  stamina: 100,
+  maxStamina: 100,
+  sprinting: false,
+  swinging: false,
+};
 
 const STATE = {
   scene: null,
@@ -225,10 +239,20 @@ function createCrosshairOverlay() {
   };
 
   const h = document.createElement("div");
-  Object.assign(h.style, lineStyle, { width: "100%", height: "2px", top: "10px", left: "0" });
+  Object.assign(h.style, lineStyle, {
+    width: "100%",
+    height: "2px",
+    top: "10px",
+    left: "0",
+  });
 
   const v = document.createElement("div");
-  Object.assign(v.style, lineStyle, { width: "2px", height: "100%", left: "10px", top: "0" });
+  Object.assign(v.style, lineStyle, {
+    width: "2px",
+    height: "100%",
+    left: "10px",
+    top: "0",
+  });
 
   div.appendChild(h);
   div.appendChild(v);
@@ -247,6 +271,139 @@ function createCrosshairOverlay() {
 }
 
 const crosshairUI = createCrosshairOverlay();
+
+/* ============================================================
+ * UI: HUD OVERLAY (HEARTS + STAMINA)
+ * ============================================================
+ */
+
+function createHudOverlay() {
+  const wrap = document.createElement("div");
+  wrap.id = "noa-hud";
+  Object.assign(wrap.style, {
+    position: "fixed",
+    left: "14px",
+    bottom: "14px",
+    zIndex: "9999",
+    pointerEvents: "none",
+    fontFamily: "system-ui, -apple-system, Segoe UI, Roboto, Arial",
+    textShadow: "0 1px 2px rgba(0,0,0,0.8)",
+    userSelect: "none",
+    display: "block",
+  });
+
+  // Hearts row
+  const hearts = document.createElement("div");
+  Object.assign(hearts.style, {
+    display: "flex",
+    gap: "2px",
+    alignItems: "center",
+    marginBottom: "8px",
+    fontSize: "20px",
+    lineHeight: "20px",
+  });
+
+  // Stamina bar
+  const staminaWrap = document.createElement("div");
+  Object.assign(staminaWrap.style, {
+    width: "220px",
+    height: "10px",
+    borderRadius: "6px",
+    background: "rgba(0,0,0,0.45)",
+    border: "1px solid rgba(255,255,255,0.25)",
+    overflow: "hidden",
+  });
+
+  const staminaFill = document.createElement("div");
+  Object.assign(staminaFill.style, {
+    width: "100%",
+    height: "100%",
+    borderRadius: "6px",
+    background: "rgba(80, 220, 120, 0.9)",
+    transformOrigin: "left center",
+    transform: "scaleX(1)",
+  });
+
+  staminaWrap.appendChild(staminaFill);
+
+  // optional hint label
+  const label = document.createElement("div");
+  Object.assign(label.style, {
+    marginTop: "6px",
+    fontSize: "12px",
+    opacity: "0.75",
+  });
+  label.textContent = "";
+
+  wrap.appendChild(hearts);
+  wrap.appendChild(staminaWrap);
+  wrap.appendChild(label);
+  document.body.appendChild(wrap);
+
+  // internal cache to reduce DOM churn
+  let lastHp = -1,
+    lastMaxHp = -1,
+    lastSt = -1,
+    lastMaxSt = -1;
+
+  function setHp(hp, maxHp) {
+    hp = Math.max(0, Math.min(maxHp || 0, hp || 0));
+    maxHp = Math.max(1, maxHp || 1);
+
+    if (hp === lastHp && maxHp === lastMaxHp) return;
+    lastHp = hp;
+    lastMaxHp = maxHp;
+
+    // each heart = 2 hp
+    const heartsCount = Math.ceil(maxHp / 2);
+    const fullHearts = Math.floor(hp / 2);
+    const hasHalf = hp % 2 === 1;
+
+    hearts.innerHTML = "";
+    for (let i = 0; i < heartsCount; i++) {
+      const span = document.createElement("span");
+      if (i < fullHearts) {
+        span.textContent = "♥";
+        span.style.color = "rgba(255,80,80,0.95)";
+      } else if (i === fullHearts && hasHalf) {
+        span.textContent = "♥";
+        span.style.color = "rgba(255,80,80,0.55)";
+      } else {
+        span.textContent = "♡";
+        span.style.color = "rgba(255,255,255,0.55)";
+      }
+      hearts.appendChild(span);
+    }
+  }
+
+  function setStamina(stamina, maxStamina) {
+    stamina = Math.max(0, Math.min(maxStamina || 0, stamina || 0));
+    maxStamina = Math.max(1, maxStamina || 1);
+
+    if (stamina === lastSt && maxStamina === lastMaxSt) return;
+    lastSt = stamina;
+    lastMaxSt = maxStamina;
+
+    const pct = stamina / maxStamina;
+    staminaFill.style.transform = `scaleX(${pct})`;
+
+    // color shift when low
+    if (pct < 0.25) staminaFill.style.background = "rgba(255, 200, 80, 0.95)";
+    else staminaFill.style.background = "rgba(80, 220, 120, 0.9)";
+  }
+
+  function setHint(text) {
+    label.textContent = text || "";
+  }
+
+  function setVisible(on) {
+    wrap.style.display = on ? "block" : "none";
+  }
+
+  return { setHp, setStamina, setHint, setVisible };
+}
+
+const hudUI = createHudOverlay();
 
 /* ============================================================
  * WORLD GENERATION
@@ -590,11 +747,7 @@ function updateFpsRig(dt, speed) {
   const wr = MESH.weaponRoot;
   const s = clamp(dt * 12, 0, 1);
 
-  const targetPos = new BABYLON.Vector3(
-    bobX + swayX * 0.8,
-    -0.02 + bobY - swingAmt * 0.04,
-    0
-  );
+  const targetPos = new BABYLON.Vector3(bobX + swayX * 0.8, -0.02 + bobY - swingAmt * 0.04, 0);
 
   const targetRot = new BABYLON.Vector3(
     swayY + swingAmt * 0.9,
@@ -691,15 +844,7 @@ function meshEnabled(m) {
 
 function getMeshesFromRig(parts) {
   if (!parts) return [];
-  return [
-    parts.head,
-    parts.body,
-    parts.armL,
-    parts.armR,
-    parts.legL,
-    parts.legR,
-    parts.tool,
-  ].filter(Boolean);
+  return [parts.head, parts.body, parts.armL, parts.armR, parts.legL, parts.legR, parts.tool].filter(Boolean);
 }
 
 function debugThirdPersonAvatar(nowMs) {
@@ -852,6 +997,36 @@ function syncPlayersFromState(state) {
 
   updateRemoteTargetsFromState(playersObj);
   lastPlayersKeys = newKeys;
+
+  // also refresh local HUD stats whenever state changes
+  updateLocalStatsFromState(playersObj);
+}
+
+/* ============================================================
+ * HUD SYNC (LOCAL PLAYER)
+ * ============================================================
+ */
+
+function updateLocalStatsFromState(playersObj) {
+  if (!colyRoom) return;
+  if (!playersObj) return;
+
+  const me = playersObj[colyRoom.sessionId];
+  if (!me) return;
+
+  LOCAL_STATS.hp = safeNum(me.hp, LOCAL_STATS.hp);
+  LOCAL_STATS.maxHp = safeNum(me.maxHp, LOCAL_STATS.maxHp);
+  LOCAL_STATS.stamina = safeNum(me.stamina, LOCAL_STATS.stamina);
+  LOCAL_STATS.maxStamina = safeNum(me.maxStamina, LOCAL_STATS.maxStamina);
+  LOCAL_STATS.sprinting = !!me.sprinting;
+  LOCAL_STATS.swinging = !!me.swinging;
+
+  hudUI.setHp(LOCAL_STATS.hp, LOCAL_STATS.maxHp);
+  hudUI.setStamina(LOCAL_STATS.stamina, LOCAL_STATS.maxStamina);
+
+  // optional hint label
+  const hint = LOCAL_STATS.sprinting ? "Sprinting" : "";
+  hudUI.setHint(hint);
 }
 
 /* ============================================================
@@ -872,7 +1047,27 @@ document.addEventListener("keydown", (e) => {
     showDebugProof = !showDebugProof;
     refreshDebugProofMeshes();
   }
+
+  // Sprint start (Shift)
+  if (e.code === "ShiftLeft" || e.code === "ShiftRight") {
+    sendSprintIntent(true);
+  }
 });
+
+document.addEventListener("keyup", (e) => {
+  // Sprint stop (Shift)
+  if (e.code === "ShiftLeft" || e.code === "ShiftRight") {
+    sendSprintIntent(false);
+  }
+});
+
+function sendSprintIntent(on) {
+  if (!colyRoom) return;
+  // send intent (server decides if stamina allows it)
+  try {
+    colyRoom.send("sprint", { on: !!on });
+  } catch (e) {}
+}
 
 noa.on("tick", function () {
   const scroll = noa.inputs.pointerState.scrolly;
@@ -884,6 +1079,13 @@ noa.on("tick", function () {
 
 function triggerSwing() {
   STATE.swingT = 0;
+
+  // send swing intent for stamina drain / animation replication
+  if (colyRoom) {
+    try {
+      colyRoom.send("swing", { t: performance.now() });
+    } catch (e) {}
+  }
 }
 
 noa.inputs.down.on("fire", function () {
@@ -983,6 +1185,10 @@ noa.on("beforeRender", function () {
     const fwd = cam.getForwardRay(3).direction;
     MESH.frontCube.position.copyFrom(cam.position).addInPlace(fwd.scale(3));
   }
+
+  // Keep HUD updated even between state-change callbacks (cheap + smooth)
+  hudUI.setHp(LOCAL_STATS.hp, LOCAL_STATS.maxHp);
+  hudUI.setStamina(LOCAL_STATS.stamina, LOCAL_STATS.maxStamina);
 });
 
 /* ============================================================
@@ -1010,13 +1216,14 @@ async function connectColyseus() {
       console.log("[server] welcome:", msg);
     });
 
+    // initial sync
     if (room.state) syncPlayersFromState(room.state);
 
     room.onStateChange((state) => {
       syncPlayersFromState(state);
     });
 
-    // send loop
+    // send loop (movement/orientation)
     setInterval(() => {
       if (!colyRoom) return;
 
@@ -1024,7 +1231,15 @@ async function connectColyseus() {
       const yaw = noa.camera.heading;
       const pitch = noa.camera.pitch;
 
-      colyRoom.send("move", { x: p[0], y: p[1], z: p[2], yaw, pitch });
+      // include optional client hints (server may ignore)
+      colyRoom.send("move", {
+        x: p[0],
+        y: p[1],
+        z: p[2],
+        yaw,
+        pitch,
+        viewMode, // optional
+      });
     }, 100);
   } catch (err) {
     console.error("Colyseus Connection Failed:", err);
