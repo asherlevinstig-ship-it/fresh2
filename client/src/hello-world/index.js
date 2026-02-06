@@ -12,7 +12,8 @@
  * - Colyseus (@colyseus/sdk) state sync + remote interpolation
  * - Sends: move, sprint, swing, hotbar:set, inv:move, inv:split, inv:consumeHotbar, inv:add
  * - Mining: breaks block locally + tells server inv:add(kind)
- * - Building: places selected hotbar block locally + tells server inv:consumeHotbar
+ * - Building: RIGHT CLICK (mouse2) places selected hotbar block locally + tells server inv:consumeHotbar
+ * - Extra: placement safety checks + optional debug logs
  *
  * Assumptions:
  * - Server room is "my_room"
@@ -54,6 +55,8 @@ let viewMode = 0; // 0 = first, 1 = third
 let forceCrosshair = true;
 let showDebugProof = false;
 let inventoryOpen = false;
+
+let DEBUG_BUILD = false; // flip true for placement logs
 
 // Multiplayer
 let colyRoom = null;
@@ -550,7 +553,6 @@ function createInventoryOverlay() {
     return { cell, icon, qty };
   }
 
-  // build inv grid
   const invCells = [];
   function rebuildInvGrid() {
     invGrid.innerHTML = "";
@@ -563,7 +565,7 @@ function createInventoryOverlay() {
     const total = cols * rows;
     for (let i = 0; i < total; i++) {
       const { cell, icon, qty } = makeSlotBox("", `inv:${i}`);
-      cell.firstChild.style.display = "none"; // hide label
+      cell.firstChild.style.display = "none";
       invGrid.appendChild(cell);
       invCells.push({ cell, icon, qty });
     }
@@ -587,7 +589,6 @@ function createInventoryOverlay() {
   overlay.appendChild(panel);
   document.body.appendChild(overlay);
 
-  // drag state
   const drag = { active: false, from: "", over: "", uid: "" };
 
   function itemShort(kind) {
@@ -794,9 +795,8 @@ const grassID = noa.registry.registerBlock(2, { material: "grass" });
 function getVoxelID(x, y, z) {
   const height = 2 * Math.sin(x / 10) + 3 * Math.cos(z / 20);
 
-  // Dirt below the surface, grass only on the top layer.
-  if (y < height - 1) return dirtID;
-  if (y < height) return grassID;
+  if (y < height - 1) return dirtID; // dirt below surface
+  if (y < height) return grassID; // top layer grass
   return 0;
 }
 
@@ -1428,6 +1428,87 @@ function sendInvAdd(kind, qty = 1) {
 }
 
 /* ============================================================
+ * BUILDING (RIGHT CLICK)
+ * ============================================================
+ */
+
+function canPlaceAt(x, y, z) {
+  // prevent placing inside player
+  const p = getSafePlayerPos();
+  const px = p[0],
+    py = p[1],
+    pz = p[2];
+
+  const dx = Math.abs(x + 0.5 - px);
+  const dz = Math.abs(z + 0.5 - pz);
+  const dy = Math.abs(y + 0.5 - (py + 0.9));
+
+  const insidePlayer = dx < 0.45 && dz < 0.45 && dy < 1.0;
+  if (insidePlayer) return false;
+
+  // must be empty
+  return noa.getBlock(x, y, z) === 0;
+}
+
+function placeSelectedBlock() {
+  // do not build while inventory open
+  if (inventoryOpen) return;
+
+  // local swing visual + server swing stamina
+  STATE.swingT = 0;
+  sendSwing();
+
+  if (!noa.targetedBlock) {
+    if (DEBUG_BUILD) console.log("[BUILD] no targetedBlock (aim at a block face)");
+    return;
+  }
+
+  const { it } = getSelectedHotbarItem();
+  const kind = it?.kind || "";
+  if (!kind.startsWith("block:")) {
+    if (DEBUG_BUILD) console.log("[BUILD] selected item is not a block:", kind);
+    return;
+  }
+
+  const blockId = kindToBlockId(kind);
+  if (!blockId) {
+    if (DEBUG_BUILD) console.log("[BUILD] no blockId mapping for:", kind);
+    return;
+  }
+
+  const pos = noa.targetedBlock.adjacent;
+  const x = pos[0],
+    y = pos[1],
+    z = pos[2];
+
+  // reach guard (optional but useful)
+  const camPos = STATE.scene?.activeCamera?.position;
+  if (camPos) {
+    const dx = x + 0.5 - camPos.x;
+    const dy = y + 0.5 - camPos.y;
+    const dz = z + 0.5 - camPos.z;
+    const dist = Math.sqrt(dx * dx + dy * dy + dz * dz);
+    if (dist > 8.0) {
+      if (DEBUG_BUILD) console.log("[BUILD] out of reach:", dist.toFixed(2));
+      return;
+    }
+  }
+
+  if (!canPlaceAt(x, y, z)) {
+    if (DEBUG_BUILD) console.log("[BUILD] blocked (occupied or inside player) at:", x, y, z);
+    return;
+  }
+
+  // place locally
+  noa.setBlock(blockId, x, y, z);
+
+  // consume from inventory on server
+  sendConsumeHotbar(1);
+
+  if (DEBUG_BUILD) console.log("[BUILD] placed", kind, "at", x, y, z);
+}
+
+/* ============================================================
  * INPUTS
  * ============================================================
  */
@@ -1448,7 +1529,6 @@ document.addEventListener("keydown", (e) => {
     refreshDebugProofMeshes();
   }
 
-  // Inventory toggle
   if (e.code === "KeyI") {
     e.preventDefault();
     inventoryOpen = !inventoryOpen;
@@ -1459,7 +1539,6 @@ document.addEventListener("keydown", (e) => {
     }
   }
 
-  // ESC closes inventory
   if (e.code === "Escape") {
     if (inventoryOpen) {
       inventoryOpen = false;
@@ -1467,7 +1546,6 @@ document.addEventListener("keydown", (e) => {
     }
   }
 
-  // Hotbar number keys
   if (!inventoryOpen) {
     if (e.code === "Digit1") sendHotbarIndex(0);
     if (e.code === "Digit2") sendHotbarIndex(1);
@@ -1479,6 +1557,13 @@ document.addEventListener("keydown", (e) => {
     if (e.code === "Digit8") sendHotbarIndex(7);
     if (e.code === "Digit9") sendHotbarIndex(8);
   }
+});
+
+// Prevent browser context menu on right click (important for build)
+document.addEventListener("contextmenu", (e) => {
+  // only prevent while pointer locked or over canvas
+  const overCanvas = e.target === noa.container.canvas || (noa.container.canvas && noa.container.canvas.contains?.(e.target));
+  if (document.pointerLockElement === noa.container.canvas || overCanvas) e.preventDefault();
 });
 
 // Zoom + hotbar scroll
@@ -1509,14 +1594,11 @@ document.addEventListener("keyup", (e) => {
   }
 });
 
-// Swing local visuals
-function triggerSwingLocalOnly() {
-  STATE.swingT = 0;
-}
-
-// Mine
+// Mine (left click default "fire")
 noa.inputs.down.on("fire", function () {
-  triggerSwingLocalOnly();
+  if (inventoryOpen) return;
+
+  STATE.swingT = 0;
   sendSwing();
 
   if (!noa.targetedBlock) return;
@@ -1532,29 +1614,13 @@ noa.inputs.down.on("fire", function () {
   if (kind) sendInvAdd(kind, 1);
 });
 
-// Place (Minecraft right-click / E bound as alt-fire)
-noa.inputs.down.on("alt-fire", function () {
-  triggerSwingLocalOnly();
-  sendSwing();
+// Build (RIGHT CLICK)
+noa.inputs.down.on("alt-fire", placeSelectedBlock);
 
-  if (!noa.targetedBlock) return;
+// Ensure right mouse triggers alt-fire
+noa.inputs.bind("alt-fire", "mouse2");
 
-  const { it } = getSelectedHotbarItem();
-  const kind = it?.kind || "";
-  if (!kind.startsWith("block:")) return;
-
-  const blockId = kindToBlockId(kind);
-  if (!blockId) return;
-
-  const pos = noa.targetedBlock.adjacent;
-
-  // place locally
-  noa.setBlock(blockId, pos[0], pos[1], pos[2]);
-
-  // consume server-side from selected hotbar stack
-  sendConsumeHotbar(1);
-});
-
+// Optional: keep KeyE build too
 noa.inputs.bind("alt-fire", "KeyE");
 
 /* ============================================================
@@ -1617,7 +1683,7 @@ noa.on("beforeRender", function () {
     updateAvatarAnim(rp.parts, remoteSpeed, true, false);
   }
 
-  // debug cube in front of camera
+  // debug cube
   if (showDebugProof && MESH.frontCube && STATE.scene?.activeCamera) {
     const cam = STATE.scene.activeCamera;
     const fwd = cam.getForwardRay(3).direction;
