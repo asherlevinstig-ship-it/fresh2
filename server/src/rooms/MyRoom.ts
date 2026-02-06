@@ -9,9 +9,17 @@
 // - Swing (stamina cost + timed swinging flag)
 // - Hotbar selection (0..8) (server authoritative)
 // - Inventory + equipment slot moves (drag/drop), stacking, split
-// - Build/mining inventory logic:
-//    inv:consumeHotbar  -> consumes blocks from selected hotbar slot
-//    inv:add            -> adds mined blocks into inventory with stacking
+// - SERVER-AUTHORITATIVE WORLD (blocks) using sparse override store:
+//    - Procedural base terrain (matches your client: sin/cos dirt+grass layering)
+//    - Store only edits in a Map, broadcast edits via "block:update"
+// - Mining:
+//    - client sends "block:break" -> server validates reach -> sets block to 0
+//    - server adds block item to inventory (stacking)
+// - Building:
+//    - client sends "block:place" -> server validates reach + empty -> consumes from hotbar
+//    - server places block and broadcasts
+// - Backwards compatible inventory messages still exist:
+//    inv:consumeHotbar  / inv:add
 // - equip.tool synced to selected hotbar slot IF item is tool-compatible
 // ============================================================
 
@@ -36,9 +44,13 @@ type HotbarSetMsg = { index: number };
 type InvMoveMsg = { from: string; to: string };
 type InvSplitMsg = { slot: string };
 
-// building/mining inventory logic
+// Backwards compatible inventory logic (keep if your client still calls these)
 type InvConsumeHotbarMsg = { qty?: number };
 type InvAddMsg = { kind: string; qty?: number };
+
+// New world-authoritative actions
+type BlockBreakMsg = { x: number; y: number; z: number };
+type BlockPlaceMsg = { x: number; y: number; z: number; blockId?: number; kind?: string };
 
 // ------------------------------------------------------------
 // utils
@@ -54,6 +66,87 @@ function clamp(n: number, a: number, b: number) {
 
 function nowMs() {
   return Date.now();
+}
+
+function i32(n: any, fallback = 0) {
+  const x = Number(n);
+  return Number.isFinite(x) ? (x | 0) : fallback;
+}
+
+function key3(x: number, y: number, z: number) {
+  return `${x | 0},${y | 0},${z | 0}`;
+}
+
+// ------------------------------------------------------------
+// WORLD (server authoritative, sparse override store)
+// ------------------------------------------------------------
+//
+// We keep a procedural "base world" (same as your client getVoxelID),
+// and store edits in a Map. This means the server doesn't need to hold
+// infinite chunks in memory to begin with.
+//
+// IMPORTANT: Keep block IDs consistent with your client registry.
+// In your client:
+//   dirtID = registerBlock(1, ...)
+//   grassID = registerBlock(2, ...)
+// So here:
+//   1 = dirt, 2 = grass, 0 = air
+//
+
+const BLOCK = {
+  AIR: 0,
+  DIRT: 1,
+  GRASS: 2,
+} as const;
+
+function getBaseVoxelID(x: number, y: number, z: number) {
+  // Mirror the client exactly:
+  // const height = 2 * Math.sin(x / 10) + 3 * Math.cos(z / 20);
+  // if (y < height - 1) dirt
+  // else if (y < height) grass
+  // else air
+  const height = 2 * Math.sin(x / 10) + 3 * Math.cos(z / 20);
+  if (y < height - 1) return BLOCK.DIRT;
+  if (y < height) return BLOCK.GRASS;
+  return BLOCK.AIR;
+}
+
+function blockIdToKind(id: number) {
+  if (id === BLOCK.DIRT) return "block:dirt";
+  if (id === BLOCK.GRASS) return "block:grass";
+  return "";
+}
+
+function kindToBlockId(kind: string) {
+  if (kind === "block:dirt") return BLOCK.DIRT;
+  if (kind === "block:grass") return BLOCK.GRASS;
+  return 0;
+}
+
+function isBlockIdPlaceable(id: number) {
+  return id === BLOCK.DIRT || id === BLOCK.GRASS;
+}
+
+class WorldStore {
+  // sparse overrides: only store edits (including air removals)
+  private overrides = new Map<string, number>();
+
+  get(x: number, y: number, z: number) {
+    const k = key3(x, y, z);
+    if (this.overrides.has(k)) return this.overrides.get(k)!;
+    return getBaseVoxelID(x, y, z);
+  }
+
+  set(x: number, y: number, z: number, id: number) {
+    const k = key3(x, y, z);
+    // store the override even if it matches base? we can avoid storing if equal.
+    const base = getBaseVoxelID(x, y, z);
+    if (id === base) {
+      this.overrides.delete(k);
+    } else {
+      this.overrides.set(k, id | 0);
+    }
+  }
 }
 
 // ------------------------------------------------------------
@@ -163,7 +256,6 @@ function normalizeHotbarIndex(i: any) {
 }
 
 function syncEquipToolToHotbar(p: PlayerState) {
-  // Minecraft-like: selected hotbar slot becomes equipped tool if compatible.
   ensureSlotsLength(p);
 
   const idx = normalizeHotbarIndex(p.hotbarIndex);
@@ -258,7 +350,7 @@ function addKindToInventory(p: PlayerState, kind: string, qty: number) {
     const add = Math.min(maxStack, remaining);
     remaining -= add;
 
-    const uid = makeUid(p.id || "player", "loot");
+    const uid = makeUid(String(p.id || "player"), "loot");
     const it2 = new ItemState();
     it2.uid = uid;
     it2.kind = kind;
@@ -299,12 +391,40 @@ function consumeFromHotbar(p: PlayerState, qty: number) {
 }
 
 // ------------------------------------------------------------
+// server-side validation for block actions
+// ------------------------------------------------------------
+
+function isValidBlockCoord(x: number, y: number, z: number) {
+  // keep same broad clamp as movement
+  return (
+    Number.isInteger(x) &&
+    Number.isInteger(y) &&
+    Number.isInteger(z) &&
+    x >= -100000 &&
+    x <= 100000 &&
+    y >= -100000 &&
+    y <= 100000 &&
+    z >= -100000 &&
+    z <= 100000
+  );
+}
+
+function dist3(ax: number, ay: number, az: number, bx: number, by: number, bz: number) {
+  const dx = ax - bx;
+  const dy = ay - by;
+  const dz = az - bz;
+  return Math.sqrt(dx * dx + dy * dy + dz * dz);
+}
+
+// ------------------------------------------------------------
 // room
 // ------------------------------------------------------------
 
 export class MyRoom extends Room {
   public maxClients = 16;
   public state!: MyRoomState;
+
+  private world = new WorldStore();
 
   public onCreate(options: any) {
     this.setState(new MyRoomState());
@@ -319,6 +439,10 @@ export class MyRoom extends Room {
     const SWING_FLAG_MS = 250;
 
     const lastSwingAt = new Map<string, number>();
+
+    // simple per-player rate limit for block edits
+    const lastBlockEditAt = new Map<string, number>();
+    const MIN_BLOCK_EDIT_INTERVAL_MS = 55; // ~18 edits/sec max
 
     this.setSimulationInterval(() => {
       const dt = TICK_MS / 1000;
@@ -354,7 +478,7 @@ export class MyRoom extends Room {
     }, TICK_MS);
 
     // --------------------------------------------------------
-    // Messages
+    // Messages: player movement
     // --------------------------------------------------------
 
     this.onMessage("move", (client: Client, msg: MoveMsg) => {
@@ -402,7 +526,118 @@ export class MyRoom extends Room {
       syncEquipToolToHotbar(p);
     });
 
-    // ---- CONSUME from selected hotbar slot (blocks only)
+    // --------------------------------------------------------
+    // Messages: SERVER-AUTHORITATIVE WORLD EDITS
+    // --------------------------------------------------------
+
+    const canEditBlockNow = (sid: string) => {
+      const t = nowMs();
+      const prev = (lastBlockEditAt.get(sid) || 0) | 0;
+      if (t - prev < MIN_BLOCK_EDIT_INTERVAL_MS) return false;
+      lastBlockEditAt.set(sid, t);
+      return true;
+    };
+
+    const withinReach = (p: PlayerState, x: number, y: number, z: number) => {
+      // use "eye position" approximation
+      const ex = safeCoord(p.x);
+      const ey = safeCoord(p.y + 1.6);
+      const ez = safeCoord(p.z);
+      const bx = x + 0.5;
+      const by = y + 0.5;
+      const bz = z + 0.5;
+      return dist3(ex, ey, ez, bx, by, bz) <= 8.0;
+    };
+
+    function safeCoord(n: any) {
+      const v = Number(n);
+      return Number.isFinite(v) ? v : 0;
+    }
+
+    // break block (mining)
+    this.onMessage("block:break", (client: Client, msg: BlockBreakMsg) => {
+      const p = this.state.players.get(client.sessionId);
+      if (!p) return;
+
+      const x = i32(msg?.x);
+      const y = i32(msg?.y);
+      const z = i32(msg?.z);
+
+      if (!isValidBlockCoord(x, y, z)) return;
+      if (!canEditBlockNow(client.sessionId)) return;
+      if (!withinReach(p, x, y, z)) return;
+
+      const existing = this.world.get(x, y, z);
+      if (existing === BLOCK.AIR) return;
+
+      // set to air
+      this.world.set(x, y, z, BLOCK.AIR);
+
+      // add to inventory (blocks only)
+      const kind = blockIdToKind(existing);
+      if (kind) addKindToInventory(p, kind, 1);
+
+      syncEquipToolToHotbar(p);
+
+      // broadcast authoritative update
+      this.broadcast("block:update", { x, y, z, id: BLOCK.AIR });
+    });
+
+    // place block (building)
+    this.onMessage("block:place", (client: Client, msg: BlockPlaceMsg) => {
+      const p = this.state.players.get(client.sessionId);
+      if (!p) return;
+
+      const x = i32(msg?.x);
+      const y = i32(msg?.y);
+      const z = i32(msg?.z);
+
+      if (!isValidBlockCoord(x, y, z)) return;
+      if (!canEditBlockNow(client.sessionId)) return;
+      if (!withinReach(p, x, y, z)) return;
+
+      // must be empty
+      const existing = this.world.get(x, y, z);
+      if (existing !== BLOCK.AIR) return;
+
+      // Determine blockId:
+      // Prefer msg.blockId if provided; else allow msg.kind.
+      let blockId = 0;
+      if (isFiniteNum(msg?.blockId)) blockId = msg.blockId | 0;
+      if (!blockId && typeof msg?.kind === "string") blockId = kindToBlockId(msg.kind);
+
+      // If client didn't specify, use selected hotbar item kind:
+      // (This makes the server resilient even if client forgets to include blockId.)
+      if (!blockId) {
+        ensureSlotsLength(p);
+        const idx = normalizeHotbarIndex(p.hotbarIndex);
+        const uid = String(p.inventory.slots[idx] || "");
+        const it = uid ? p.items.get(uid) : null;
+        const kind = String(it?.kind || "");
+        blockId = kindToBlockId(kind);
+      }
+
+      if (!isBlockIdPlaceable(blockId)) return;
+
+      // consume from hotbar (blocks only)
+      const took = consumeFromHotbar(p, 1);
+      if (took !== 1) {
+        syncEquipToolToHotbar(p);
+        return;
+      }
+
+      this.world.set(x, y, z, blockId);
+      syncEquipToolToHotbar(p);
+
+      this.broadcast("block:update", { x, y, z, id: blockId });
+    });
+
+    // --------------------------------------------------------
+    // Messages: Backwards compatible inventory helpers
+    // (You can keep these, but your client should not use them
+    //  to drive block truth anymore.)
+    // --------------------------------------------------------
+
     this.onMessage("inv:consumeHotbar", (client: Client, msg: InvConsumeHotbarMsg) => {
       const p = this.state.players.get(client.sessionId);
       if (!p) return;
@@ -410,12 +645,9 @@ export class MyRoom extends Room {
       const qtyReq = clamp(Math.floor(Number(msg?.qty ?? 1)), 1, 64);
 
       const took = consumeFromHotbar(p, qtyReq);
-      if (took > 0) {
-        syncEquipToolToHotbar(p);
-      }
+      if (took > 0) syncEquipToolToHotbar(p);
     });
 
-    // ---- ADD items to inventory (blocks only; stacking)
     this.onMessage("inv:add", (client: Client, msg: InvAddMsg) => {
       const p = this.state.players.get(client.sessionId);
       if (!p) return;
@@ -429,7 +661,10 @@ export class MyRoom extends Room {
       syncEquipToolToHotbar(p);
     });
 
-    // ---- Inventory slot moves / stacking / swapping
+    // --------------------------------------------------------
+    // Messages: Inventory slot moves / stacking / swapping
+    // --------------------------------------------------------
+
     this.onMessage("inv:move", (client: Client, msg: InvMoveMsg) => {
       const p = this.state.players.get(client.sessionId);
       if (!p) return;
@@ -508,7 +743,10 @@ export class MyRoom extends Room {
       syncEquipToolToHotbar(p);
     });
 
-    // ---- Split stack in half into first empty slot
+    // --------------------------------------------------------
+    // Messages: Split stack in half into first empty slot
+    // --------------------------------------------------------
+
     this.onMessage("inv:split", (client: Client, msg: InvSplitMsg) => {
       const p = this.state.players.get(client.sessionId);
       if (!p) return;
@@ -554,7 +792,10 @@ export class MyRoom extends Room {
       syncEquipToolToHotbar(p);
     });
 
-    // debug
+    // --------------------------------------------------------
+    // Debug
+    // --------------------------------------------------------
+
     this.onMessage("hello", (client: Client, message: any) => {
       console.log(client.sessionId, "said hello:", message);
       client.send("hello_ack", { ok: true, serverTime: Date.now() });
