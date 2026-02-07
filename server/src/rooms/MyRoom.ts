@@ -1,52 +1,35 @@
 // ============================================================
 // rooms/MyRoom.ts  (FULL REWRITE - NO OMITS, ALL LOGIC INCLUDED)
 // ------------------------------------------------------------
-// Server-authoritative multiplayer room for a NOA-style voxel game.
-//
-// ✅ Includes (all logic):
-// - Typed Colyseus room state (MyRoomState)
+// Includes:
+// - Typed room state (MyRoomState)
 // - Player join/leave
 // - Move replication + sanity clamps
 // - Stamina regen/drain (server authoritative) + sprint toggle
 // - Swing (stamina cost + timed swinging flag)
 // - Hotbar selection (0..8) (server authoritative)
 // - Inventory + equipment slot moves (drag/drop), stacking, split
-// - WorldStore integration (server-authoritative blocks + edits persistence while server runs)
-// - Server-driven world sync:
-//     - onJoin: send "world:patch" with edits near spawn/player
-//     - on break/place: broadcast "block:update" {x,y,z,id}
-//     - on reject: client.send "block:reject" {reason,...}
+// - WorldStore authoritative voxels (base terrain + edits)
+// - Server-authoritative block break/place:
+//    - Reach checks
+//    - Rate limiting
+//    - Inventory consume/add for block kinds
+//    - Broadcast "block:update" for ALL clients
+//    - Send "world:patch" on join (edits around spawn) + on demand
 //
-// ✅ Secure-ish gameplay rules (simple but effective):
-// - Reach check (max distance from player eye to target block center)
-// - Rate limit block actions (break/place) per-client
-// - Place requires block item in selected hotbar
-// - Break requires target not air; mined block adds to inventory if known
-//
-// IMPORTANT NOTES
-// - World is generated deterministically on client+server. Server stores only edits.
-// - Blocks:
-//     0 = air
-//     1 = dirt
-//     2 = grass
-// - Client index.ts expects messages:
-//     "world:patch", "block:update", "block:reject"
-//
-// File deps expected:
-// - ./schema/MyRoomState.js exports: MyRoomState, PlayerState, ItemState
-// - ../world/WorldStore.js exports: WorldStore, BLOCKS
-//   (adjust relative path if your folder layout differs)
+// IMPORTANT NOTES:
+// - This file assumes you created server/world/WorldStore.ts as posted.
+// - Block IDs MUST match client registry:
+//     0 = air, 1 = dirt, 2 = grass
+// - Client should:
+//    - generate base terrain locally
+//    - apply "world:patch" edits
+//    - apply "block:update" edits
 // ============================================================
 
-import { Room, Client } from "@colyseus/core";
-
-import type { MyRoomState } from "./schema/MyRoomState.js";
-
-import { WorldStore, BLOCKS } from "./world/WorldStore.js";
-
-// -----------------------------
-// Types
-// -----------------------------
+import { Room, Client, CloseCode } from "@colyseus/core";
+import { MyRoomState, PlayerState, ItemState } from "./schema/MyRoomState.js";
+import { WorldStore, BLOCKS, type BlockId } from "./world/WorldStore.js";
 
 type JoinOptions = { name?: string };
 
@@ -66,12 +49,20 @@ type HotbarSetMsg = { index: number };
 type InvMoveMsg = { from: string; to: string };
 type InvSplitMsg = { slot: string };
 
+// world block ops (authoritative)
 type BlockBreakMsg = { x: number; y: number; z: number; src?: string };
 type BlockPlaceMsg = { x: number; y: number; z: number; kind: string; src?: string };
 
-// -----------------------------
-// Utils
-// -----------------------------
+// building/mining inventory logic
+type InvConsumeHotbarMsg = { qty?: number };
+type InvAddMsg = { kind: string; qty?: number };
+
+// optional: client request patch around them
+type WorldPatchReqMsg = { x: number; y: number; z: number; r?: number; limit?: number };
+
+// ------------------------------------------------------------
+// utils
+// ------------------------------------------------------------
 
 function isFiniteNum(n: any): n is number {
   return typeof n === "number" && Number.isFinite(n);
@@ -92,15 +83,9 @@ function dist3(ax: number, ay: number, az: number, bx: number, by: number, bz: n
   return Math.sqrt(dx * dx + dy * dy + dz * dz);
 }
 
-function i32(n: any, fallback = 0) {
-  const v = Number(n);
-  if (!Number.isFinite(v)) return fallback;
-  return v | 0;
-}
-
-// -----------------------------
-// Slots + Inventory
-// -----------------------------
+// ------------------------------------------------------------
+// slots + inventory
+// ------------------------------------------------------------
 
 type EquipKey = "head" | "chest" | "legs" | "feet" | "tool" | "offhand";
 
@@ -130,7 +115,7 @@ function parseSlotRef(s: any): SlotRef | null {
 function getTotalSlots(p: PlayerState) {
   const cols = isFiniteNum(p.inventory?.cols) ? p.inventory.cols : 9;
   const rows = isFiniteNum(p.inventory?.rows) ? p.inventory.rows : 4;
-  return Math.max(1, (cols | 0) * (rows | 0));
+  return Math.max(1, cols * rows);
 }
 
 function ensureSlotsLength(p: PlayerState) {
@@ -162,9 +147,9 @@ function setSlotUid(p: PlayerState, slot: SlotRef, uid: string) {
   }
 }
 
-// -----------------------------
-// Item rules
-// -----------------------------
+// ------------------------------------------------------------
+// item rules
+// ------------------------------------------------------------
 
 function isEquipSlotCompatible(slotKey: EquipKey, itemKind: string) {
   if (!itemKind) return true;
@@ -194,21 +179,9 @@ function isBlockKind(kind: string) {
   return typeof kind === "string" && kind.startsWith("block:");
 }
 
-function kindToBlockId(kind: string) {
-  if (kind === "block:dirt") return BLOCKS.DIRT;
-  if (kind === "block:grass") return BLOCKS.GRASS;
-  return BLOCKS.AIR;
-}
-
-function blockIdToKind(id: number) {
-  if (id === BLOCKS.DIRT) return "block:dirt";
-  if (id === BLOCKS.GRASS) return "block:grass";
-  return "";
-}
-
-// -----------------------------
-// Hotbar + equip sync
-// -----------------------------
+// ------------------------------------------------------------
+// hotbar + equip sync
+// ------------------------------------------------------------
 
 function normalizeHotbarIndex(i: any) {
   const n = Number(i);
@@ -241,9 +214,9 @@ function syncEquipToolToHotbar(p: PlayerState) {
   p.equip.tool = uid;
 }
 
-// -----------------------------
-// Inventory add/consume helpers
-// -----------------------------
+// ------------------------------------------------------------
+// inventory add/consume helpers
+// ------------------------------------------------------------
 
 function makeUid(sessionId: string, tag: string) {
   return `${sessionId}:${tag}:${nowMs()}:${Math.floor(Math.random() * 1e9)}`;
@@ -325,7 +298,7 @@ function addKindToInventory(p: PlayerState, kind: string, qty: number) {
   return qty - remaining;
 }
 
-function consumeFromHotbarBlocksOnly(p: PlayerState, qty: number) {
+function consumeFromHotbar(p: PlayerState, qty: number) {
   ensureSlotsLength(p);
 
   const idx = normalizeHotbarIndex(p.hotbarIndex);
@@ -344,7 +317,7 @@ function consumeFromHotbarBlocksOnly(p: PlayerState, qty: number) {
   const take = Math.min(cur, qty);
   it.qty = cur - take;
 
-  if ((it.qty || 0) <= 0) {
+  if (it.qty <= 0) {
     p.inventory.slots[idx] = "";
     p.items.delete(uid);
   }
@@ -352,43 +325,55 @@ function consumeFromHotbarBlocksOnly(p: PlayerState, qty: number) {
   return take;
 }
 
-// -----------------------------
-// Security checks (simple baseline)
-// -----------------------------
+// ------------------------------------------------------------
+// Block mapping (kind <-> blockId)
+// ------------------------------------------------------------
 
-function eyePosOfPlayer(p: PlayerState) {
-  // approximate NOA player eye height
-  return { x: p.x, y: p.y + 1.6, z: p.z };
+function kindToBlockId(kind: string): BlockId {
+  if (kind === "block:dirt") return BLOCKS.DIRT;
+  if (kind === "block:grass") return BLOCKS.GRASS;
+  return BLOCKS.AIR;
 }
 
-function withinReach(p: PlayerState, bx: number, by: number, bz: number, maxReach: number) {
-  const eye = eyePosOfPlayer(p);
-  const cx = bx + 0.5;
-  const cy = by + 0.5;
-  const cz = bz + 0.5;
-  return dist3(eye.x, eye.y, eye.z, cx, cy, cz) <= maxReach;
+function blockIdToKind(id: BlockId): string {
+  if (id === BLOCKS.DIRT) return "block:dirt";
+  if (id === BLOCKS.GRASS) return "block:grass";
+  return "";
 }
 
-// -----------------------------
-// Room
-// -----------------------------
+// ------------------------------------------------------------
+// World op checks
+// ------------------------------------------------------------
+
+function sanitizeInt(n: any, fallback = 0) {
+  const v = Number(n);
+  if (!Number.isFinite(v)) return fallback;
+  return (v | 0) as number;
+}
+
+function isValidBlockCoord(n: any) {
+  const v = Number(n);
+  return Number.isFinite(v) && Math.floor(v) === v;
+}
+
+// ------------------------------------------------------------
+// room
+// ------------------------------------------------------------
 
 export class MyRoom extends Room<MyRoomState> {
   public maxClients = 16;
   public state!: MyRoomState;
 
-  // Server world (edits persist while server stays up)
-  private world: WorldStore;
+  // IMPORTANT: static/shared world per server process
+  // This is what makes edits survive "new roomId" as long as the process stays alive.
+  private static WORLD = new WorldStore({ minCoord: -100000, maxCoord: 100000 });
 
-  // Action rate-limit tracking
-  private lastBlockActionAt = new Map<string, number>();
+  // rate limit maps
+  private lastBlockOpAt = new Map<string, number>();
 
   public onCreate(options: any) {
     this.setState(new MyRoomState());
     console.log("room", this.roomId, "created with options:", options);
-
-    // World
-    this.world = new WorldStore({ minCoord: -100000, maxCoord: 100000 });
 
     // ---- Simulation tick
     const TICK_MS = 50; // 20 Hz
@@ -434,7 +419,7 @@ export class MyRoom extends Room<MyRoomState> {
     }, TICK_MS);
 
     // --------------------------------------------------------
-    // Messages
+    // Messages: movement + stats
     // --------------------------------------------------------
 
     this.onMessage("move", (client: Client, msg: MoveMsg) => {
@@ -467,7 +452,6 @@ export class MyRoom extends Room<MyRoomState> {
       const p = this.state.players.get(client.sessionId);
       if (!p) return;
 
-      // cost handled server-side
       if (p.stamina < SWING_COST) return;
 
       p.stamina = clamp(p.stamina - SWING_COST, 0, p.maxStamina);
@@ -480,6 +464,35 @@ export class MyRoom extends Room<MyRoomState> {
       if (!p) return;
 
       p.hotbarIndex = normalizeHotbarIndex(msg?.index);
+      syncEquipToolToHotbar(p);
+    });
+
+    // --------------------------------------------------------
+    // Messages: inventory
+    // --------------------------------------------------------
+
+    // ---- CONSUME from selected hotbar slot (blocks only)
+    this.onMessage("inv:consumeHotbar", (client: Client, msg: InvConsumeHotbarMsg) => {
+      const p = this.state.players.get(client.sessionId);
+      if (!p) return;
+
+      const qtyReq = clamp(Math.floor(Number(msg?.qty ?? 1)), 1, 64);
+
+      const took = consumeFromHotbar(p, qtyReq);
+      if (took > 0) syncEquipToolToHotbar(p);
+    });
+
+    // ---- ADD items to inventory (blocks only; stacking)
+    this.onMessage("inv:add", (client: Client, msg: InvAddMsg) => {
+      const p = this.state.players.get(client.sessionId);
+      if (!p) return;
+
+      const kind = String(msg?.kind || "");
+      if (!isBlockKind(kind)) return;
+
+      const qtyReq = clamp(Math.floor(Number(msg?.qty ?? 1)), 1, 64);
+
+      addKindToInventory(p, kind, qtyReq);
       syncEquipToolToHotbar(p);
     });
 
@@ -609,140 +622,195 @@ export class MyRoom extends Room<MyRoomState> {
     });
 
     // --------------------------------------------------------
-    // WORLD: break/place (server authoritative)
+    // Messages: world patches
     // --------------------------------------------------------
 
-    const MAX_REACH = 8.0; // keep aligned with client feel
-    const MIN_ACTION_MS = 90; // rate limit per client
+    this.onMessage("world:patch:req", (client: Client, msg: WorldPatchReqMsg) => {
+      const p = this.state.players.get(client.sessionId);
+      if (!p) return;
 
-    const reject = (client: Client, payload: any) => {
-      try {
-        client.send("block:reject", payload);
-      } catch {}
+      const cx = sanitizeInt(msg?.x, Math.floor(p.x));
+      const cy = sanitizeInt(msg?.y, Math.floor(p.y));
+      const cz = sanitizeInt(msg?.z, Math.floor(p.z));
+
+      const r = clamp(Math.floor(Number(msg?.r ?? 64)), 8, 512);
+      const limit = clamp(Math.floor(Number(msg?.limit ?? 5000)), 100, 50000);
+
+      const patch = MyRoom.WORLD.encodePatchAround({ x: cx, y: cy, z: cz }, r, { limit });
+
+      client.send("world:patch", patch);
+    });
+
+    // --------------------------------------------------------
+    // Messages: authoritative block break/place
+    // --------------------------------------------------------
+
+    const BLOCK_REACH = 7.5;
+    const BLOCK_OP_COOLDOWN_MS = 90; // ~11/sec
+    const MAX_COORD = 100000;
+
+    const reject = (client: Client, reason: string, extra?: any) => {
+      client.send("block:reject", { reason, ...(extra || {}) });
     };
 
-    const broadcastUpdate = (x: number, y: number, z: number, id: number) => {
-      try {
-        this.broadcast("block:update", { x, y, z, id });
-      } catch {}
-    };
-
-    const rateLimitOk = (sid: string) => {
+    const canOpNow = (sid: string) => {
       const t = nowMs();
-      const last = this.lastBlockActionAt.get(sid) || 0;
-      if (t - last < MIN_ACTION_MS) return false;
-      this.lastBlockActionAt.set(sid, t);
+      const last = this.lastBlockOpAt.get(sid) || 0;
+      if (t - last < BLOCK_OP_COOLDOWN_MS) return false;
+      this.lastBlockOpAt.set(sid, t);
       return true;
+    };
+
+    const withinWorld = (x: number, y: number, z: number) => {
+      return (
+        x >= -MAX_COORD &&
+        x <= MAX_COORD &&
+        y >= -MAX_COORD &&
+        y <= MAX_COORD &&
+        z >= -MAX_COORD &&
+        z <= MAX_COORD
+      );
     };
 
     this.onMessage("block:break", (client: Client, msg: BlockBreakMsg) => {
       const p = this.state.players.get(client.sessionId);
       if (!p) return;
 
-      if (!rateLimitOk(client.sessionId)) {
-        reject(client, { reason: "rate_limit", op: "break" });
+      const src = String(msg?.src || "unknown");
+
+      if (!canOpNow(client.sessionId)) {
+        reject(client, "rate_limited", { op: "break", src });
         return;
       }
 
-      const x = i32(msg?.x, 0);
-      const y = i32(msg?.y, 0);
-      const z = i32(msg?.z, 0);
-
-      // reach check
-      if (!withinReach(p, x, y, z, MAX_REACH)) {
-        reject(client, { reason: "out_of_reach", op: "break", x, y, z });
+      if (!isValidBlockCoord(msg?.x) || !isValidBlockCoord(msg?.y) || !isValidBlockCoord(msg?.z)) {
+        reject(client, "bad_coords", { op: "break", src });
         return;
       }
 
-      const prevId = this.world.getBlock(x, y, z);
+      const x = sanitizeInt(msg.x, 0);
+      const y = sanitizeInt(msg.y, 0);
+      const z = sanitizeInt(msg.z, 0);
+
+      if (!withinWorld(x, y, z)) {
+        reject(client, "out_of_bounds", { op: "break", src });
+        return;
+      }
+
+      // reach check (player eye approx)
+      const eyeX = p.x;
+      const eyeY = p.y + 1.6;
+      const eyeZ = p.z;
+
+      const blockCenterX = x + 0.5;
+      const blockCenterY = y + 0.5;
+      const blockCenterZ = z + 0.5;
+
+      const d = dist3(eyeX, eyeY, eyeZ, blockCenterX, blockCenterY, blockCenterZ);
+      if (d > BLOCK_REACH) {
+        reject(client, "too_far", { op: "break", src, d: Number(d.toFixed(2)) });
+        return;
+      }
+
+      const prevId = MyRoom.WORLD.getBlock(x, y, z);
       if (prevId === BLOCKS.AIR) {
-        reject(client, { reason: "already_air", op: "break", x, y, z });
+        reject(client, "nothing_to_break", { op: "break", src });
         return;
       }
 
-      // apply break
-      const res = this.world.applyBreak(x, y, z);
+      const { newId } = MyRoom.WORLD.applyBreak(x, y, z);
 
-      // add to inventory (if known)
+      // inventory add for known blocks
       const kind = blockIdToKind(prevId);
-      if (kind) {
-        addKindToInventory(p, kind, 1);
-      }
+      if (kind) addKindToInventory(p, kind, 1);
 
-      syncEquipToolToHotbar(p);
+      // Broadcast authoritative update
+      this.broadcast("block:update", { x, y, z, id: newId });
 
-      // broadcast authoritative update
-      broadcastUpdate(x, y, z, res.newId);
+      // server debug
+      // eslint-disable-next-line no-console
+      console.log(
+        `[WORLD] break by=${client.sessionId} src=${src} at=${x},${y},${z} prev=${prevId} edits=${MyRoom.WORLD.editsCount()}`
+      );
     });
 
     this.onMessage("block:place", (client: Client, msg: BlockPlaceMsg) => {
       const p = this.state.players.get(client.sessionId);
       if (!p) return;
 
-      if (!rateLimitOk(client.sessionId)) {
-        reject(client, { reason: "rate_limit", op: "place" });
+      const src = String(msg?.src || "unknown");
+
+      if (!canOpNow(client.sessionId)) {
+        reject(client, "rate_limited", { op: "place", src });
         return;
       }
 
-      const x = i32(msg?.x, 0);
-      const y = i32(msg?.y, 0);
-      const z = i32(msg?.z, 0);
+      if (!isValidBlockCoord(msg?.x) || !isValidBlockCoord(msg?.y) || !isValidBlockCoord(msg?.z)) {
+        reject(client, "bad_coords", { op: "place", src });
+        return;
+      }
+
       const kind = String(msg?.kind || "");
-
       if (!isBlockKind(kind)) {
-        reject(client, { reason: "not_a_block_kind", op: "place", kind });
+        reject(client, "not_a_block_item", { op: "place", src, kind });
         return;
       }
 
-      // reach check
-      if (!withinReach(p, x, y, z, MAX_REACH)) {
-        reject(client, { reason: "out_of_reach", op: "place", x, y, z });
+      const x = sanitizeInt(msg.x, 0);
+      const y = sanitizeInt(msg.y, 0);
+      const z = sanitizeInt(msg.z, 0);
+
+      if (!withinWorld(x, y, z)) {
+        reject(client, "out_of_bounds", { op: "place", src });
         return;
       }
 
-      // must be empty on server
-      const existing = this.world.getBlock(x, y, z);
+      // reach check (player eye approx)
+      const eyeX = p.x;
+      const eyeY = p.y + 1.6;
+      const eyeZ = p.z;
+
+      const blockCenterX = x + 0.5;
+      const blockCenterY = y + 0.5;
+      const blockCenterZ = z + 0.5;
+
+      const d = dist3(eyeX, eyeY, eyeZ, blockCenterX, blockCenterY, blockCenterZ);
+      if (d > BLOCK_REACH) {
+        reject(client, "too_far", { op: "place", src, d: Number(d.toFixed(2)) });
+        return;
+      }
+
+      // must be empty
+      const existing = MyRoom.WORLD.getBlock(x, y, z);
       if (existing !== BLOCKS.AIR) {
-        reject(client, { reason: "occupied", op: "place", x, y, z, existing });
+        reject(client, "occupied", { op: "place", src, existing });
         return;
       }
 
-      // must have block in selected hotbar
-      ensureSlotsLength(p);
-      const hot = normalizeHotbarIndex(p.hotbarIndex);
-      const uid = String(p.inventory.slots[hot] || "");
-      if (!uid) {
-        reject(client, { reason: "hotbar_empty", op: "place", x, y, z });
+      const blockId = kindToBlockId(kind);
+      if (blockId === BLOCKS.AIR) {
+        reject(client, "unknown_block_kind", { op: "place", src, kind });
         return;
       }
 
-      const it = p.items.get(uid);
-      if (!it) {
-        reject(client, { reason: "hotbar_item_missing", op: "place", x, y, z });
-        return;
-      }
-
-      const itemKind = String(it.kind || "");
-      if (itemKind !== kind) {
-        reject(client, { reason: "hotbar_kind_mismatch", op: "place", x, y, z, need: kind, have: itemKind });
-        return;
-      }
-
-      // consume 1 from hotbar
-      const took = consumeFromHotbarBlocksOnly(p, 1);
+      // consume from hotbar
+      const took = consumeFromHotbar(p, 1);
       if (took <= 0) {
-        reject(client, { reason: "consume_failed", op: "place", x, y, z });
+        reject(client, "no_blocks_in_hotbar", { op: "place", src });
         return;
       }
 
-      // apply place
-      const id = kindToBlockId(kind);
-      const res = this.world.applyPlace(x, y, z, id);
+      // place into world
+      const { newId } = MyRoom.WORLD.applyPlace(x, y, z, blockId);
 
-      syncEquipToolToHotbar(p);
+      // Broadcast authoritative update
+      this.broadcast("block:update", { x, y, z, id: newId });
 
-      // broadcast authoritative update
-      broadcastUpdate(x, y, z, res.newId);
+      // server debug
+      // eslint-disable-next-line no-console
+      console.log(
+        `[WORLD] place by=${client.sessionId} src=${src} kind=${kind} at=${x},${y},${z} edits=${MyRoom.WORLD.editsCount()}`
+      );
     });
 
     // debug
@@ -823,28 +891,25 @@ export class MyRoom extends Room<MyRoomState> {
 
     this.state.players.set(client.sessionId, p);
 
-    // Send welcome
+    // Send welcome + world patch around spawn
     client.send("welcome", {
       roomId: this.roomId,
       sessionId: client.sessionId,
     });
 
-    // Send world patch (edits near player/spawn)
-    // radius should cover what the player can see; start modest to avoid huge payloads
-    const center = { x: p.x | 0, y: p.y | 0, z: p.z | 0 };
-    const radiusBlocks = 128;
-    const patch = this.world.encodePatchAround(center, radiusBlocks, { limit: 5000 });
-
+    // Patch radius around spawn (enough for initial view)
+    const patch = MyRoom.WORLD.encodePatchAround({ x: 0, y: 10, z: 0 }, 96, { limit: 8000 });
     client.send("world:patch", patch);
-    if (patch.truncated) {
-      client.send("block:reject", { reason: "world_patch_truncated", radiusBlocks, limit: 5000 });
-    }
+
+    console.log(
+      `[WORLD] sent world:patch to=${client.sessionId} edits=${patch.edits.length} truncated=${patch.truncated} totalEdits=${MyRoom.WORLD.editsCount()}`
+    );
   }
 
-  public onLeave(client: Client) {
-    console.log(client.sessionId, "left!");
+  public onLeave(client: Client, code: CloseCode) {
+    console.log(client.sessionId, "left!", code);
     this.state.players.delete(client.sessionId);
-    this.lastBlockActionAt.delete(client.sessionId);
+    this.lastBlockOpAt.delete(client.sessionId);
   }
 
   public onDispose() {

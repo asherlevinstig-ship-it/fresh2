@@ -1,19 +1,25 @@
 // ============================================================
-// server/world/WorldStore.ts  (FULL REWRITE - NO OMITS)
+// server/world/WorldStore.ts  (FULL REWRITE - NO OMITS, ALL LOGIC INCLUDED)
 // ------------------------------------------------------------
 // Purpose:
 // - Server-authoritative voxel world for a NOA-style Minecraft clone.
 // - Deterministic base terrain generation (must match client).
 // - Stores ONLY edits (placed/broken blocks) in a compact Map.
-// - Supports patching for late joiners / resync.
-// - Optional disk persistence so edits survive server restarts.
+// - Supports chunk snapshots + patching for late joiners.
+// - OPTIONAL persistence helpers:
+//     - saveToFile/loadFromFile (great for local dev / self-host)
+//     - serialize/deserialize for plugging into Redis/DB later
 //
 // IMPORTANT:
 // - Block IDs MUST match the client registry:
 //     0 = air
 //     1 = dirt
 //     2 = grass
-// - Base terrain function MUST match client getVoxelID(x,y,z).
+// - Base terrain function MUST match client getVoxelID(x,y,z):
+//     height = 2*sin(x/10) + 3*cos(z/20)
+//     if y < height - 1 => dirt
+//     else if y < height => grass
+//     else air
 //
 // API:
 //   - getBaseBlock(x,y,z) -> number
@@ -24,22 +30,15 @@
 //   - getEditsInAABB(min,max) -> array of {x,y,z,id}
 //   - getAllEdits() -> array of {x,y,z,id}
 //   - makeChunkSnapshot(chunkX,chunkY,chunkZ,chunkSize) -> Uint16Array
-//   - encodeEditsPatch(...) -> { edits: {x,y,z,id}[]; truncated:boolean }
-//   - encodePatchAround(center,radius,opts) -> { edits: ...; truncated:boolean }
-//
-// Persistence (optional):
-//   - loadFromDisk(path?)
-//   - saveToDisk(path?)
-//   - queueSaveToDisk(path?)  (debounced)
-//
-// Notes:
-// - WorldStore does NOT do inventory, reach checks, or permission checks.
-//   That logic lives in the Room.
-// - Coordinates are assumed integer block coords.
+//   - encodeEditsPatch(min,max,{limit}) -> { edits, truncated }
+//   - encodePatchAround(center,radius,{limit}) -> { edits, truncated }
+//   - serialize() -> { version, edits:[...] }
+//   - applySerialized(data, {replace}) -> void
+//   - saveToFile(path) / loadFromFile(path, {replace})
 // ============================================================
 
-import fs from "node:fs";
-import path from "node:path";
+import * as fs from "node:fs";
+import * as path from "node:path";
 
 export type BlockId = number;
 
@@ -51,9 +50,10 @@ export const BLOCKS = {
 
 export type WorldEdit = { x: number; y: number; z: number; id: BlockId };
 
-// ------------------------------------------------------------
-// utils
-// ------------------------------------------------------------
+type SerializedWorld = {
+  version: number;
+  edits: WorldEdit[];
+};
 
 function isFiniteNum(n: any): n is number {
   return typeof n === "number" && Number.isFinite(n);
@@ -71,11 +71,10 @@ function i32(n: any, fallback = 0) {
 
 /** String key for Map storage */
 function keyOf(x: number, y: number, z: number) {
-  // Fast + stable + readable
   return `${x}|${y}|${z}`;
 }
 
-/** Inverse for debugging or utilities */
+/** Inverse for utilities / persistence parsing */
 function parseKey(k: string): { x: number; y: number; z: number } | null {
   if (typeof k !== "string") return null;
   const parts = k.split("|");
@@ -87,17 +86,9 @@ function parseKey(k: string): { x: number; y: number; z: number } | null {
   return { x: x | 0, y: y | 0, z: z | 0 };
 }
 
-// ------------------------------------------------------------
-// base terrain (MUST MATCH CLIENT)
-// ------------------------------------------------------------
-
 /**
  * Deterministic base terrain function.
- * MUST match the client:
- *   height = 2*sin(x/10) + 3*cos(z/20)
- *   if y < height - 1 => dirt
- *   else if y < height => grass
- *   else air
+ * MUST match the client.
  */
 export function getBaseVoxelID(x: number, y: number, z: number): BlockId {
   const height = 2 * Math.sin(x / 10) + 3 * Math.cos(z / 20);
@@ -107,42 +98,67 @@ export function getBaseVoxelID(x: number, y: number, z: number): BlockId {
   return BLOCKS.AIR;
 }
 
-// ------------------------------------------------------------
-// WorldStore
-// ------------------------------------------------------------
-
 /**
  * WorldStore keeps ONLY edits vs base terrain.
  * If an edit matches the base, it is removed (keeps map small).
  */
 export class WorldStore {
-  /** Map of coordinate key -> blockId */
   private edits: Map<string, BlockId>;
 
-  /** Optional bounds guard */
   public readonly minCoord: number;
   public readonly maxCoord: number;
 
-  /** persistence */
-  private readonly defaultSavePath: string;
-  private _saveQueued: boolean = false;
-  private _lastSaveOk: boolean = false;
+  // Simple dirty flag + throttled autosave support
+  private _dirty: boolean = false;
+  private _lastSaveAt: number = 0;
+  private _autosavePath: string | null = null;
+  private _autosaveMinIntervalMs: number = 2500;
 
-  constructor(opts?: { minCoord?: number; maxCoord?: number; savePath?: string }) {
+  constructor(opts?: { minCoord?: number; maxCoord?: number; seed?: number; autosavePath?: string; autosaveMinIntervalMs?: number }) {
     this.edits = new Map();
 
     this.minCoord = isFiniteNum(opts?.minCoord) ? (opts!.minCoord as number) : -100000;
     this.maxCoord = isFiniteNum(opts?.maxCoord) ? (opts!.maxCoord as number) : 100000;
 
-    this.defaultSavePath =
-      typeof opts?.savePath === "string" && opts.savePath.trim()
-        ? opts.savePath.trim()
-        : path.join(process.cwd(), "world_edits.json");
+    if (typeof opts?.autosavePath === "string" && opts.autosavePath.trim()) {
+      this._autosavePath = opts.autosavePath.trim();
+    }
+    if (isFiniteNum(opts?.autosaveMinIntervalMs)) {
+      this._autosaveMinIntervalMs = Math.max(250, (opts!.autosaveMinIntervalMs as number) | 0);
+    }
   }
 
-  // ----------------------------------------------------------
-  // sanitize
-  // ----------------------------------------------------------
+  /** Enable/disable autosave (file). */
+  public configureAutosave(opts: { path?: string | null; minIntervalMs?: number }) {
+    if (typeof opts.path === "string" && opts.path.trim()) this._autosavePath = opts.path.trim();
+    if (opts.path === null) this._autosavePath = null;
+
+    if (isFiniteNum(opts.minIntervalMs)) {
+      this._autosaveMinIntervalMs = Math.max(250, (opts.minIntervalMs as number) | 0);
+    }
+  }
+
+  /** Mark dirty and (optionally) autosave. */
+  private markDirty() {
+    this._dirty = true;
+    this.maybeAutosave();
+  }
+
+  /** Autosave if enabled and throttled interval passed. */
+  private maybeAutosave() {
+    if (!this._autosavePath) return;
+    const now = Date.now();
+    if (!this._dirty) return;
+    if (now - this._lastSaveAt < this._autosaveMinIntervalMs) return;
+
+    try {
+      this.saveToFileSync(this._autosavePath);
+      this._lastSaveAt = now;
+      this._dirty = false;
+    } catch {
+      // keep dirty; next attempt may succeed
+    }
+  }
 
   /** Clamp coords into safe range for sanity */
   public sanitizeCoord(n: any) {
@@ -158,10 +174,6 @@ export class WorldStore {
       z: this.sanitizeCoord(z),
     };
   }
-
-  // ----------------------------------------------------------
-  // read/write blocks
-  // ----------------------------------------------------------
 
   /** Base block at coordinate (no edits considered) */
   public getBaseBlock(x: number, y: number, z: number): BlockId {
@@ -194,13 +206,18 @@ export class WorldStore {
     const k = keyOf(x, y, z);
 
     if (id === base) {
-      this.edits.delete(k);
-      this.queueSaveToDisk();
+      if (this.edits.has(k)) {
+        this.edits.delete(k);
+        this.markDirty();
+      }
       return base;
     }
 
-    this.edits.set(k, id);
-    this.queueSaveToDisk();
+    const prev = this.edits.get(k);
+    if (prev !== id) {
+      this.edits.set(k, id);
+      this.markDirty();
+    }
     return id;
   }
 
@@ -231,17 +248,17 @@ export class WorldStore {
     return { prevId, newId };
   }
 
-  // ----------------------------------------------------------
-  // edits inspection
-  // ----------------------------------------------------------
-
+  /** Returns the internal edits Map size */
   public editsCount() {
     return this.edits.size;
   }
 
+  /** Remove all edits (world reset) */
   public clearAllEdits() {
-    this.edits.clear();
-    this.queueSaveToDisk();
+    if (this.edits.size > 0) {
+      this.edits.clear();
+      this.markDirty();
+    }
   }
 
   /** Get all edits as an array (careful: can be big) */
@@ -257,7 +274,6 @@ export class WorldStore {
 
   /**
    * Get edits inside an axis-aligned bounding box (inclusive).
-   * Useful for world:patch around the player or within loaded chunk radius.
    */
   public getEditsInAABB(
     min: { x: number; y: number; z: number },
@@ -272,8 +288,6 @@ export class WorldStore {
 
     const out: WorldEdit[] = [];
 
-    // NOTE: This is O(edits). Fine for small maps.
-    // If you grow big, index by chunk key.
     for (const [k, id] of this.edits.entries()) {
       const p = parseKey(k);
       if (!p) continue;
@@ -323,12 +337,8 @@ export class WorldStore {
     return arr;
   }
 
-  // ----------------------------------------------------------
-  // patch encoding (for clients)
-  // ----------------------------------------------------------
-
   /**
-   * Encode a patch payload for the client (plain JSON).
+   * Encode a patch payload for the client. Keeps it plain JSON.
    * Provide an area; you get back only edits in that area.
    */
   public encodeEditsPatch(
@@ -341,7 +351,7 @@ export class WorldStore {
     const limit = isFiniteNum(opts?.limit) ? Math.max(1, (opts!.limit as number) | 0) : 5000;
 
     if (edits.length > limit) {
-      edits.length = limit; // deterministic trim
+      edits.length = limit;
       return { edits, truncated: true };
     }
 
@@ -362,79 +372,127 @@ export class WorldStore {
     return this.encodeEditsPatch(min, max, opts);
   }
 
-  // ----------------------------------------------------------
-  // persistence (optional but recommended)
-  // ----------------------------------------------------------
+  // ==========================================================
+  // Persistence helpers
+  // ==========================================================
 
-  public getSavePath() {
-    return this.defaultSavePath;
+  /** Serialize world edits to a JSON-friendly structure. */
+  public serialize(): SerializedWorld {
+    return {
+      version: 1,
+      edits: this.getAllEdits(),
+    };
   }
 
-  public lastSaveOk() {
-    return this._lastSaveOk;
-  }
+  /**
+   * Apply serialized data.
+   * - replace=true clears existing edits first.
+   * - Any edit matching base will be dropped automatically.
+   */
+  public applySerialized(data: any, opts?: { replace?: boolean }) {
+    const replace = !!opts?.replace;
 
-  public loadFromDisk(customPath?: string) {
-    const p = (customPath || this.defaultSavePath).trim();
+    if (!data || typeof data !== "object") return;
+    const ver = Number((data as any).version || 0);
+    if (!Number.isFinite(ver) || ver < 1) return;
 
-    try {
-      if (!fs.existsSync(p)) return false;
+    const editsArr = (data as any).edits;
+    if (!Array.isArray(editsArr)) return;
 
-      const raw = fs.readFileSync(p, "utf8");
-      const data = JSON.parse(raw);
+    if (replace) this.edits.clear();
 
-      this.edits.clear();
+    for (const e of editsArr) {
+      const x = i32(e?.x, 0);
+      const y = i32(e?.y, 0);
+      const z = i32(e?.z, 0);
+      const id = i32(e?.id, BLOCKS.AIR);
 
-      const arr = Array.isArray(data?.edits) ? data.edits : [];
-      for (const e of arr) {
-        const x = this.sanitizeCoord(e?.x);
-        const y = this.sanitizeCoord(e?.y);
-        const z = this.sanitizeCoord(e?.z);
-        const id = i32(e?.id, BLOCKS.AIR);
+      // clamp coords to store bounds
+      const sx = clamp(x, this.minCoord, this.maxCoord) | 0;
+      const sy = clamp(y, this.minCoord, this.maxCoord) | 0;
+      const sz = clamp(z, this.minCoord, this.maxCoord) | 0;
 
-        // setBlock handles delta-vs-base correctly (removes if matches base)
-        const base = this.getBaseBlock(x, y, z);
-        const k = keyOf(x, y, z);
+      // store as delta vs base
+      const base = this.getBaseBlock(sx, sy, sz);
+      const k = keyOf(sx, sy, sz);
 
-        if (id === base) {
-          this.edits.delete(k);
-        } else {
-          this.edits.set(k, id);
-        }
+      if (id === base) {
+        this.edits.delete(k);
+      } else {
+        this.edits.set(k, id);
       }
-
-      this._lastSaveOk = true;
-      return true;
-    } catch (err) {
-      console.error("[WorldStore] loadFromDisk failed:", err);
-      this._lastSaveOk = false;
-      return false;
     }
+
+    this._dirty = false;
   }
 
-  public saveToDisk(customPath?: string) {
-    const p = (customPath || this.defaultSavePath).trim();
+  /** Ensure parent directory exists. */
+  private ensureDirForFile(filePath: string) {
+    const dir = path.dirname(filePath);
+    if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
+  }
+
+  /** Save serialized world to disk (sync). */
+  public saveToFileSync(filePath: string) {
+    const fp = String(filePath || "").trim();
+    if (!fp) throw new Error("saveToFileSync: invalid path");
+
+    this.ensureDirForFile(fp);
+
+    const data = this.serialize();
+    const json = JSON.stringify(data);
+
+    fs.writeFileSync(fp, json, "utf8");
+    this._dirty = false;
+    this._lastSaveAt = Date.now();
+  }
+
+  /** Load serialized world from disk (sync). */
+  public loadFromFileSync(filePath: string, opts?: { replace?: boolean }) {
+    const fp = String(filePath || "").trim();
+    if (!fp) throw new Error("loadFromFileSync: invalid path");
+
+    if (!fs.existsSync(fp)) return false;
+
+    const raw = fs.readFileSync(fp, "utf8");
+    const data = JSON.parse(raw);
+
+    this.applySerialized(data, { replace: opts?.replace ?? true });
+    return true;
+  }
+
+  /** Save serialized world to disk (async). */
+  public async saveToFile(filePath: string) {
+    const fp = String(filePath || "").trim();
+    if (!fp) throw new Error("saveToFile: invalid path");
+
+    this.ensureDirForFile(fp);
+
+    const data = this.serialize();
+    const json = JSON.stringify(data);
+
+    await fs.promises.writeFile(fp, json, "utf8");
+    this._dirty = false;
+    this._lastSaveAt = Date.now();
+  }
+
+  /** Load serialized world from disk (async). */
+  public async loadFromFile(filePath: string, opts?: { replace?: boolean }) {
+    const fp = String(filePath || "").trim();
+    if (!fp) throw new Error("loadFromFile: invalid path");
 
     try {
-      const edits = this.getAllEdits();
-      fs.writeFileSync(p, JSON.stringify({ edits }, null, 2), "utf8");
-      this._lastSaveOk = true;
+      const raw = await fs.promises.readFile(fp, "utf8");
+      const data = JSON.parse(raw);
+      this.applySerialized(data, { replace: opts?.replace ?? true });
       return true;
-    } catch (err) {
-      console.error("[WorldStore] saveToDisk failed:", err);
-      this._lastSaveOk = false;
+    } catch {
       return false;
     }
   }
 
-  /** Debounced save to avoid writing every block hit */
-  public queueSaveToDisk(customPath?: string) {
-    if (this._saveQueued) return;
-    this._saveQueued = true;
-
-    setTimeout(() => {
-      this._saveQueued = false;
-      this.saveToDisk(customPath);
-    }, 250);
+  /** Whether edits have changed since last save. */
+  public isDirty() {
+    return !!this._dirty;
   }
 }
