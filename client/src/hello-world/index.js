@@ -7,23 +7,24 @@
  *   - F4 toggle, F6 clear, F7 toggle console mirroring
  * - F2 toggles browser context menu (for inspector if you still want it)
  * - F3 toggles build debug logs
- * - World generation: grass top layer, dirt below
+ * - World generation: grass top layer, dirt below (CLIENT BASE TERRAIN)
  * - First/Third person view mode enforcement EVERY FRAME
  * - FPS rig + 3rd-person avatar rigs (local + remote)
  * - Crosshair overlay
  * - Hotbar overlay (inv:0..8), server-authoritative hotbarIndex
  * - Inventory overlay (I) with drag/drop and split (right-click inside UI)
  * - Colyseus (@colyseus/sdk) state sync + remote interpolation
- * - Mining: SERVER authoritative world:
- *    - Client sends block:break {x,y,z}
- *    - Client applies block:update / world:patch from server
- *    - Inventory add occurs server-side in response to break
- * - Building: SERVER authoritative world:
- *    - Client sends block:place {x,y,z,kind}
- *    - Server consumes hotbar + broadcasts block:update
- *    - Right-click places ONLY when context menu is disabled
- *    - Always available via KeyB / KeyE (even when context menu is enabled)
- *    - Logs reasons to UI console so you can debug in-game
+ * - Mining/Building: 100% SERVER-DRIVEN BLOCKS
+ *    - Client sends intents:
+ *       - block:break {x,y,z}
+ *       - block:place {x,y,z,kind}
+ *    - Server broadcasts:
+ *       - block:update {x,y,z,id}   (client applies noa.setBlock)
+ *    - Server sends on join:
+ *       - world:patch {edits:[{x,y,z,id}], truncated:boolean}
+ * - Right-click places ONLY when context menu is disabled
+ * - Always build via KeyB / KeyE (even when context menu is enabled)
+ * - Logs reasons to UI console so you can debug in-game
  */
 
 import { Engine } from "noa-engine";
@@ -387,7 +388,7 @@ function safeNum(v, fallback = 0) {
   return typeof v === "number" && Number.isFinite(v) ? v : fallback;
 }
 
-function clamp2(v, a, b) {
+function clamp(v, a, b) {
   return Math.max(a, Math.min(b, v));
 }
 
@@ -446,7 +447,7 @@ function getSafePlayerPos() {
 
   if (isFinite3(p)) {
     const x = p[0];
-    const y = clamp2(p[1], -100000, 100000);
+    const y = clamp(p[1], -100000, 100000);
     const z = p[2];
     STATE.lastValidPlayerPos = [x, y, z];
     return STATE.lastValidPlayerPos;
@@ -1026,7 +1027,7 @@ function createInventoryOverlay() {
 const inventoryUI = createInventoryOverlay();
 
 /* ============================================================
- * WORLD GENERATION (CLIENT BASE TERRAIN)
+ * WORLD GENERATION (CLIENT BASE TERRAIN ONLY)
  * ============================================================
  */
 
@@ -1257,7 +1258,7 @@ function enforceViewModeEveryFrame() {
     noa.camera.zoomDistance = 0;
     noa.camera.currentZoom = 0;
   } else {
-    const z = clamp2(noa.camera.zoomDistance || 6, 2, 12);
+    const z = clamp(noa.camera.zoomDistance || 6, 2, 12);
     noa.camera.zoomDistance = z;
     noa.camera.currentZoom = z;
   }
@@ -1310,7 +1311,7 @@ function hardFollowThirdPersonCamera() {
 
   const target = MESH.avatarRoot.position.clone();
   const heading = safeNum(noa.camera.heading, 0);
-  const dist = clamp2(noa.camera.zoomDistance || 6, 2, 12);
+  const dist = clamp(noa.camera.zoomDistance || 6, 2, 12);
 
   const backDir = new BABYLON.Vector3(Math.sin(heading), 0, Math.cos(heading));
   const back = backDir.scale(-dist);
@@ -1344,22 +1345,22 @@ function updateFpsRig(dt, speed) {
   STATE.lastHeading = heading;
   STATE.lastPitch = pitch;
 
-  const bobRate = clamp2(speed * 7, 0, 12);
+  const bobRate = clamp(speed * 7, 0, 12);
   STATE.bobPhase += bobRate * dt;
   const bobY = Math.sin(STATE.bobPhase) * 0.03;
   const bobX = Math.sin(STATE.bobPhase * 0.5) * 0.015;
 
-  const swayX = clamp2(-dHeading * 1.6, -0.08, 0.08);
-  const swayY = clamp2(dPitch * 1.2, -0.06, 0.06);
+  const swayX = clamp(-dHeading * 1.6, -0.08, 0.08);
+  const swayY = clamp(dPitch * 1.2, -0.06, 0.06);
 
   let swingAmt = 0;
   if (STATE.swingT < STATE.swingDuration) {
-    const t = clamp2(STATE.swingT / STATE.swingDuration, 0, 1);
+    const t = clamp(STATE.swingT / STATE.swingDuration, 0, 1);
     swingAmt = Math.sin(t * Math.PI) * 1.0;
   }
 
   const wr = MESH.weaponRoot;
-  const s = clamp2(dt * 12, 0, 1);
+  const s = clamp(dt * 12, 0, 1);
 
   const targetPos = new BABYLON.Vector3(bobX + swayX * 0.8, -0.02 + bobY - swingAmt * 0.04, 0);
 
@@ -1382,7 +1383,7 @@ function updateFpsRig(dt, speed) {
 function updateAvatarAnim(parts, speed, grounded, isSwing) {
   if (!parts || !parts.root || !parts.root.isEnabled()) return;
 
-  const walkAmp = grounded ? clamp2(speed / 4.5, 0, 1) : 0;
+  const walkAmp = grounded ? clamp(speed / 4.5, 0, 1) : 0;
   const walkPhase = STATE.bobPhase * 0.6;
 
   const legSwing = Math.sin(walkPhase) * 0.7 * walkAmp;
@@ -1394,7 +1395,7 @@ function updateAvatarAnim(parts, speed, grounded, isSwing) {
 
   let swingAmt = 0;
   if (isSwing) {
-    const t = clamp2(STATE.swingT / STATE.swingDuration, 0, 1);
+    const t = clamp(STATE.swingT / STATE.swingDuration, 0, 1);
     swingAmt = Math.sin(t * Math.PI) * 1.0;
   }
 
@@ -1449,6 +1450,12 @@ function getSelectedHotbarItem() {
   const uid = LOCAL_INV.slots?.[idx] || "";
   const it = uid ? LOCAL_INV.items?.[uid] : null;
   return { idx, uid, it };
+}
+
+function kindToBlockId(kind) {
+  if (kind === "block:dirt") return dirtID;
+  if (kind === "block:grass") return grassID;
+  return 0;
 }
 
 /* ============================================================
@@ -1655,11 +1662,11 @@ function sendSwing() {
 }
 
 /* ============================================================
- * BUILDING (SERVER AUTH)
+ * BUILDING (SERVER-DRIVEN)
  * ============================================================
  */
 
-function canPlaceAtClientHint(x, y, z) {
+function canPlaceAt(x, y, z) {
   // prevent placing inside player
   const p = getSafePlayerPos();
   const px = p[0],
@@ -1673,7 +1680,7 @@ function canPlaceAtClientHint(x, y, z) {
   const insidePlayer = dx < 0.45 && dz < 0.45 && dy < 1.0;
   if (insidePlayer) return false;
 
-  // must be empty (local hint only; server final)
+  // must be empty (client hint only; server is authority)
   return noa.getBlock(x, y, z) === 0;
 }
 
@@ -1685,11 +1692,6 @@ function placeSelectedBlock(source = "unknown") {
 
   STATE.swingT = 0;
   sendSwing();
-
-  if (!colyRoom) {
-    if (DEBUG_BUILD) uiWarn("[BUILD] no room; cannot place", "src=", source);
-    return;
-  }
 
   if (!noa.targetedBlock) {
     if (DEBUG_BUILD) uiWarn("[BUILD] no targetedBlock (aim at a block face)", "src=", source);
@@ -1709,10 +1711,16 @@ function placeSelectedBlock(source = "unknown") {
     return;
   }
 
+  const blockId = kindToBlockId(kind);
+  if (!blockId) {
+    if (DEBUG_BUILD) uiWarn("[BUILD] no blockId mapping for:", kind, "src=", source);
+    return;
+  }
+
   const pos = noa.targetedBlock.adjacent;
-  const x = pos[0],
-    y = pos[1],
-    z = pos[2];
+  const x = pos[0] | 0,
+    y = pos[1] | 0,
+    z = pos[2] | 0;
 
   const camPos = STATE.scene?.activeCamera?.position;
   if (camPos) {
@@ -1726,18 +1734,22 @@ function placeSelectedBlock(source = "unknown") {
     }
   }
 
-  if (!canPlaceAtClientHint(x, y, z)) {
+  if (!canPlaceAt(x, y, z)) {
     if (DEBUG_BUILD) uiWarn("[BUILD] blocked (occupied or inside player) at:", x, y, z, "src=", source);
     return;
   }
 
-  // SERVER-AUTH: request placement. Server will consume hotbar + broadcast block:update.
+  if (!colyRoom) {
+    if (DEBUG_BUILD) uiWarn("[BUILD] no colyRoom (not connected)", "src=", source);
+    return;
+  }
+
+  // SERVER-DRIVEN: request placement; server consumes hotbar + broadcasts block:update
   try {
     colyRoom.send("block:place", { x, y, z, kind });
-    if (DEBUG_BUILD) uiLog("[BUILD] request place", kind, "at", x, y, z, "src=", source);
-  } catch (e) {
-    if (DEBUG_BUILD) uiWarn("[BUILD] send failed:", e);
-  }
+  } catch (e) {}
+
+  if (DEBUG_BUILD) uiLog("[BUILD] requested place", kind, "at", x, y, z, "src=", source);
 }
 
 /* ============================================================
@@ -1826,7 +1838,8 @@ document.addEventListener(
 
     const canvas = noa?.container?.canvas;
     const overCanvas =
-      e.target === canvas || (canvas && typeof canvas.contains === "function" && canvas.contains(e.target));
+      e.target === canvas ||
+      (canvas && typeof canvas.contains === "function" && canvas.contains(e.target));
 
     if (document.pointerLockElement === canvas || overCanvas) {
       e.preventDefault();
@@ -1840,7 +1853,7 @@ noa.on("tick", function () {
   const scroll = noa.inputs.pointerState.scrolly;
 
   if (scroll !== 0 && viewMode === 1 && !inventoryOpen) {
-    noa.camera.zoomDistance = clamp2(noa.camera.zoomDistance + (scroll > 0 ? 1 : -1), 2, 12);
+    noa.camera.zoomDistance = clamp(noa.camera.zoomDistance + (scroll > 0 ? 1 : -1), 2, 12);
     noa.camera.currentZoom = noa.camera.zoomDistance;
   }
 
@@ -1871,10 +1884,9 @@ window.addEventListener(
   true
 );
 
-// Mine (left click default "fire") - SERVER AUTH world
+// Mine (left click default "fire") - SERVER-DRIVEN
 noa.inputs.down.on("fire", function () {
   if (inventoryOpen) return;
-  if (!colyRoom) return;
 
   STATE.swingT = 0;
   sendSwing();
@@ -1882,12 +1894,15 @@ noa.inputs.down.on("fire", function () {
   if (!noa.targetedBlock) return;
 
   const tgt = noa.targetedBlock.position;
+  const x = tgt[0] | 0;
+  const y = tgt[1] | 0;
+  const z = tgt[2] | 0;
+
+  if (!colyRoom) return;
+
   try {
-    colyRoom.send("block:break", { x: tgt[0], y: tgt[1], z: tgt[2] });
-    if (DEBUG_BUILD) uiLog("[MINE] request break at", tgt[0], tgt[1], tgt[2]);
-  } catch (e) {
-    if (DEBUG_BUILD) uiWarn("[MINE] send failed:", e);
-  }
+    colyRoom.send("block:break", { x, y, z });
+  } catch (e) {}
 });
 
 // Build (right click) only when browser context menu is disabled
@@ -1914,7 +1929,7 @@ noa.on("beforeRender", function () {
   enforceViewModeEveryFrame();
 
   const now = performance.now();
-  const dt = clamp2((now - STATE.lastTime) / 1000, 0, 0.05);
+  const dt = clamp((now - STATE.lastTime) / 1000, 0, 0.05);
   STATE.lastTime = now;
   STATE.swingT += dt;
 
@@ -1991,7 +2006,9 @@ noa.on("beforeRender", function () {
  */
 
 const ENDPOINT =
-  import.meta.env && import.meta.env.VITE_COLYSEUS_ENDPOINT ? import.meta.env.VITE_COLYSEUS_ENDPOINT : "ws://localhost:2567";
+  import.meta.env && import.meta.env.VITE_COLYSEUS_ENDPOINT
+    ? import.meta.env.VITE_COLYSEUS_ENDPOINT
+    : "ws://localhost:2567";
 
 const colyseusClient = new ColyClient(ENDPOINT);
 
@@ -2004,27 +2021,33 @@ async function connectColyseus() {
 
     uiLog("[MP] connected session:", room.sessionId);
 
-    // ---- Server world replication
-    room.onMessage("block:update", (m) => {
-      if (!m) return;
-      const x = m.x | 0;
-      const y = m.y | 0;
-      const z = m.z | 0;
-      const id = m.id | 0;
-      noa.setBlock(id, x, y, z);
-      if (DEBUG_BUILD) uiLog("[WORLD] block:update", id, "at", x, y, z);
-    });
-
-    room.onMessage("world:patch", (patch) => {
-      const edits = patch?.edits || [];
-      for (const e of edits) {
-        noa.setBlock((e.id | 0) || 0, e.x | 0, e.y | 0, e.z | 0);
-      }
-      uiLog("[WORLD] patch applied:", edits.length, "truncated=", !!patch?.truncated);
-    });
-
     room.onMessage("welcome", (msg) => uiLog("[server] welcome:", msg));
     room.onMessage("hello_ack", (msg) => uiLog("[server] hello_ack:", msg));
+
+    // ---- WORLD SYNC (server-driven blocks)
+    room.onMessage("world:patch", (patch) => {
+      try {
+        const edits = patch?.edits || [];
+        uiLog("[WORLD] patch edits:", edits.length, "truncated:", !!patch?.truncated);
+        for (const e of edits) {
+          noa.setBlock((e.id | 0) || 0, e.x | 0, e.y | 0, e.z | 0);
+        }
+      } catch (err) {
+        uiWarn("[WORLD] patch apply failed:", err);
+      }
+    });
+
+    room.onMessage("block:update", (u) => {
+      try {
+        const x = u?.x | 0;
+        const y = u?.y | 0;
+        const z = u?.z | 0;
+        const id = u?.id | 0;
+        noa.setBlock(id, x, y, z);
+      } catch (err) {
+        uiWarn("[WORLD] block:update failed:", err);
+      }
+    });
 
     if (room.state) syncPlayersFromState(room.state);
 
@@ -2050,6 +2073,7 @@ const bootInterval = setInterval(() => {
     clearInterval(bootInterval);
     applyViewModeOnce();
     uiLog("[BOOT] scene ready");
-    uiLog("[HELP] F4 debug console • F3 build logs • B/E build • RMB build (if ctx menu disabled) • 1..9 hotbar • I inventory");
+    uiLog("[HELP] F4 debug console • F3 build logs • B/E build • 1..9 hotbar • I inventory");
+    uiLog("[HELP] Server-driven blocks: mine=block:break • place=block:place • apply via block:update/world:patch");
   }
 }, 100);
