@@ -40,7 +40,7 @@ import {
   getCactusHeight,
   buildDefaultOreTablesFromPalette,
   pickOreId,
-} from "../shared/world/Biomes.js";
+} from "../world/Biomes.js";
 
 /* ============================================================
  * 1. RECIPE DATA & SYSTEM (Client-Side Prediction)
