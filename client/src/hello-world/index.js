@@ -1,15 +1,16 @@
 // @ts-nocheck
 /*
- * fresh2 - client main/index (FINAL FULL VERSION)
+ * fresh2 - client main/index (FULL NO-OMIT VERSION)
  * -------------------------------------------------------------------
- * INCLUDES:
+ * FEATURES:
  * - 3x3 Crafting Grid (Virtual Mapping Strategy)
- * - Inventory UI (Drag & Drop, Splitting)
+ * - Inventory UI (Drag & Drop, Logic)
  * - Server-Authoritative Logic (Colyseus)
  * - World Generation (Synced Bedrock/Trees)
  * - 3D Rigs (FPS Hands + 3rd Person Avatars)
  * - Network Interpolation (Smooth movement)
  * - Debug Console (F4)
+ * - FIXED: Render Loop Delta Time calculation
  */
 
 import { Engine } from "noa-engine";
@@ -159,8 +160,7 @@ let inventoryOpen = false;
 
 // Multiplayer
 let colyRoom = null;
-const remotePlayers = {}; // { [sid]: { mesh, parts, targetPos, targetRot, lastPos } }
-let lastPlayersKeys = new Set();
+const remotePlayers = {}; // { [sid]: { mesh, targetPos, lastPos } }
 
 // Client State
 const LOCAL_INV = {
@@ -180,8 +180,8 @@ const LOCAL_HOTBAR = { index: 0 };
 const LOCAL_STATS = { hp: 20, maxHp: 20, stamina: 100, maxStamina: 100 };
 
 const MESH = {
-  weaponRoot: null, armsRoot: null, armL: null, armR: null, tool: null, // FPS
-  avatarRoot: null, avParts: {}, // TPS
+  weaponRoot: null, armR: null, tool: null, // FPS
+  avatarRoot: null, // TPS (Local)
 };
 
 const STATE = {
@@ -190,7 +190,7 @@ const STATE = {
   bobPhase: 0,
   swingT: 999,
   swingDuration: 0.22,
-  lastPlayerPos: null,
+  moveAccum: 0,
 };
 
 /* ============================================================
@@ -692,9 +692,9 @@ function createAvatar(scene) {
 function updateRigAnim(dt) {
   // Bobbing
   if (viewMode === 0 && MESH.weaponRoot) {
-    const moving = noa.entities.getPhysicsBody(noa.playerEntity).velocity[1] === 0 && 
-                   (Math.abs(noa.entities.getPhysicsBody(noa.playerEntity).velocity[0]) > 0.1 ||
-                    Math.abs(noa.entities.getPhysicsBody(noa.playerEntity).velocity[2]) > 0.1);
+    // Only bob if moving
+    const vel = noa.entities.getPhysicsBody(noa.playerEntity).velocity;
+    const moving = Math.abs(vel[0]) > 0.1 || Math.abs(vel[2]) > 0.1;
     
     if (moving) STATE.bobPhase += dt * 10;
     MESH.weaponRoot.position.y = Math.sin(STATE.bobPhase) * 0.02;
@@ -762,7 +762,7 @@ client.joinOrCreate("my_room", { name: "Steve" }).then(room => {
       }
       // Update Target
       remotePlayers[sid].targetPos = [p.x, p.y, p.z];
-      remotePlayers[sid].mesh.rotation.y = p.yaw;
+      if (remotePlayers[sid].mesh) remotePlayers[sid].mesh.rotation.y = p.yaw;
     });
   });
 
@@ -854,33 +854,53 @@ window.addEventListener("keydown", (e) => {
   }
 });
 
-// Loop
+// --- RENDER LOOP (FIXED DT CALCULATION) ---
 noa.on("beforeRender", () => {
+  // 1. Ensure Scene Initialized
   if (!STATE.scene) {
-    STATE.scene = noa.rendering.getScene();
-    initFpsRig(STATE.scene);
+    const scene = noa.rendering.getScene();
+    if (scene) {
+      STATE.scene = scene;
+      initFpsRig(STATE.scene);
+    } else {
+      return;
+    }
   }
 
-  const dt = noa.engineTimer.dt / 1000;
+  // 2. Robust Delta Time Calculation
+  const now = performance.now();
+  const dt = (now - STATE.lastTime) / 1000; // seconds
+  STATE.lastTime = now;
+  
+  if (dt > 0.1) return; // Skip giant lag spikes
+
+  // 3. Update Animations
   updateRigAnim(dt);
 
-  // Network Interpolation (Remote Players)
+  // 4. Network Interpolation
   for (const sid in remotePlayers) {
     const rp = remotePlayers[sid];
-    const cur = rp.mesh.position;
-    const tgt = rp.targetPos;
-    cur.x += (tgt[0] - cur.x) * 0.1;
-    cur.y += (tgt[1] - cur.y) * 0.1;
-    cur.z += (tgt[2] - cur.z) * 0.1;
+    if (rp && rp.mesh) {
+      const cur = rp.mesh.position;
+      const tgt = rp.targetPos;
+      // Simple lerp
+      cur.x += (tgt[0] - cur.x) * 0.1;
+      cur.y += (tgt[1] - cur.y) * 0.1;
+      cur.z += (tgt[2] - cur.z) * 0.1;
+    }
   }
   
-  // Send Move
-  if (colyRoom && !inventoryOpen && (STATE.bobPhase % 5 < 1)) { // Throttle
-    const p = noa.entities.getPosition(noa.playerEntity);
-    const cam = noa.camera;
-    colyRoom.send("move", { x: p[0], y: p[1], z: p[2], yaw: cam.heading, pitch: cam.pitch });
+  // 5. Send Move (Throttle)
+  STATE.moveAccum += dt;
+  if (colyRoom && !inventoryOpen && STATE.moveAccum > 0.05) { // 20hz
+    STATE.moveAccum = 0;
+    try {
+        const p = noa.entities.getPosition(noa.playerEntity);
+        const cam = noa.camera;
+        colyRoom.send("move", { x: p[0], y: p[1], z: p[2], yaw: cam.heading, pitch: cam.pitch });
+    } catch(e) {}
   }
 });
 
-// Initial patch request
+// Initial spawn
 noa.entities.setPosition(noa.playerEntity, 0, 10, 0);
