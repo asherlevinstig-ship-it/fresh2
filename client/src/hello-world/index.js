@@ -14,7 +14,7 @@
  */
 
 import { Engine } from "noa-engine";
-import { Client as ColyClient } from "@colyseus/sdk";
+import Colyseus from "colyseus.js";
 import * as BABYLON from "babylonjs";
 
 /* ============================================================
@@ -90,7 +90,7 @@ const CraftingSystem = {
     const recipeMatrix = recipe.pattern.map((row) => row.split(""));
 
     if (inputShape.length !== recipeMatrix.length) return false;
-    if (inputShape[0].length !== recipeMatrix[0].length) return false;
+    if (!inputShape[0] || inputShape[0].length !== recipeMatrix[0].length) return false;
 
     for (let r = 0; r < inputShape.length; r++) {
       for (let c = 0; c < inputShape[0].length; c++) {
@@ -108,7 +108,10 @@ const CraftingSystem = {
   },
 
   trimMatrix(matrix) {
-    let minR = 3, maxR = -1, minC = 3, maxC = -1;
+    let minR = 3,
+      maxR = -1,
+      minC = 3,
+      maxC = -1;
     for (let r = 0; r < 3; r++) {
       for (let c = 0; c < 3; c++) {
         if (matrix[r][c] !== "") {
@@ -164,7 +167,8 @@ const remotePlayers = {}; // { [sid]: { mesh, targetPos, lastPos } }
 
 // Client State
 const LOCAL_INV = {
-  cols: 9, rows: 4,
+  cols: 9,
+  rows: 4,
   slots: [], // uid strings
   items: {}, // uid -> ItemState
   equip: { head: "", chest: "", legs: "", feet: "", tool: "", offhand: "" },
@@ -180,7 +184,9 @@ const LOCAL_HOTBAR = { index: 0 };
 const LOCAL_STATS = { hp: 20, maxHp: 20, stamina: 100, maxStamina: 100 };
 
 const MESH = {
-  weaponRoot: null, armR: null, tool: null, // FPS
+  weaponRoot: null,
+  armR: null,
+  tool: null, // FPS
   avatarRoot: null, // TPS (Local)
 };
 
@@ -202,21 +208,34 @@ const UI_CONSOLE = (() => {
   const wrap = document.createElement("div");
   wrap.id = "ui-console";
   Object.assign(wrap.style, {
-    position: "fixed", left: "14px", bottom: "90px", width: "min(600px, 90vw)",
-    maxHeight: "300px", zIndex: "10050", display: "none", pointerEvents: "none",
-    fontFamily: "monospace", color: "white", fontSize: "12px", textShadow: "1px 1px 0 #000"
+    position: "fixed",
+    left: "14px",
+    bottom: "90px",
+    width: "min(600px, 90vw)",
+    maxHeight: "300px",
+    zIndex: "10050",
+    display: "none",
+    pointerEvents: "none",
+    fontFamily: "monospace",
+    color: "white",
+    fontSize: "12px",
+    textShadow: "1px 1px 0 #000",
   });
-  
+
   const scroller = document.createElement("div");
   Object.assign(scroller.style, {
-    background: "rgba(0,0,0,0.6)", padding: "10px", borderRadius: "8px",
-    overflowY: "auto", maxHeight: "100%", pointerEvents: "auto"
+    background: "rgba(0,0,0,0.6)",
+    padding: "10px",
+    borderRadius: "8px",
+    overflowY: "auto",
+    maxHeight: "100%",
+    pointerEvents: "auto",
   });
-  
+
   wrap.appendChild(scroller);
   document.body.appendChild(wrap);
 
-  function log(msg, color="#fff") {
+  function log(msg, color = "#fff") {
     const el = document.createElement("div");
     el.textContent = `> ${msg}`;
     el.style.color = color;
@@ -228,7 +247,9 @@ const UI_CONSOLE = (() => {
     log: (m) => log(m),
     warn: (m) => log(m, "#ffaa00"),
     error: (m) => log(m, "#ff5555"),
-    toggle: () => { wrap.style.display = wrap.style.display === "none" ? "block" : "none"; }
+    toggle: () => {
+      wrap.style.display = wrap.style.display === "none" ? "block" : "none";
+    },
   };
 })();
 
@@ -242,35 +263,60 @@ const uiLog = UI_CONSOLE.log;
 function createInventoryOverlay() {
   const overlay = document.createElement("div");
   Object.assign(overlay.style, {
-    position: "fixed", inset: "0", display: "none", zIndex: "9998",
-    background: "rgba(0,0,0,0.5)", backdropFilter: "blur(4px)"
+    position: "fixed",
+    inset: "0",
+    display: "none",
+    zIndex: "9998",
+    background: "rgba(0,0,0,0.5)",
+    backdropFilter: "blur(4px)",
   });
 
   const panel = document.createElement("div");
   Object.assign(panel.style, {
-    position: "absolute", left: "50%", top: "50%", transform: "translate(-50%, -50%)",
-    width: "min(800px, 95vw)", background: "rgba(30,30,35,0.95)", borderRadius: "12px",
-    border: "1px solid #444", boxShadow: "0 10px 40px rgba(0,0,0,0.5)",
-    padding: "20px", display: "grid", gridTemplateColumns: "240px 1fr", gap: "20px",
-    fontFamily: "system-ui, sans-serif", color: "#eee"
+    position: "absolute",
+    left: "50%",
+    top: "50%",
+    transform: "translate(-50%, -50%)",
+    width: "min(800px, 95vw)",
+    background: "rgba(30,30,35,0.95)",
+    borderRadius: "12px",
+    border: "1px solid #444",
+    boxShadow: "0 10px 40px rgba(0,0,0,0.5)",
+    padding: "20px",
+    display: "grid",
+    gridTemplateColumns: "240px 1fr",
+    gap: "20px",
+    fontFamily: "system-ui, sans-serif",
+    color: "#eee",
   });
 
   // --- Left: Crafting & Equip ---
   const leftCol = document.createElement("div");
   leftCol.innerHTML = `<div style="font-weight:bold; margin-bottom:8px">Crafting</div>`;
-  
+
   const craftWrap = document.createElement("div");
   Object.assign(craftWrap.style, {
-    display: "flex", gap: "10px", alignItems: "center", background: "#222",
-    padding: "10px", borderRadius: "8px", border: "1px solid #333"
+    display: "flex",
+    gap: "10px",
+    alignItems: "center",
+    background: "#222",
+    padding: "10px",
+    borderRadius: "8px",
+    border: "1px solid #333",
   });
 
   // 3x3 Grid
   const craftGrid = document.createElement("div");
-  Object.assign(craftGrid.style, { display: "grid", gridTemplateColumns: "repeat(3, 48px)", gap: "4px" });
+  Object.assign(craftGrid.style, {
+    display: "grid",
+    gridTemplateColumns: "repeat(3, 48px)",
+    gap: "4px",
+  });
   const craftCells = [];
-  for(let i=0; i<9; i++) {
+  for (let i = 0; i < 9; i++) {
     const { cell, icon, qty } = makeSlot(`craft:${i}`);
+    cell.appendChild(icon);
+    cell.appendChild(qty);
     craftGrid.appendChild(cell);
     craftCells.push({ cell, icon, qty });
   }
@@ -279,6 +325,8 @@ function createInventoryOverlay() {
   const resWrap = document.createElement("div");
   const { cell: resCell, icon: resIcon, qty: resQty } = makeSlot("craft:result");
   resCell.style.border = "1px solid #6c6";
+  resCell.appendChild(resIcon);
+  resCell.appendChild(resQty);
   resWrap.appendChild(resCell);
 
   craftWrap.appendChild(craftGrid);
@@ -287,13 +335,19 @@ function createInventoryOverlay() {
   leftCol.appendChild(craftWrap);
 
   // Equipment
-  leftCol.appendChild(document.createElement("hr")); 
+  leftCol.appendChild(document.createElement("hr"));
   const eqGrid = document.createElement("div");
-  Object.assign(eqGrid.style, { display: "grid", gridTemplateColumns: "repeat(3, 48px)", gap: "4px" });
+  Object.assign(eqGrid.style, {
+    display: "grid",
+    gridTemplateColumns: "repeat(3, 48px)",
+    gap: "4px",
+  });
   const eqKeys = ["head", "chest", "legs", "feet", "tool", "offhand"];
   const eqCells = {};
-  eqKeys.forEach(k => {
+  eqKeys.forEach((k) => {
     const { cell, icon, qty } = makeSlot(`eq:${k}`);
+    cell.appendChild(icon);
+    cell.appendChild(qty);
     eqCells[k] = { cell, icon, qty };
     eqGrid.appendChild(cell);
   });
@@ -302,12 +356,18 @@ function createInventoryOverlay() {
   // --- Right: Inventory ---
   const rightCol = document.createElement("div");
   rightCol.innerHTML = `<div style="font-weight:bold; margin-bottom:8px">Inventory</div>`;
-  
+
   const invGrid = document.createElement("div");
-  Object.assign(invGrid.style, { display: "grid", gridTemplateColumns: "repeat(9, 48px)", gap: "4px" });
+  Object.assign(invGrid.style, {
+    display: "grid",
+    gridTemplateColumns: "repeat(9, 48px)",
+    gap: "4px",
+  });
   const invCells = [];
-  for(let i=0; i<36; i++) {
+  for (let i = 0; i < 36; i++) {
     const { cell, icon, qty } = makeSlot(`inv:${i}`);
+    cell.appendChild(icon);
+    cell.appendChild(qty);
     invGrid.appendChild(cell);
     invCells.push({ cell, icon, qty });
   }
@@ -323,18 +383,34 @@ function createInventoryOverlay() {
     const cell = document.createElement("div");
     cell.dataset.id = id;
     Object.assign(cell.style, {
-      width: "48px", height: "48px", background: "rgba(255,255,255,0.05)",
-      border: "1px solid #444", borderRadius: "4px", position: "relative",
-      cursor: "pointer", userSelect: "none"
+      width: "48px",
+      height: "48px",
+      background: "rgba(255,255,255,0.05)",
+      border: "1px solid #444",
+      borderRadius: "4px",
+      position: "relative",
+      cursor: "pointer",
+      userSelect: "none",
     });
     const icon = document.createElement("div");
     Object.assign(icon.style, {
-      position: "absolute", inset: "2px", display: "flex", alignItems: "center",
-      justifyContent: "center", fontSize: "10px", textAlign: "center", pointerEvents: "none"
+      position: "absolute",
+      inset: "2px",
+      display: "flex",
+      alignItems: "center",
+      justifyContent: "center",
+      fontSize: "10px",
+      textAlign: "center",
+      pointerEvents: "none",
     });
     const qty = document.createElement("div");
     Object.assign(qty.style, {
-      position: "absolute", bottom: "1px", right: "2px", fontSize: "11px", fontWeight: "bold", pointerEvents: "none"
+      position: "absolute",
+      bottom: "1px",
+      right: "2px",
+      fontSize: "11px",
+      fontWeight: "bold",
+      pointerEvents: "none",
     });
     return { cell, icon, qty };
   }
@@ -352,37 +428,40 @@ function createInventoryOverlay() {
   // --- Render Loop ---
   function refresh() {
     // Inventory
-    for(let i=0; i<36; i++) {
+    for (let i = 0; i < 36; i++) {
       const it = getInvItem(i);
       invCells[i].icon.textContent = it ? getItemShort(it.kind) : "";
       invCells[i].qty.textContent = it && it.qty > 1 ? it.qty : "";
-      
+
       const isCraftUsed = LOCAL_CRAFT.indices.includes(i);
       invCells[i].cell.style.opacity = isCraftUsed ? "0.3" : "1";
     }
+
     // Crafting
-    for(let i=0; i<9; i++) {
+    for (let i = 0; i < 9; i++) {
       const invIdx = LOCAL_CRAFT.indices[i];
       const it = getInvItem(invIdx);
       craftCells[i].icon.textContent = it ? getItemShort(it.kind) : "";
       craftCells[i].qty.textContent = it && it.qty > 1 ? it.qty : "";
     }
+
     // Result
     const res = LOCAL_CRAFT.result;
     resIcon.textContent = res ? getItemShort(res.kind) : "";
     resQty.textContent = res ? res.qty : "";
-    
+
     // Equip
-    eqKeys.forEach(k => {
+    eqKeys.forEach((k) => {
       const uid = LOCAL_INV.equip[k];
       const it = uid ? LOCAL_INV.items[uid] : null;
       eqCells[k].icon.textContent = it ? getItemShort(it.kind) : "";
+      eqCells[k].qty.textContent = "";
     });
   }
 
   // --- Drag & Drop Logic ---
   const drag = { active: false, srcId: null, invIdx: -1, ghost: null };
-  
+
   function startDrag(e, slotId) {
     let it = null;
     let invIdx = -1;
@@ -407,8 +486,14 @@ function createInventoryOverlay() {
     const g = document.createElement("div");
     g.textContent = getItemShort(it.kind);
     Object.assign(g.style, {
-      position: "fixed", background: "#222", border: "1px solid white", padding: "4px",
-      pointerEvents: "none", zIndex: "10001", borderRadius: "4px", color: "#fff"
+      position: "fixed",
+      background: "#222",
+      border: "1px solid white",
+      padding: "4px",
+      pointerEvents: "none",
+      zIndex: "10001",
+      borderRadius: "4px",
+      color: "#fff",
     });
     document.body.appendChild(g);
     drag.ghost = g;
@@ -416,7 +501,7 @@ function createInventoryOverlay() {
   }
 
   function moveGhost(e) {
-    if(drag.ghost) {
+    if (drag.ghost) {
       drag.ghost.style.left = e.clientX + 10 + "px";
       drag.ghost.style.top = e.clientY + 10 + "px";
     }
@@ -429,8 +514,8 @@ function createInventoryOverlay() {
 
     const el = document.elementFromPoint(e.clientX, e.clientY);
     const dropSlot = el ? el.closest("[data-id]") : null;
-    
-    // Logic: 
+
+    // Logic:
     // If drop on Craft Slot -> Map index
     // If drop on Inv Slot -> Move item (Server)
     // If drop outside -> Clear craft mapping (if source was craft)
@@ -446,11 +531,11 @@ function createInventoryOverlay() {
     }
 
     const destId = dropSlot.dataset.id;
-    
+
     // 1. Drop onto Crafting Grid
     if (destId.startsWith("craft:") && !destId.includes("result")) {
       const cIdx = parseInt(destId.split(":")[1]);
-      
+
       // If dragging FROM craft, swap indices
       if (drag.srcId.startsWith("craft:")) {
         const oldCIdx = parseInt(drag.srcId.split(":")[1]);
@@ -484,7 +569,7 @@ function createInventoryOverlay() {
   }
 
   function updateCraft() {
-    const kinds = LOCAL_CRAFT.indices.map(idx => {
+    const kinds = LOCAL_CRAFT.indices.map((idx) => {
       const it = getInvItem(idx);
       return it ? it.kind : "";
     });
@@ -493,11 +578,13 @@ function createInventoryOverlay() {
   }
 
   // Bind Events
-  window.addEventListener("mousemove", (e) => { if(drag.active) moveGhost(e); });
+  window.addEventListener("mousemove", (e) => {
+    if (drag.active) moveGhost(e);
+  });
   window.addEventListener("mouseup", endDrag);
 
   // Slot Clicks
-  [...invCells, ...craftCells, ...Object.values(eqCells), {cell:resCell}].forEach(o => {
+  [...invCells, ...craftCells, ...Object.values(eqCells), { cell: resCell }].forEach((o) => {
     o.cell.addEventListener("mousedown", (e) => {
       const id = o.cell.dataset.id;
       if (id === "craft:result") {
@@ -514,16 +601,16 @@ function createInventoryOverlay() {
     toggle: () => {
       const open = overlay.style.display === "none";
       overlay.style.display = open ? "block" : "none";
-      if (open) { 
-        refresh(); 
-        document.exitPointerLock(); 
-      } else { 
-        noa.container.canvas.requestPointerLock(); 
+      if (open) {
+        refresh();
+        document.exitPointerLock();
+      } else {
+        noa.container.canvas.requestPointerLock();
       }
       inventoryOpen = open;
     },
     refresh,
-    isOpen: () => overlay.style.display !== "none"
+    isOpen: () => overlay.style.display !== "none",
   };
 }
 
@@ -537,41 +624,65 @@ const inventoryUI = createInventoryOverlay();
 function createHotbarUI() {
   const div = document.createElement("div");
   Object.assign(div.style, {
-    position: "fixed", bottom: "10px", left: "50%", transform: "translateX(-50%)",
-    display: "flex", gap: "5px", padding: "5px", background: "rgba(0,0,0,0.5)", borderRadius: "8px"
+    position: "fixed",
+    bottom: "10px",
+    left: "50%",
+    transform: "translateX(-50%)",
+    display: "flex",
+    gap: "5px",
+    padding: "5px",
+    background: "rgba(0,0,0,0.5)",
+    borderRadius: "8px",
   });
-  
+
   const slots = [];
-  for(let i=0; i<9; i++) {
+  for (let i = 0; i < 9; i++) {
     const s = document.createElement("div");
     Object.assign(s.style, {
-      width: "50px", height: "50px", border: "2px solid #555", borderRadius: "4px",
-      position: "relative", background: "rgba(0,0,0,0.3)"
+      width: "50px",
+      height: "50px",
+      border: "2px solid #555",
+      borderRadius: "4px",
+      position: "relative",
+      background: "rgba(0,0,0,0.3)",
     });
     const icon = document.createElement("div");
     Object.assign(icon.style, {
-      position: "absolute", inset: "0", display: "flex", justifyContent: "center", alignItems: "center",
-      color: "white", fontSize: "10px", textAlign: "center"
+      position: "absolute",
+      inset: "0",
+      display: "flex",
+      justifyContent: "center",
+      alignItems: "center",
+      color: "white",
+      fontSize: "10px",
+      textAlign: "center",
     });
     const qty = document.createElement("div");
-    Object.assign(qty.style, { position: "absolute", bottom: "2px", right: "2px", fontSize: "10px", fontWeight: "bold", color: "#fff" });
+    Object.assign(qty.style, {
+      position: "absolute",
+      bottom: "2px",
+      right: "2px",
+      fontSize: "10px",
+      fontWeight: "bold",
+      color: "#fff",
+    });
     s.appendChild(icon);
     s.appendChild(qty);
     div.appendChild(s);
-    slots.push({s, icon, qty});
+    slots.push({ s, icon, qty });
   }
   document.body.appendChild(div);
 
   return {
     refresh: () => {
-      for(let i=0; i<9; i++) {
+      for (let i = 0; i < 9; i++) {
         const uid = LOCAL_INV.slots[i];
         const it = uid ? LOCAL_INV.items[uid] : null;
-        slots[i].s.style.borderColor = (i === LOCAL_HOTBAR.index) ? "white" : "#555";
+        slots[i].s.style.borderColor = i === LOCAL_HOTBAR.index ? "white" : "#555";
         slots[i].icon.textContent = it ? it.kind.split(":")[1] : "";
         slots[i].qty.textContent = it && it.qty > 1 ? it.qty : "";
       }
-    }
+    },
   };
 }
 
@@ -584,11 +695,16 @@ const hotbarUI = createHotbarUI();
 
 // Materials
 const mats = {
-  dirt: [0.45, 0.36, 0.22], grass: [0.1, 0.8, 0.2], stone: [0.5, 0.5, 0.5],
-  bedrock: [0.2, 0.2, 0.2], log: [0.4, 0.3, 0.1], leaves: [0.2, 0.6, 0.2],
-  planks: [0.6, 0.45, 0.25], glass: [0.8, 0.9, 1.0]
+  dirt: [0.45, 0.36, 0.22],
+  grass: [0.1, 0.8, 0.2],
+  stone: [0.5, 0.5, 0.5],
+  bedrock: [0.2, 0.2, 0.2],
+  log: [0.4, 0.3, 0.1],
+  leaves: [0.2, 0.6, 0.2],
+  planks: [0.6, 0.45, 0.25],
+  glass: [0.8, 0.9, 1.0],
 };
-Object.keys(mats).forEach(k => noa.registry.registerMaterial(k, { color: mats[k] }));
+Object.keys(mats).forEach((k) => noa.registry.registerMaterial(k, { color: mats[k] }));
 
 const ID = {
   dirt: noa.registry.registerBlock(1, { material: "dirt" }),
@@ -608,13 +724,14 @@ function hash2(x, z) {
 function getVoxelID(x, y, z) {
   if (y < -10) return ID.bedrock;
   const h = Math.floor(4 * Math.sin(x / 15) + 4 * Math.cos(z / 20));
-  
-  if (y > h && y < h + 8) { // Trees
-     if (hash2(x, z) > 0.98) {
-        const tb = h + 1;
-        if (y >= tb && y < tb + 4) return ID.log;
-        if (y > tb + 3 && y <= tb + 5) return ID.leaves;
-     }
+
+  if (y > h && y < h + 8) {
+    // Trees
+    if (hash2(x, z) > 0.98) {
+      const tb = h + 1;
+      if (y >= tb && y < tb + 4) return ID.log;
+      if (y > tb + 3 && y <= tb + 5) return ID.leaves;
+    }
   }
   if (y < h - 3) return ID.stone;
   if (y < h) return ID.dirt;
@@ -649,18 +766,26 @@ function initFpsRig(scene) {
   const cam = scene.activeCamera;
   const root = new BABYLON.TransformNode("weaponRoot", scene);
   root.parent = cam;
-  
+
   const armMat = createSolidMat(scene, "armMat", [0.2, 0.8, 0.2]);
   const toolMat = createSolidMat(scene, "toolMat", [0.8, 0.8, 0.8]);
-  
-  const armR = BABYLON.MeshBuilder.CreateBox("armR", {width:0.3, height:0.8, depth:0.3}, scene);
-  armR.material = armMat; armR.parent = root; armR.position.set(0.5, -0.5, 1);
+
+  const armR = BABYLON.MeshBuilder.CreateBox(
+    "armR",
+    { width: 0.3, height: 0.8, depth: 0.3 },
+    scene
+  );
+  armR.material = armMat;
+  armR.parent = root;
+  armR.position.set(0.5, -0.5, 1);
   armR.rotation.set(0.5, 0, 0);
 
-  const tool = BABYLON.MeshBuilder.CreateBox("tool", {width:0.1, height:0.1, depth:0.6}, scene);
-  tool.material = toolMat; tool.parent = armR; tool.position.set(0, 0.5, 0.2);
+  const tool = BABYLON.MeshBuilder.CreateBox("tool", { width: 0.1, height: 0.1, depth: 0.6 }, scene);
+  tool.material = toolMat;
+  tool.parent = armR;
+  tool.position.set(0, 0.5, 0.2);
 
-  [armR, tool].forEach(m => {
+  [armR, tool].forEach((m) => {
     noa.rendering.addMeshToScene(m, false);
     m.isPickable = false;
   });
@@ -674,15 +799,19 @@ function createAvatar(scene) {
   const root = new BABYLON.TransformNode("avRoot", scene);
   const skin = createSolidMat(scene, "skin", [1, 0.8, 0.6]);
   const shirt = createSolidMat(scene, "shirt", [0.2, 0.4, 0.9]);
-  
-  const head = BABYLON.MeshBuilder.CreateBox("head", {size:0.5}, scene);
-  head.material = skin; head.parent = root; head.position.y = 1.6;
-  
-  const body = BABYLON.MeshBuilder.CreateBox("body", {width:0.5, height:0.8, depth:0.25}, scene);
-  body.material = shirt; body.parent = root; body.position.y = 0.9;
+
+  const head = BABYLON.MeshBuilder.CreateBox("head", { size: 0.5 }, scene);
+  head.material = skin;
+  head.parent = root;
+  head.position.y = 1.6;
+
+  const body = BABYLON.MeshBuilder.CreateBox("body", { width: 0.5, height: 0.8, depth: 0.25 }, scene);
+  body.material = shirt;
+  body.parent = root;
+  body.position.y = 0.9;
 
   const parts = { root, head, body };
-  [head, body].forEach(m => {
+  [head, body].forEach((m) => {
     noa.rendering.addMeshToScene(m, false);
     m.isPickable = false;
   });
@@ -695,7 +824,7 @@ function updateRigAnim(dt) {
     // Only bob if moving
     const vel = noa.entities.getPhysicsBody(noa.playerEntity).velocity;
     const moving = Math.abs(vel[0]) > 0.1 || Math.abs(vel[2]) > 0.1;
-    
+
     if (moving) STATE.bobPhase += dt * 10;
     MESH.weaponRoot.position.y = Math.sin(STATE.bobPhase) * 0.02;
     MESH.weaponRoot.position.x = Math.cos(STATE.bobPhase) * 0.02;
@@ -722,74 +851,76 @@ function snapshotState(me) {
   LOCAL_STATS.hp = me.hp;
   LOCAL_STATS.stamina = me.stamina;
   LOCAL_HOTBAR.index = me.hotbarIndex;
-  
+
   // FIXED: Pad inventory to 36 slots
-  const rawSlots = (me.inventory.slots || []).map(String);
+  const rawSlots = (me.inventory?.slots || []).map(String);
   while (rawSlots.length < 36) rawSlots.push("");
   LOCAL_INV.slots = rawSlots;
 
   const items = {};
-  if (me.items) me.items.forEach((it, uid) => items[uid] = { kind: it.kind, qty: it.qty });
+  if (me.items) me.items.forEach((it, uid) => (items[uid] = { kind: it.kind, qty: it.qty }));
   LOCAL_INV.items = items;
   LOCAL_INV.equip = JSON.parse(JSON.stringify(me.equip || {}));
 
   // Clean craft indices if item gone
-  for(let i=0; i<9; i++) {
+  for (let i = 0; i < 9; i++) {
     const idx = LOCAL_CRAFT.indices[i];
     if (idx !== -1 && !LOCAL_INV.slots[idx]) LOCAL_CRAFT.indices[i] = -1;
   }
-  
+
   if (inventoryUI.isOpen()) inventoryUI.refresh();
   hotbarUI.refresh();
 }
 
-// DYNAMIC ENDPOINT SWITCH
-const ENDPOINT = (window.location.hostname.includes("localhost"))
-  ? "ws://localhost:2567" 
-  : "wss://fresh2-production.up.railway.app"; // Replace with your actual Colyseus Cloud URL if different
+// DYNAMIC ENDPOINT SWITCH (Vercel Frontend -> Colyseus Cloud Backend)
+const ENDPOINT = window.location.hostname.includes("localhost")
+  ? "ws://localhost:2567"
+  : "https://us-mia-ea26ba04.colyseus.cloud";
 
-const client = new ColyClient(ENDPOINT);
+const client = new Colyseus.Client(ENDPOINT);
 
-client.joinOrCreate("my_room", { name: "Steve" }).then(room => {
-  colyRoom = room;
-  uiLog("Connected to Server!");
+client
+  .joinOrCreate("my_room", { name: "Steve" })
+  .then((room) => {
+    colyRoom = room;
+    uiLog("Connected to Server!");
 
-  room.onStateChange(state => {
-    // 1. Sync Self
-    const me = state.players.get(room.sessionId);
-    if (me) snapshotState(me);
+    room.onStateChange((state) => {
+      // 1. Sync Self
+      const me = state.players.get(room.sessionId);
+      if (me) snapshotState(me);
 
-    // 2. Sync Remotes
-    state.players.forEach((p, sid) => {
-      if (sid === room.sessionId) return;
-      if (!remotePlayers[sid]) {
-        // Spawn
-        const rig = createAvatar(noa.rendering.getScene());
-        remotePlayers[sid] = { mesh: rig.root, targetPos: [p.x, p.y, p.z] };
-        uiLog(`Player ${sid} joined`);
-      }
-      // Update Target
-      remotePlayers[sid].targetPos = [p.x, p.y, p.z];
-      if (remotePlayers[sid].mesh) remotePlayers[sid].mesh.rotation.y = p.yaw;
+      // 2. Sync Remotes
+      state.players.forEach((p, sid) => {
+        if (sid === room.sessionId) return;
+        if (!remotePlayers[sid]) {
+          // Spawn
+          const rig = createAvatar(noa.rendering.getScene());
+          remotePlayers[sid] = { mesh: rig.root, targetPos: [p.x, p.y, p.z] };
+          uiLog(`Player ${sid} joined`);
+        }
+        // Update Target
+        remotePlayers[sid].targetPos = [p.x, p.y, p.z];
+        if (remotePlayers[sid].mesh) remotePlayers[sid].mesh.rotation.y = p.yaw;
+      });
     });
-  });
 
-  room.onMessage("world:patch", (patch) => {
-    (patch.edits || []).forEach(e => noa.setBlock(e.id, e.x, e.y, e.z));
-  });
+    room.onMessage("world:patch", (patch) => {
+      (patch.edits || []).forEach((e) => noa.setBlock(e.id, e.x, e.y, e.z));
+    });
 
-  room.onMessage("block:update", (msg) => {
-    noa.setBlock(msg.id, msg.x, msg.y, msg.z);
-  });
-  
-  room.onMessage("craft:success", (msg) => {
-    uiLog(`Crafted: ${msg.item}`);
-    LOCAL_CRAFT.indices.fill(-1); // Clear grid on success
-    LOCAL_CRAFT.result = null;
-    inventoryUI.refresh();
-  });
+    room.onMessage("block:update", (msg) => {
+      noa.setBlock(msg.id, msg.x, msg.y, msg.z);
+    });
 
-}).catch(e => uiLog(`Connect Error: ${e}`, "red"));
+    room.onMessage("craft:success", (msg) => {
+      uiLog(`Crafted: ${msg.item}`);
+      LOCAL_CRAFT.indices.fill(-1); // Clear grid on success
+      LOCAL_CRAFT.result = null;
+      inventoryUI.refresh();
+    });
+  })
+  .catch((e) => uiLog(`Connect Error: ${e}`, "red"));
 
 /* ============================================================
  * 10. INPUTS & GAME LOOP
@@ -809,7 +940,7 @@ noa.inputs.down.on("fire", () => {
   if (inventoryOpen) return;
   STATE.swingT = 0;
   if (colyRoom) colyRoom.send("swing");
-  
+
   if (noa.targetedBlock) {
     const p = noa.targetedBlock.position;
     if (colyRoom) colyRoom.send("block:break", { x: p[0], y: p[1], z: p[2] });
@@ -823,14 +954,14 @@ noa.inputs.down.on("alt-fire", () => {
   const idx = LOCAL_HOTBAR.index;
   const uid = LOCAL_INV.slots[idx];
   const it = uid ? LOCAL_INV.items[uid] : null;
-  
+
   if (it && it.kind.startsWith("block:")) {
     let id = 0;
     if (it.kind.includes("dirt")) id = ID.dirt;
     if (it.kind.includes("log")) id = ID.log;
     if (it.kind.includes("plank")) id = ID.planks;
     if (it.kind.includes("stone")) id = ID.stone;
-    
+
     if (id !== 0) {
       if (colyRoom) colyRoom.send("block:place", { x: p[0], y: p[1], z: p[2], kind: it.kind });
       noa.setBlock(id, p[0], p[1], p[2]); // Predict
@@ -851,13 +982,13 @@ window.addEventListener("keydown", (e) => {
   if (e.code === "KeyV") {
     setView(viewMode === 0 ? 1 : 0);
   }
-  
+
   if (!inventoryOpen) {
     if (e.key >= "1" && e.key <= "9") {
-       const idx = parseInt(e.key) - 1;
-       if (colyRoom) colyRoom.send("hotbar:set", { index: idx });
-       LOCAL_HOTBAR.index = idx;
-       hotbarUI.refresh();
+      const idx = parseInt(e.key) - 1;
+      if (colyRoom) colyRoom.send("hotbar:set", { index: idx });
+      LOCAL_HOTBAR.index = idx;
+      hotbarUI.refresh();
     }
   }
 });
@@ -879,7 +1010,7 @@ noa.on("beforeRender", () => {
   const now = performance.now();
   const dt = (now - STATE.lastTime) / 1000; // seconds
   STATE.lastTime = now;
-  
+
   if (dt > 0.1) return; // Skip giant lag spikes
 
   // 3. Update Animations
@@ -897,16 +1028,17 @@ noa.on("beforeRender", () => {
       cur.z += (tgt[2] - cur.z) * 0.1;
     }
   }
-  
+
   // 5. Send Move (Throttle)
   STATE.moveAccum += dt;
-  if (colyRoom && !inventoryOpen && STATE.moveAccum > 0.05) { // 20hz
+  if (colyRoom && !inventoryOpen && STATE.moveAccum > 0.05) {
+    // 20hz
     STATE.moveAccum = 0;
     try {
-        const p = noa.entities.getPosition(noa.playerEntity);
-        const cam = noa.camera;
-        colyRoom.send("move", { x: p[0], y: p[1], z: p[2], yaw: cam.heading, pitch: cam.pitch });
-    } catch(e) {}
+      const p = noa.entities.getPosition(noa.playerEntity);
+      const cam = noa.camera;
+      colyRoom.send("move", { x: p[0], y: p[1], z: p[2], yaw: cam.heading, pitch: cam.pitch });
+    } catch (e) {}
   }
 });
 
