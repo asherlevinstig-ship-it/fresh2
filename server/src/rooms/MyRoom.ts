@@ -30,10 +30,13 @@
 //     - "block:update" (live edits)
 // ============================================================
 
-import { Room, Client } from "colyseus";
-import { CloseCode } from "@colyseus/core"; // Cloud templates often still provide this
-import { MyRoomState, PlayerState, ItemState } from "./schema/MyRoomState.js";
-import { WorldStore, BLOCKS, type BlockId } from "../world/WorldStore.js";
+import { Room, Client } from "@colyseus/core";
+import { MyRoomState, PlayerState } from "./schema/MyRoomState";
+import { WorldStore, BLOCKS, type BlockId } from "../world/WorldStore";
+
+
+
+
 
 type JoinOptions = { name?: string };
 
