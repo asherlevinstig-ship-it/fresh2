@@ -739,7 +739,7 @@ function snapshotState(me) {
   hotbarUI.refresh();
 }
 
-const ENDPOINT = "ws://localhost:2567";
+const ENDPOINT = "https://us-mia-ea26ba04.colyseus.cloud";
 const client = new ColyClient(ENDPOINT);
 
 client.joinOrCreate("my_room", { name: "Steve" }).then(room => {
