@@ -5,7 +5,7 @@
  * INCLUDES:
  * - 3x3 Crafting Grid (Virtual Mapping Strategy)
  * - Inventory UI (Drag & Drop, Logic, Splitting)
- * - Server-Authoritative Logic (Colyseus)
+ * - Server-Authoritative Logic (Colyseus) with Persistent ID
  * - World Generation (Synced Bedrock/Trees)
  * - 3D Rigs (FPS Hands + 3rd Person Avatars)
  * - Network Interpolation (Smooth movement)
@@ -15,7 +15,7 @@
 
 import { Engine } from "noa-engine";
 import * as BABYLON from "babylonjs";
-import * as Colyseus from "colyseus.js"; // Adjusted import for better compatibility
+import * as Colyseus from "colyseus.js";
 
 /* ============================================================
  * 1. RECIPE DATA & SYSTEM (Client-Side Prediction)
@@ -879,8 +879,24 @@ const ENDPOINT = window.location.hostname.includes("localhost")
 
 const client = new Colyseus.Client(ENDPOINT);
 
+// --- NEW: Persistent ID Logic ---
+function getDistinctId() {
+  const key = "fresh2_player_id";
+  let id = localStorage.getItem(key);
+  if (!id) {
+    // Generate a random ID if none exists
+    id = "user_" + Math.random().toString(36).substr(2, 9);
+    localStorage.setItem(key, id);
+  }
+  return id;
+}
+// --------------------------------
+
 client
-  .joinOrCreate("my_room", { name: "Steve" })
+  .joinOrCreate("my_room", { 
+    name: "Steve",
+    distinctId: getDistinctId() // <--- Send the persistent ID
+  })
   .then((room) => {
     colyRoom = room;
     uiLog("Connected to Server!");

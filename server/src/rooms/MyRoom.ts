@@ -1,20 +1,16 @@
-// ============================================================
-// rooms/MyRoom.ts  (FULL REWRITE - CRAFTING + PERSISTENCE)
-// ============================================================
-
-import { Room, Client, CloseCode } from "@colyseus/core";
+import { Room, Client } from "colyseus"; // Note: 'colyseus' exports these in recent versions, or use @colyseus/core
 import * as fs from "fs";
 import * as path from "path";
 
-import { WorldStore, BLOCKS, type BlockId } from "../world/WorldStore.js";
-import { MyRoomState, PlayerState, ItemState } from "./schema/MyRoomState.js";
-import { CraftingSystem } from "../crafting/CraftingSystem.js";
+import { WorldStore, BLOCKS, type BlockId } from "../world/WorldStore";
+import { MyRoomState, PlayerState, ItemState, InventoryState, EquipmentState } from "./schema/MyRoomState";
+import { CraftingSystem } from "../crafting/CraftingSystem";
 
 // ------------------------------------------------------------
 // Message Types
 // ------------------------------------------------------------
 
-type JoinOptions = { name?: string };
+type JoinOptions = { name?: string; distinctId?: string };
 
 type MoveMsg = {
   x: number;
@@ -352,18 +348,64 @@ function isValidBlockCoord(n: any) {
 // Room Implementation
 // ------------------------------------------------------------
 
-export class MyRoom extends Room {
+export class MyRoom extends Room<MyRoomState> {
   public maxClients = 16;
-  public state!: MyRoomState;
 
   // Shared world per server process
   private static WORLD = new WorldStore({ minCoord: -100000, maxCoord: 100000 });
 
-  // Persistence path
+  // Persistence paths
   private worldPath = path.join(process.cwd(), "world_data.json");
+  private playersPath = path.join(process.cwd(), "players.json");
 
   // Rate limiting
   private lastBlockOpAt = new Map<string, number>();
+
+  // --------------------------------------------------------
+  // Persistence Helpers
+  // --------------------------------------------------------
+
+  private loadPlayerData(distinctId: string) {
+    if (!fs.existsSync(this.playersPath)) return null;
+    try {
+      const raw = fs.readFileSync(this.playersPath, "utf8");
+      const data = JSON.parse(raw);
+      return data[distinctId] || null;
+    } catch (e) {
+      console.error("Load Error:", e);
+      return null;
+    }
+  }
+
+  private savePlayerData(distinctId: string, p: PlayerState) {
+    let allData: any = {};
+    if (fs.existsSync(this.playersPath)) {
+      try { allData = JSON.parse(fs.readFileSync(this.playersPath, "utf8")); } catch (e) {}
+    }
+    
+    // Serialize PlayerState to JSON
+    const saveData = {
+        x: p.x, y: p.y, z: p.z,
+        yaw: p.yaw, pitch: p.pitch,
+        hp: p.hp, stamina: p.stamina,
+        hotbarIndex: p.hotbarIndex,
+        // Convert Schema Array to JS Array for storage
+        inventory: Array.from(p.inventory.slots), 
+        // Convert MapSchema to Array for storage
+        items: Array.from(p.items.entries()).map(([uid, item]) => ({
+            uid, kind: item.kind, qty: item.qty, durability: item.durability
+        })),
+        equip: p.equip.toJSON()
+    };
+
+    allData[distinctId] = saveData;
+    fs.writeFileSync(this.playersPath, JSON.stringify(allData, null, 2));
+    console.log(`[PERSIST] Saved data for ${distinctId}`);
+  }
+
+  // --------------------------------------------------------
+  // Room Lifecycle
+  // --------------------------------------------------------
 
   public onCreate(options: any) {
     this.setState(new MyRoomState());
@@ -371,19 +413,19 @@ export class MyRoom extends Room {
 
     // 1. Load World from Disk
     if (fs.existsSync(this.worldPath)) {
-      console.log(`[PERSISTENCE] Loading world from ${this.worldPath}...`);
+      console.log(`[PERSIST] Loading world from ${this.worldPath}...`);
       try {
         const loaded = MyRoom.WORLD.loadFromFileSync(this.worldPath);
         if (loaded) {
-          console.log(`[PERSISTENCE] Loaded ${MyRoom.WORLD.editsCount()} edits.`);
+          console.log(`[PERSIST] Loaded ${MyRoom.WORLD.editsCount()} edits.`);
         } else {
-          console.log(`[PERSISTENCE] File existed but failed to load.`);
+          console.log(`[PERSIST] File existed but failed to load.`);
         }
       } catch (e) {
-        console.error(`[PERSISTENCE] Error loading world:`, e);
+        console.error(`[PERSIST] Error loading world:`, e);
       }
     } else {
-      console.log(`[PERSISTENCE] No save file found at ${this.worldPath}. Starting fresh.`);
+      console.log(`[PERSIST] No save file found at ${this.worldPath}. Starting fresh.`);
     }
 
     // 2. Configure Autosave
@@ -432,6 +474,8 @@ export class MyRoom extends Room {
       });
       
       // Autosave triggered internally by WorldStore logic on dirty + time check
+      MyRoom.WORLD.maybeAutosave();
+
     }, TICK_MS);
 
     // --------------------------------------------------------
@@ -840,41 +884,88 @@ export class MyRoom extends Room {
   public onJoin(client: Client, options: JoinOptions) {
     console.log(client.sessionId, "joined!", "options:", options);
 
+    // 1. Identify the user (use persistent ID or fallback to session ID)
+    const distinctId = options.distinctId || client.sessionId;
+    
+    // Store distinctId on the client object for later use in onLeave
+    (client as any).auth = { distinctId };
+
     const p = new PlayerState();
     p.id = client.sessionId;
     p.name = (options.name || "Steve").trim().substring(0, 16);
     
-    // Spawn
-    p.x = 0; p.y = 10; p.z = 0;
-    p.yaw = 0; p.pitch = 0;
+    // 2. Try to Load Saved Data
+    const saved = this.loadPlayerData(distinctId);
 
-    // Stats
-    p.maxHp = 20; p.hp = 20;
-    p.maxStamina = 100; p.stamina = 100;
+    if (saved) {
+        console.log(`[PERSIST] Restoring player ${distinctId}...`);
+        p.x = isFiniteNum(saved.x) ? saved.x : 0; 
+        p.y = isFiniteNum(saved.y) ? saved.y : 10; 
+        p.z = isFiniteNum(saved.z) ? saved.z : 0;
+        p.yaw = isFiniteNum(saved.yaw) ? saved.yaw : 0; 
+        p.pitch = isFiniteNum(saved.pitch) ? saved.pitch : 0;
+        p.hp = isFiniteNum(saved.hp) ? saved.hp : 20; 
+        p.stamina = isFiniteNum(saved.stamina) ? saved.stamina : 100;
+        p.hotbarIndex = saved.hotbarIndex || 0;
 
-    // Inventory
-    p.inventory.cols = 9; p.inventory.rows = 4;
-    ensureSlotsLength(p);
-    p.hotbarIndex = 0;
+        // Restore Items
+        (saved.items || []).forEach((savedItem: any) => {
+             const it = new ItemState();
+             it.uid = savedItem.uid;
+             it.kind = savedItem.kind;
+             it.qty = savedItem.qty;
+             it.durability = savedItem.durability || 0;
+             it.maxDurability = savedItem.kind.startsWith("tool:") ? 100 : 0;
+             p.items.set(it.uid, it);
+        });
 
-    // Starter Items
-    const add = (kind: string, qty: number, slotIdx: number) => {
-        const uid = makeUid(client.sessionId, kind.split(":")[1] || "item");
-        const it = new ItemState();
-        it.uid = uid;
-        it.kind = kind;
-        it.qty = qty;
-        if (kind.startsWith("tool:")) {
-            it.durability = 100;
-            it.maxDurability = 100;
+        // Restore Inventory Grid
+        p.inventory.cols = 9; p.inventory.rows = 4;
+        ensureSlotsLength(p); // Ensure array exists first
+        (saved.inventory || []).forEach((uid: string, idx: number) => {
+            if (idx < p.inventory.slots.length) p.inventory.slots[idx] = uid;
+        });
+        
+        // Restore Equip
+        if (saved.equip) {
+            p.equip.tool = saved.equip.tool || "";
+            p.equip.head = saved.equip.head || "";
+            p.equip.chest = saved.equip.chest || "";
+            p.equip.legs = saved.equip.legs || "";
+            p.equip.feet = saved.equip.feet || "";
+            p.equip.offhand = saved.equip.offhand || "";
         }
-        p.items.set(uid, it);
-        p.inventory.slots[slotIdx] = uid;
-    };
 
-    add("tool:pickaxe_wood", 1, 0);
-    add("block:dirt", 32, 1);
-    add("block:grass", 16, 2);
+    } else {
+        // 3. New Player Setup (Starter Gear)
+        console.log(`[PERSIST] New player ${distinctId}, giving starter gear.`);
+        p.x = 0; p.y = 10; p.z = 0;
+        p.yaw = 0; p.pitch = 0;
+        p.maxHp = 20; p.hp = 20;
+        p.maxStamina = 100; p.stamina = 100;
+        
+        p.inventory.cols = 9; p.inventory.rows = 4;
+        ensureSlotsLength(p);
+        p.hotbarIndex = 0;
+
+        const add = (kind: string, qty: number, slotIdx: number) => {
+             const uid = makeUid(client.sessionId, kind.split(":")[1] || "item");
+             const it = new ItemState();
+             it.uid = uid;
+             it.kind = kind;
+             it.qty = qty;
+             if (kind.startsWith("tool:")) {
+                 it.durability = 100;
+                 it.maxDurability = 100;
+             }
+             p.items.set(uid, it);
+             p.inventory.slots[slotIdx] = uid;
+        };
+
+        add("tool:pickaxe_wood", 1, 0);
+        add("block:dirt", 32, 1);
+        add("block:grass", 16, 2);
+    }
 
     syncEquipToolToHotbar(p);
     this.state.players.set(client.sessionId, p);
@@ -882,12 +973,20 @@ export class MyRoom extends Room {
     client.send("welcome", { roomId: this.roomId, sessionId: client.sessionId });
 
     // Initial patch around spawn
-    const patch = MyRoom.WORLD.encodePatchAround({ x: 0, y: 10, z: 0 }, 96, { limit: 8000 });
+    const patch = MyRoom.WORLD.encodePatchAround({ x: p.x, y: p.y, z: p.z }, 96, { limit: 8000 });
     client.send("world:patch", patch);
   }
 
-  public onLeave(client: Client, code: CloseCode) {
+  public onLeave(client: Client, code: number) {
     console.log(client.sessionId, "left", code);
+    
+    const p = this.state.players.get(client.sessionId);
+    const distinctId = (client as any).auth?.distinctId;
+
+    if (p && distinctId) {
+        this.savePlayerData(distinctId, p);
+    }
+
     this.state.players.delete(client.sessionId);
     this.lastBlockOpAt.delete(client.sessionId);
   }
