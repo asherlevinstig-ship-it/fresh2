@@ -1,16 +1,16 @@
 // @ts-nocheck
 /*
- * fresh2 - client main/index (FULL NO-OMIT VERSION)
+ * fresh2 - client main/index (FINAL PRODUCTION VERSION)
  * -------------------------------------------------------------------
- * FEATURES:
+ * INCLUDES:
  * - 3x3 Crafting Grid (Virtual Mapping Strategy)
- * - Inventory UI (Drag & Drop, Logic)
+ * - Inventory UI (Drag & Drop, Logic, Splitting)
  * - Server-Authoritative Logic (Colyseus)
  * - World Generation (Synced Bedrock/Trees)
  * - 3D Rigs (FPS Hands + 3rd Person Avatars)
  * - Network Interpolation (Smooth movement)
  * - Debug Console (F4)
- * - FIXED: Render Loop Delta Time calculation
+ * - Dynamic Environment Switching (Localhost vs Prod)
  */
 
 import { Engine } from "noa-engine";
@@ -723,7 +723,11 @@ function snapshotState(me) {
   LOCAL_STATS.stamina = me.stamina;
   LOCAL_HOTBAR.index = me.hotbarIndex;
   
-  LOCAL_INV.slots = (me.inventory.slots || []).map(String);
+  // FIXED: Pad inventory to 36 slots
+  const rawSlots = (me.inventory.slots || []).map(String);
+  while (rawSlots.length < 36) rawSlots.push("");
+  LOCAL_INV.slots = rawSlots;
+
   const items = {};
   if (me.items) me.items.forEach((it, uid) => items[uid] = { kind: it.kind, qty: it.qty });
   LOCAL_INV.items = items;
@@ -739,7 +743,11 @@ function snapshotState(me) {
   hotbarUI.refresh();
 }
 
-const ENDPOINT = "https://us-mia-ea26ba04.colyseus.cloud";
+// DYNAMIC ENDPOINT SWITCH
+const ENDPOINT = (window.location.hostname.includes("localhost"))
+  ? "ws://localhost:2567" 
+  : "wss://fresh2-production.up.railway.app"; // Replace with your actual Colyseus Cloud URL if different
+
 const client = new ColyClient(ENDPOINT);
 
 client.joinOrCreate("my_room", { name: "Steve" }).then(room => {
