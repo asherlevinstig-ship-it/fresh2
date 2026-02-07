@@ -7,23 +7,23 @@
  *   - F4 toggle, F6 clear, F7 toggle console mirroring
  * - F2 toggles browser context menu (for inspector if you still want it)
  * - F3 toggles build debug logs
- * - World generation: grass top layer, dirt below (procedural base terrain)
+ * - World generation: grass top layer, dirt below
  * - First/Third person view mode enforcement EVERY FRAME
  * - FPS rig + 3rd-person avatar rigs (local + remote)
  * - Crosshair overlay
  * - Hotbar overlay (inv:0..8), server-authoritative hotbarIndex
  * - Inventory overlay (I) with drag/drop and split (right-click inside UI)
  * - Colyseus (@colyseus/sdk) state sync + remote interpolation
- *
- * SERVER-AUTHORITATIVE WORLD EDITS (Colyseus):
- * - Mining: client sends "block:break" (no local truth changes)
- * - Building: client sends "block:place" (no local truth changes)
- * - Server broadcasts "block:update" {x,y,z,id} -> client applies noa.setBlock
- *
- * Notes:
- * - Client still procedurally generates base chunks locally (must match server base)
- *   so newly loaded chunks look correct before/without edits.
- * - Authoritative edits from server override local base terrain.
+ * - Mining: SERVER authoritative world:
+ *    - Client sends block:break {x,y,z}
+ *    - Client applies block:update / world:patch from server
+ *    - Inventory add occurs server-side in response to break
+ * - Building: SERVER authoritative world:
+ *    - Client sends block:place {x,y,z,kind}
+ *    - Server consumes hotbar + broadcasts block:update
+ *    - Right-click places ONLY when context menu is disabled
+ *    - Always available via KeyB / KeyE (even when context menu is enabled)
+ *    - Logs reasons to UI console so you can debug in-game
  */
 
 import { Engine } from "noa-engine";
@@ -387,7 +387,7 @@ function safeNum(v, fallback = 0) {
   return typeof v === "number" && Number.isFinite(v) ? v : fallback;
 }
 
-function clamp(v, a, b) {
+function clamp2(v, a, b) {
   return Math.max(a, Math.min(b, v));
 }
 
@@ -446,7 +446,7 @@ function getSafePlayerPos() {
 
   if (isFinite3(p)) {
     const x = p[0];
-    const y = clamp(p[1], -100000, 100000);
+    const y = clamp2(p[1], -100000, 100000);
     const z = p[2];
     STATE.lastValidPlayerPos = [x, y, z];
     return STATE.lastValidPlayerPos;
@@ -643,9 +643,7 @@ function createHotbarOverlay() {
       slots[i].qty.textContent = it && safeNum(it.qty, 0) > 1 ? String(it.qty | 0) : "";
 
       const selected = i === (LOCAL_HOTBAR.index | 0);
-      slots[i].slot.style.borderColor = selected
-        ? "rgba(255,255,255,0.65)"
-        : "rgba(255,255,255,0.12)";
+      slots[i].slot.style.borderColor = selected ? "rgba(255,255,255,0.65)" : "rgba(255,255,255,0.12)";
       slots[i].slot.style.boxShadow = selected ? "0 0 0 2px rgba(255,255,255,0.18) inset" : "none";
     }
   }
@@ -1038,7 +1036,6 @@ const greenish = [0.1, 0.8, 0.2];
 noa.registry.registerMaterial("dirt", { color: brownish });
 noa.registry.registerMaterial("grass", { color: greenish });
 
-// IMPORTANT: IDs must match server WorldStore BLOCK ids
 const dirtID = noa.registry.registerBlock(1, { material: "dirt" });
 const grassID = noa.registry.registerBlock(2, { material: "grass" });
 
@@ -1109,27 +1106,47 @@ function createAvatarRig(scene, namePrefix) {
   head.parent = root;
   head.position.set(0, 1.55, 0);
 
-  const body = BABYLON.MeshBuilder.CreateBox(namePrefix + "_body", { width: 0.7, height: 0.9, depth: 0.35 }, scene);
+  const body = BABYLON.MeshBuilder.CreateBox(
+    namePrefix + "_body",
+    { width: 0.7, height: 0.9, depth: 0.35 },
+    scene
+  );
   body.material = shirtMat;
   body.parent = root;
   body.position.set(0, 0.95, 0);
 
-  const armL = BABYLON.MeshBuilder.CreateBox(namePrefix + "_armL", { width: 0.25, height: 0.8, depth: 0.25 }, scene);
+  const armL = BABYLON.MeshBuilder.CreateBox(
+    namePrefix + "_armL",
+    { width: 0.25, height: 0.8, depth: 0.25 },
+    scene
+  );
   armL.material = shirtMat;
   armL.parent = root;
   armL.position.set(-0.55, 1.05, 0);
 
-  const armR = BABYLON.MeshBuilder.CreateBox(namePrefix + "_armR", { width: 0.25, height: 0.8, depth: 0.25 }, scene);
+  const armR = BABYLON.MeshBuilder.CreateBox(
+    namePrefix + "_armR",
+    { width: 0.25, height: 0.8, depth: 0.25 },
+    scene
+  );
   armR.material = shirtMat;
   armR.parent = root;
   armR.position.set(0.55, 1.05, 0);
 
-  const legL = BABYLON.MeshBuilder.CreateBox(namePrefix + "_legL", { width: 0.28, height: 0.85, depth: 0.28 }, scene);
+  const legL = BABYLON.MeshBuilder.CreateBox(
+    namePrefix + "_legL",
+    { width: 0.28, height: 0.85, depth: 0.28 },
+    scene
+  );
   legL.material = pantsMat;
   legL.parent = root;
   legL.position.set(-0.18, 0.35, 0);
 
-  const legR = BABYLON.MeshBuilder.CreateBox(namePrefix + "_legR", { width: 0.28, height: 0.85, depth: 0.28 }, scene);
+  const legR = BABYLON.MeshBuilder.CreateBox(
+    namePrefix + "_legR",
+    { width: 0.28, height: 0.85, depth: 0.28 },
+    scene
+  );
   legR.material = pantsMat;
   legR.parent = root;
   legR.position.set(0.18, 0.35, 0);
@@ -1240,7 +1257,7 @@ function enforceViewModeEveryFrame() {
     noa.camera.zoomDistance = 0;
     noa.camera.currentZoom = 0;
   } else {
-    const z = clamp(noa.camera.zoomDistance || 6, 2, 12);
+    const z = clamp2(noa.camera.zoomDistance || 6, 2, 12);
     noa.camera.zoomDistance = z;
     noa.camera.currentZoom = z;
   }
@@ -1293,7 +1310,7 @@ function hardFollowThirdPersonCamera() {
 
   const target = MESH.avatarRoot.position.clone();
   const heading = safeNum(noa.camera.heading, 0);
-  const dist = clamp(noa.camera.zoomDistance || 6, 2, 12);
+  const dist = clamp2(noa.camera.zoomDistance || 6, 2, 12);
 
   const backDir = new BABYLON.Vector3(Math.sin(heading), 0, Math.cos(heading));
   const back = backDir.scale(-dist);
@@ -1327,24 +1344,25 @@ function updateFpsRig(dt, speed) {
   STATE.lastHeading = heading;
   STATE.lastPitch = pitch;
 
-  const bobRate = clamp(speed * 7, 0, 12);
+  const bobRate = clamp2(speed * 7, 0, 12);
   STATE.bobPhase += bobRate * dt;
   const bobY = Math.sin(STATE.bobPhase) * 0.03;
   const bobX = Math.sin(STATE.bobPhase * 0.5) * 0.015;
 
-  const swayX = clamp(-dHeading * 1.6, -0.08, 0.08);
-  const swayY = clamp(dPitch * 1.2, -0.06, 0.06);
+  const swayX = clamp2(-dHeading * 1.6, -0.08, 0.08);
+  const swayY = clamp2(dPitch * 1.2, -0.06, 0.06);
 
   let swingAmt = 0;
   if (STATE.swingT < STATE.swingDuration) {
-    const t = clamp(STATE.swingT / STATE.swingDuration, 0, 1);
+    const t = clamp2(STATE.swingT / STATE.swingDuration, 0, 1);
     swingAmt = Math.sin(t * Math.PI) * 1.0;
   }
 
   const wr = MESH.weaponRoot;
-  const s = clamp(dt * 12, 0, 1);
+  const s = clamp2(dt * 12, 0, 1);
 
   const targetPos = new BABYLON.Vector3(bobX + swayX * 0.8, -0.02 + bobY - swingAmt * 0.04, 0);
+
   const targetRot = new BABYLON.Vector3(
     swayY + swingAmt * 0.9,
     swayX * 0.8 + swingAmt * 0.15,
@@ -1364,7 +1382,7 @@ function updateFpsRig(dt, speed) {
 function updateAvatarAnim(parts, speed, grounded, isSwing) {
   if (!parts || !parts.root || !parts.root.isEnabled()) return;
 
-  const walkAmp = grounded ? clamp(speed / 4.5, 0, 1) : 0;
+  const walkAmp = grounded ? clamp2(speed / 4.5, 0, 1) : 0;
   const walkPhase = STATE.bobPhase * 0.6;
 
   const legSwing = Math.sin(walkPhase) * 0.7 * walkAmp;
@@ -1376,7 +1394,7 @@ function updateAvatarAnim(parts, speed, grounded, isSwing) {
 
   let swingAmt = 0;
   if (isSwing) {
-    const t = clamp(STATE.swingT / STATE.swingDuration, 0, 1);
+    const t = clamp2(STATE.swingT / STATE.swingDuration, 0, 1);
     swingAmt = Math.sin(t * Math.PI) * 1.0;
   }
 
@@ -1431,18 +1449,6 @@ function getSelectedHotbarItem() {
   const uid = LOCAL_INV.slots?.[idx] || "";
   const it = uid ? LOCAL_INV.items?.[uid] : null;
   return { idx, uid, it };
-}
-
-function kindToBlockId(kind) {
-  if (kind === "block:dirt") return dirtID;
-  if (kind === "block:grass") return grassID;
-  return 0;
-}
-
-function blockIdToKind(blockId) {
-  if (blockId === dirtID) return "block:dirt";
-  if (blockId === grassID) return "block:grass";
-  return "";
 }
 
 /* ============================================================
@@ -1649,37 +1655,12 @@ function sendSwing() {
 }
 
 /* ============================================================
- * SERVER-AUTH WORLD ACTIONS
+ * BUILDING (SERVER AUTH)
  * ============================================================
  */
 
-function sendBlockBreak(x, y, z) {
-  if (!colyRoom) return;
-  try {
-    colyRoom.send("block:break", { x: x | 0, y: y | 0, z: z | 0 });
-  } catch (e) {}
-}
-
-function sendBlockPlace(x, y, z, blockId, kind = "") {
-  if (!colyRoom) return;
-  try {
-    colyRoom.send("block:place", {
-      x: x | 0,
-      y: y | 0,
-      z: z | 0,
-      blockId: blockId | 0,
-      kind: String(kind || ""),
-    });
-  } catch (e) {}
-}
-
-/* ============================================================
- * BUILDING (client request -> server authoritative)
- * ============================================================
- */
-
-function canPlaceAt(x, y, z) {
-  // prevent placing inside player (client UX gate; server also validates)
+function canPlaceAtClientHint(x, y, z) {
+  // prevent placing inside player
   const p = getSafePlayerPos();
   const px = p[0],
     py = p[1],
@@ -1692,7 +1673,7 @@ function canPlaceAt(x, y, z) {
   const insidePlayer = dx < 0.45 && dz < 0.45 && dy < 1.0;
   if (insidePlayer) return false;
 
-  // must be empty locally (server authoritative will enforce too)
+  // must be empty (local hint only; server final)
   return noa.getBlock(x, y, z) === 0;
 }
 
@@ -1704,6 +1685,11 @@ function placeSelectedBlock(source = "unknown") {
 
   STATE.swingT = 0;
   sendSwing();
+
+  if (!colyRoom) {
+    if (DEBUG_BUILD) uiWarn("[BUILD] no room; cannot place", "src=", source);
+    return;
+  }
 
   if (!noa.targetedBlock) {
     if (DEBUG_BUILD) uiWarn("[BUILD] no targetedBlock (aim at a block face)", "src=", source);
@@ -1720,12 +1706,6 @@ function placeSelectedBlock(source = "unknown") {
   const kind = it?.kind || "";
   if (!kind.startsWith("block:")) {
     if (DEBUG_BUILD) uiWarn("[BUILD] selected item is not a block:", kind, "src=", source);
-    return;
-  }
-
-  const blockId = kindToBlockId(kind);
-  if (!blockId) {
-    if (DEBUG_BUILD) uiWarn("[BUILD] no blockId mapping for:", kind, "src=", source);
     return;
   }
 
@@ -1746,15 +1726,18 @@ function placeSelectedBlock(source = "unknown") {
     }
   }
 
-  if (!canPlaceAt(x, y, z)) {
+  if (!canPlaceAtClientHint(x, y, z)) {
     if (DEBUG_BUILD) uiWarn("[BUILD] blocked (occupied or inside player) at:", x, y, z, "src=", source);
     return;
   }
 
-  // SERVER-AUTH: request placement; server consumes inventory & broadcasts block:update
-  sendBlockPlace(x, y, z, blockId, kind);
-
-  if (DEBUG_BUILD) uiLog("[BUILD] request place", kind, "at", x, y, z, "src=", source);
+  // SERVER-AUTH: request placement. Server will consume hotbar + broadcast block:update.
+  try {
+    colyRoom.send("block:place", { x, y, z, kind });
+    if (DEBUG_BUILD) uiLog("[BUILD] request place", kind, "at", x, y, z, "src=", source);
+  } catch (e) {
+    if (DEBUG_BUILD) uiWarn("[BUILD] send failed:", e);
+  }
 }
 
 /* ============================================================
@@ -1843,8 +1826,7 @@ document.addEventListener(
 
     const canvas = noa?.container?.canvas;
     const overCanvas =
-      e.target === canvas ||
-      (canvas && typeof canvas.contains === "function" && canvas.contains(e.target));
+      e.target === canvas || (canvas && typeof canvas.contains === "function" && canvas.contains(e.target));
 
     if (document.pointerLockElement === canvas || overCanvas) {
       e.preventDefault();
@@ -1858,7 +1840,7 @@ noa.on("tick", function () {
   const scroll = noa.inputs.pointerState.scrolly;
 
   if (scroll !== 0 && viewMode === 1 && !inventoryOpen) {
-    noa.camera.zoomDistance = clamp(noa.camera.zoomDistance + (scroll > 0 ? 1 : -1), 2, 12);
+    noa.camera.zoomDistance = clamp2(noa.camera.zoomDistance + (scroll > 0 ? 1 : -1), 2, 12);
     noa.camera.currentZoom = noa.camera.zoomDistance;
   }
 
@@ -1889,9 +1871,10 @@ window.addEventListener(
   true
 );
 
-// Mine (left click default "fire") -> SERVER-AUTH: block:break
+// Mine (left click default "fire") - SERVER AUTH world
 noa.inputs.down.on("fire", function () {
   if (inventoryOpen) return;
+  if (!colyRoom) return;
 
   STATE.swingT = 0;
   sendSwing();
@@ -1899,14 +1882,12 @@ noa.inputs.down.on("fire", function () {
   if (!noa.targetedBlock) return;
 
   const tgt = noa.targetedBlock.position;
-  const x = tgt[0] | 0;
-  const y = tgt[1] | 0;
-  const z = tgt[2] | 0;
-
-  // SERVER-AUTH: request break; server updates inventory & broadcasts block:update
-  sendBlockBreak(x, y, z);
-
-  if (DEBUG_BUILD) uiLog("[MINE] request break at", x, y, z);
+  try {
+    colyRoom.send("block:break", { x: tgt[0], y: tgt[1], z: tgt[2] });
+    if (DEBUG_BUILD) uiLog("[MINE] request break at", tgt[0], tgt[1], tgt[2]);
+  } catch (e) {
+    if (DEBUG_BUILD) uiWarn("[MINE] send failed:", e);
+  }
 });
 
 // Build (right click) only when browser context menu is disabled
@@ -1933,7 +1914,7 @@ noa.on("beforeRender", function () {
   enforceViewModeEveryFrame();
 
   const now = performance.now();
-  const dt = clamp((now - STATE.lastTime) / 1000, 0, 0.05);
+  const dt = clamp2((now - STATE.lastTime) / 1000, 0, 0.05);
   STATE.lastTime = now;
   STATE.swingT += dt;
 
@@ -2010,9 +1991,7 @@ noa.on("beforeRender", function () {
  */
 
 const ENDPOINT =
-  import.meta.env && import.meta.env.VITE_COLYSEUS_ENDPOINT
-    ? import.meta.env.VITE_COLYSEUS_ENDPOINT
-    : "ws://localhost:2567";
+  import.meta.env && import.meta.env.VITE_COLYSEUS_ENDPOINT ? import.meta.env.VITE_COLYSEUS_ENDPOINT : "ws://localhost:2567";
 
 const colyseusClient = new ColyClient(ENDPOINT);
 
@@ -2025,23 +2004,27 @@ async function connectColyseus() {
 
     uiLog("[MP] connected session:", room.sessionId);
 
+    // ---- Server world replication
+    room.onMessage("block:update", (m) => {
+      if (!m) return;
+      const x = m.x | 0;
+      const y = m.y | 0;
+      const z = m.z | 0;
+      const id = m.id | 0;
+      noa.setBlock(id, x, y, z);
+      if (DEBUG_BUILD) uiLog("[WORLD] block:update", id, "at", x, y, z);
+    });
+
+    room.onMessage("world:patch", (patch) => {
+      const edits = patch?.edits || [];
+      for (const e of edits) {
+        noa.setBlock((e.id | 0) || 0, e.x | 0, e.y | 0, e.z | 0);
+      }
+      uiLog("[WORLD] patch applied:", edits.length, "truncated=", !!patch?.truncated);
+    });
+
     room.onMessage("welcome", (msg) => uiLog("[server] welcome:", msg));
     room.onMessage("hello_ack", (msg) => uiLog("[server] hello_ack:", msg));
-
-    // SERVER-AUTH WORLD UPDATES
-    room.onMessage("block:update", (msg) => {
-      const x = msg?.x | 0;
-      const y = msg?.y | 0;
-      const z = msg?.z | 0;
-      const id = msg?.id | 0;
-
-      // apply authoritative update to local world
-      try {
-        noa.setBlock(id, x, y, z);
-      } catch (e) {}
-
-      if (DEBUG_BUILD) uiLog("[WORLD] apply block:update", { x, y, z, id });
-    });
 
     if (room.state) syncPlayersFromState(room.state);
 
@@ -2067,6 +2050,6 @@ const bootInterval = setInterval(() => {
     clearInterval(bootInterval);
     applyViewModeOnce();
     uiLog("[BOOT] scene ready");
-    uiLog("[HELP] F4 debug console • F3 build logs • B/E build • 1..9 hotbar • I inventory");
+    uiLog("[HELP] F4 debug console • F3 build logs • B/E build • RMB build (if ctx menu disabled) • 1..9 hotbar • I inventory");
   }
 }, 100);
