@@ -1,10 +1,11 @@
-import { Room, Client } from "colyseus"; // Note: 'colyseus' exports these in recent versions, or use @colyseus/core
+import { Room, Client } from "colyseus";
 import * as fs from "fs";
 import * as path from "path";
 
-import { WorldStore, BLOCKS, type BlockId } from "../world/WorldStore";
-import { MyRoomState, PlayerState, ItemState, InventoryState, EquipmentState } from "./schema/MyRoomState";
-import { CraftingSystem } from "../crafting/CraftingSystem";
+// FIX 1: Added .js extensions to imports
+import { WorldStore, BLOCKS, type BlockId } from "../world/WorldStore.js";
+import { MyRoomState, PlayerState, ItemState, InventoryState, EquipmentState } from "./schema/MyRoomState.js";
+import { CraftingSystem } from "../crafting/CraftingSystem.js";
 
 // ------------------------------------------------------------
 // Message Types
@@ -383,18 +384,20 @@ export class MyRoom extends Room<MyRoomState> {
       try { allData = JSON.parse(fs.readFileSync(this.playersPath, "utf8")); } catch (e) {}
     }
     
+    // FIX 2: Explicit casting for the map function to avoid Type 'unknown' error
+    const itemsArray = Array.from(p.items.entries()).map((entry: any) => {
+        const [uid, item] = entry;
+        return { uid, kind: item.kind, qty: item.qty, durability: item.durability };
+    });
+
     // Serialize PlayerState to JSON
     const saveData = {
         x: p.x, y: p.y, z: p.z,
         yaw: p.yaw, pitch: p.pitch,
         hp: p.hp, stamina: p.stamina,
         hotbarIndex: p.hotbarIndex,
-        // Convert Schema Array to JS Array for storage
-        inventory: Array.from(p.inventory.slots), 
-        // Convert MapSchema to Array for storage
-        items: Array.from(p.items.entries()).map(([uid, item]) => ({
-            uid, kind: item.kind, qty: item.qty, durability: item.durability
-        })),
+        inventory: Array.from(p.inventory.slots),
+        items: itemsArray,
         equip: p.equip.toJSON()
     };
 
