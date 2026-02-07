@@ -9,21 +9,27 @@
 // - Swing (stamina cost + timed swinging flag)
 // - Hotbar selection (0..8) (server authoritative)
 // - Inventory + equipment slot moves (drag/drop), stacking, split
-// - Server-authoritative WORLD using WorldStore:
-//    - block:break  -> breaks block in WorldStore + inv:add(kind)
-//    - block:place  -> validates + consumes hotbar + sets WorldStore
-//    - broadcasts block:update {x,y,z,id} to everyone
-//    - onJoin sends world:patch (edits near spawn/player)
-// - equip.tool synced to selected hotbar slot IF item is tool-compatible
+// - Build/mining inventory logic (server authoritative):
+//    - block:break  -> validates + breaks block in WorldStore + awards item
+//    - block:place  -> validates + consumes hotbar + places block in WorldStore
+// - World replication:
+//    - onJoin: sends world:patch around spawn
+//    - on edits: broadcasts block:update {x,y,z,id}
+// - Uses a SINGLETON world store (shared across rooms) so edits persist
+//   across client refreshes (as long as server process stays alive).
 //
-// IMPORTANT:
-// - World base terrain MUST match client getVoxelID (WorldStore does).
-// - Block IDs MUST match client registry (0 air, 1 dirt, 2 grass).
+// NOTE:
+// - This assumes you have:
+//     server/world/world.ts  exporting:  export const WORLD = new WorldStore(...)
+//     server/world/WorldStore.ts exporting: BLOCKS + WorldStore + BlockId
+//
+// If you don’t have world.ts, create it (see import below).
 // ============================================================
 
 import { Room, Client, CloseCode } from "colyseus";
 import { MyRoomState, PlayerState, ItemState } from "./schema/MyRoomState.js";
-import { WorldStore, BLOCKS } from "./world/WorldStore.js";
+import { WORLD } from "../world/world.js";
+import { BLOCKS, type BlockId } from "./world/WorldStore.js";
 
 type JoinOptions = { name?: string };
 
@@ -44,12 +50,8 @@ type InvMoveMsg = { from: string; to: string };
 type InvSplitMsg = { slot: string };
 
 // building/mining inventory logic
-type InvConsumeHotbarMsg = { qty?: number };
-type InvAddMsg = { kind: string; qty?: number };
-
-// SERVER-AUTH world actions
 type BlockBreakMsg = { x: number; y: number; z: number };
-type BlockPlaceMsg = { x: number; y: number; z: number; blockId?: number; kind?: string };
+type BlockPlaceMsg = { x: number; y: number; z: number; kind: string };
 
 // ------------------------------------------------------------
 // utils
@@ -65,12 +67,6 @@ function clamp(n: number, a: number, b: number) {
 
 function nowMs() {
   return Date.now();
-}
-
-function i32(n: any, fallback = 0) {
-  const v = Number(n);
-  if (!Number.isFinite(v)) return fallback;
-  return v | 0;
 }
 
 // ------------------------------------------------------------
@@ -180,6 +176,7 @@ function normalizeHotbarIndex(i: any) {
 }
 
 function syncEquipToolToHotbar(p: PlayerState) {
+  // Minecraft-like: selected hotbar slot becomes equipped tool if compatible.
   ensureSlotsLength(p);
 
   const idx = normalizeHotbarIndex(p.hotbarIndex);
@@ -287,21 +284,21 @@ function addKindToInventory(p: PlayerState, kind: string, qty: number) {
   return qty - remaining;
 }
 
-function consumeFromHotbar(p: PlayerState, qty: number) {
+function consumeFromHotbarBlocks(p: PlayerState, qty: number) {
   ensureSlotsLength(p);
 
   const idx = normalizeHotbarIndex(p.hotbarIndex);
   const uid = String(p.inventory.slots[idx] || "");
-  if (!uid) return 0;
+  if (!uid) return { took: 0, kind: "" };
 
   const it = p.items.get(uid);
-  if (!it) return 0;
+  if (!it) return { took: 0, kind: "" };
 
   const kind = String(it.kind || "");
-  if (!isBlockKind(kind)) return 0;
+  if (!isBlockKind(kind)) return { took: 0, kind: "" };
 
   const cur = isFiniteNum(it.qty) ? it.qty : 0;
-  if (cur <= 0) return 0;
+  if (cur <= 0) return { took: 0, kind: "" };
 
   const take = Math.min(cur, qty);
   it.qty = cur - take;
@@ -311,41 +308,52 @@ function consumeFromHotbar(p: PlayerState, qty: number) {
     p.items.delete(uid);
   }
 
-  return take;
+  return { took: take, kind };
 }
 
 // ------------------------------------------------------------
-// world helpers (kind <-> id)
+// kind <-> blockId mapping (MUST MATCH CLIENT REGISTRY)
 // ------------------------------------------------------------
 
-function blockIdToKind(blockId: number): string {
-  const id = i32(blockId, 0);
+function kindToBlockId(kind: string): BlockId {
+  if (kind === "block:dirt") return BLOCKS.DIRT;
+  if (kind === "block:grass") return BLOCKS.GRASS;
+  return BLOCKS.AIR;
+}
+
+function blockIdToKind(id: BlockId): string {
   if (id === BLOCKS.DIRT) return "block:dirt";
   if (id === BLOCKS.GRASS) return "block:grass";
   return "";
 }
 
-function kindToBlockId(kind: string): number {
-  if (kind === "block:dirt") return BLOCKS.DIRT;
-  if (kind === "block:grass") return BLOCKS.GRASS;
-  return 0;
+// ------------------------------------------------------------
+// validation helpers (server authoritative)
+// ------------------------------------------------------------
+
+function sanitizeWorldXYZ(x: any, y: any, z: any) {
+  // Use WorldStore's sanitizer so constraints are centralized
+  const p = WORLD.sanitizePos(x, y, z);
+  return p;
 }
 
-function isPlaceableBlockId(id: number) {
-  return id === BLOCKS.DIRT || id === BLOCKS.GRASS;
+function isInReach(player: PlayerState, x: number, y: number, z: number, maxDist = 8) {
+  const dx = x + 0.5 - (player.x || 0);
+  const dy = y + 0.5 - ((player.y || 0) + 0.9);
+  const dz = z + 0.5 - (player.z || 0);
+  const d = Math.sqrt(dx * dx + dy * dy + dz * dz);
+  return d <= maxDist;
 }
 
-function dist3(ax: number, ay: number, az: number, bx: number, by: number, bz: number) {
-  const dx = ax - bx;
-  const dy = ay - by;
-  const dz = az - bz;
-  return Math.sqrt(dx * dx + dy * dy + dz * dz);
-}
+function wouldIntersectPlayer(player: PlayerState, x: number, y: number, z: number) {
+  const px = player.x || 0;
+  const py = player.y || 0;
+  const pz = player.z || 0;
 
-function insidePlayerAABB(px: number, py: number, pz: number, x: number, y: number, z: number) {
   const dx = Math.abs(x + 0.5 - px);
   const dz = Math.abs(z + 0.5 - pz);
   const dy = Math.abs(y + 0.5 - (py + 0.9));
+
   return dx < 0.45 && dz < 0.45 && dy < 1.0;
 }
 
@@ -354,15 +362,12 @@ function insidePlayerAABB(px: number, py: number, pz: number, x: number, y: numb
 // ------------------------------------------------------------
 
 export class MyRoom extends Room {
+
   public maxClients = 16;
   public state!: MyRoomState;
 
-  private world!: WorldStore;
-
   public onCreate(options: any) {
     this.setState(new MyRoomState());
-    this.world = new WorldStore({ minCoord: -100000, maxCoord: 100000 });
-
     console.log("room", this.roomId, "created with options:", options);
 
     // ---- Simulation tick
@@ -418,13 +423,9 @@ export class MyRoom extends Room {
 
       if (!isFiniteNum(msg?.x) || !isFiniteNum(msg?.y) || !isFiniteNum(msg?.z)) return;
 
-      const sx = this.world.sanitizeCoord(msg.x);
-      const sy = this.world.sanitizeCoord(msg.y);
-      const sz = this.world.sanitizeCoord(msg.z);
-
-      p.x = sx;
-      p.y = sy;
-      p.z = sz;
+      p.x = clamp(msg.x, -100000, 100000);
+      p.y = clamp(msg.y, -100000, 100000);
+      p.z = clamp(msg.z, -100000, 100000);
 
       if (isFiniteNum(msg.yaw)) p.yaw = msg.yaw;
       if (isFiniteNum(msg.pitch)) p.pitch = clamp(msg.pitch, -Math.PI / 2, Math.PI / 2);
@@ -461,31 +462,6 @@ export class MyRoom extends Room {
       syncEquipToolToHotbar(p);
     });
 
-    // ---- CONSUME from selected hotbar slot (blocks only)
-    this.onMessage("inv:consumeHotbar", (client: Client, msg: InvConsumeHotbarMsg) => {
-      const p = this.state.players.get(client.sessionId);
-      if (!p) return;
-
-      const qtyReq = clamp(Math.floor(Number(msg?.qty ?? 1)), 1, 64);
-
-      const took = consumeFromHotbar(p, qtyReq);
-      if (took > 0) syncEquipToolToHotbar(p);
-    });
-
-    // ---- ADD items to inventory (blocks only; stacking)
-    this.onMessage("inv:add", (client: Client, msg: InvAddMsg) => {
-      const p = this.state.players.get(client.sessionId);
-      if (!p) return;
-
-      const kind = String(msg?.kind || "");
-      if (!isBlockKind(kind)) return;
-
-      const qtyReq = clamp(Math.floor(Number(msg?.qty ?? 1)), 1, 64);
-
-      addKindToInventory(p, kind, qtyReq);
-      syncEquipToolToHotbar(p);
-    });
-
     // ---- Inventory slot moves / stacking / swapping
     this.onMessage("inv:move", (client: Client, msg: InvMoveMsg) => {
       const p = this.state.players.get(client.sessionId);
@@ -513,6 +489,7 @@ export class MyRoom extends Room {
       // equipment compatibility checks
       if (to.kind === "eq") {
         const toKey = to.key;
+
         if (fromItem && !isEquipSlotCompatible(toKey, String(fromItem.kind || ""))) return;
         if (toItem && !isEquipSlotCompatible(toKey, String(toItem.kind || ""))) return;
       }
@@ -585,6 +562,7 @@ export class MyRoom extends Room {
       const qty = isFiniteNum(it.qty) ? it.qty : 0;
       if (qty <= 1) return;
 
+      // find empty slot
       const emptyIdx = firstEmptyInvIndex(p);
       if (emptyIdx === -1) return;
 
@@ -609,67 +587,80 @@ export class MyRoom extends Room {
       syncEquipToolToHotbar(p);
     });
 
-    // ---- SERVER-AUTH WORLD: break block
+    // ---- SERVER AUTH: BREAK BLOCK
     this.onMessage("block:break", (client: Client, msg: BlockBreakMsg) => {
       const p = this.state.players.get(client.sessionId);
       if (!p) return;
 
-      const x = this.world.sanitizeCoord(msg?.x);
-      const y = this.world.sanitizeCoord(msg?.y);
-      const z = this.world.sanitizeCoord(msg?.z);
+      if (!isFiniteNum(msg?.x) || !isFiniteNum(msg?.y) || !isFiniteNum(msg?.z)) return;
 
-      const reach = 8.0;
-      const d = dist3(p.x, p.y + 1.2, p.z, x + 0.5, y + 0.5, z + 0.5);
-      if (d > reach) return;
+      const s = sanitizeWorldXYZ(msg.x, msg.y, msg.z);
+      const x = s.x,
+        y = s.y,
+        z = s.z;
 
-      const prev = this.world.getBlock(x, y, z);
-      if (!prev || prev === BLOCKS.AIR) return;
+      if (!isInReach(p, x, y, z, 8)) return;
 
-      const res = this.world.applyBreak(x, y, z);
+      const prevId = WORLD.getBlock(x, y, z);
+      if (prevId === BLOCKS.AIR) return;
 
-      const kind = blockIdToKind(prev);
+      // break in world
+      const res = WORLD.applyBreak(x, y, z);
+
+      // award item if known
+      const kind = blockIdToKind(prevId);
       if (kind) addKindToInventory(p, kind, 1);
 
       syncEquipToolToHotbar(p);
 
+      // broadcast to all clients
       this.broadcast("block:update", { x, y, z, id: res.newId });
     });
 
-    // ---- SERVER-AUTH WORLD: place block
+    // ---- SERVER AUTH: PLACE BLOCK (consumes hotbar)
     this.onMessage("block:place", (client: Client, msg: BlockPlaceMsg) => {
       const p = this.state.players.get(client.sessionId);
       if (!p) return;
 
-      const x = this.world.sanitizeCoord(msg?.x);
-      const y = this.world.sanitizeCoord(msg?.y);
-      const z = this.world.sanitizeCoord(msg?.z);
-
-      const existing = this.world.getBlock(x, y, z);
-      if (existing !== BLOCKS.AIR) return;
-
-      const reach = 8.0;
-      const d = dist3(p.x, p.y + 1.2, p.z, x + 0.5, y + 0.5, z + 0.5);
-      if (d > reach) return;
-
-      if (insidePlayerAABB(p.x, p.y, p.z, x, y, z)) return;
-
-      let blockId = i32(msg?.blockId, 0);
+      if (!isFiniteNum(msg?.x) || !isFiniteNum(msg?.y) || !isFiniteNum(msg?.z)) return;
       const kind = String(msg?.kind || "");
+      if (!isBlockKind(kind)) return;
 
-      if (kind && isBlockKind(kind)) {
-        const mapped = kindToBlockId(kind);
-        if (mapped) blockId = mapped;
+      const s = sanitizeWorldXYZ(msg.x, msg.y, msg.z);
+      const x = s.x,
+        y = s.y,
+        z = s.z;
+
+      if (!isInReach(p, x, y, z, 8)) return;
+      if (wouldIntersectPlayer(p, x, y, z)) return;
+
+      // must be empty
+      if (WORLD.getBlock(x, y, z) !== BLOCKS.AIR) return;
+
+      // consume 1 from hotbar - must match kind
+      const got = consumeFromHotbarBlocks(p, 1);
+      if (got.took <= 0) return;
+      if (got.kind !== kind) {
+        // put it back (best-effort)
+        addKindToInventory(p, got.kind, got.took);
+        syncEquipToolToHotbar(p);
+        return;
       }
 
-      if (!isPlaceableBlockId(blockId)) return;
+      const id = kindToBlockId(kind);
+      if (!id || id === BLOCKS.AIR) {
+        // invalid mapping -> refund
+        addKindToInventory(p, kind, 1);
+        syncEquipToolToHotbar(p);
+        return;
+      }
 
-      const took = consumeFromHotbar(p, 1);
-      if (took <= 0) return;
-
-      const res = this.world.applyPlace(x, y, z, blockId);
+      // place in world
+      const res = WORLD.applyPlace(x, y, z, id);
 
       syncEquipToolToHotbar(p);
 
+      // broadcast to all clients
       this.broadcast("block:update", { x, y, z, id: res.newId });
     });
 
@@ -751,15 +742,14 @@ export class MyRoom extends Room {
 
     this.state.players.set(client.sessionId, p);
 
+    // ---- Send world patch around spawn (or player)
+    const patch = WORLD.encodePatchAround({ x: p.x | 0, y: p.y | 0, z: p.z | 0 }, 96, { limit: 8000 });
+    client.send("world:patch", patch);
+
     client.send("welcome", {
       roomId: this.roomId,
       sessionId: client.sessionId,
     });
-
-    // Send world edits near player so late joiners see builds
-    const PATCH_RADIUS = 160;
-    const patch = this.world.encodePatchAround({ x: p.x, y: p.y, z: p.z }, PATCH_RADIUS, { limit: 5000 });
-    client.send("world:patch", patch);
   }
 
   public onLeave(client: Client, code: CloseCode) {

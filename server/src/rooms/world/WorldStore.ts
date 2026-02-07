@@ -3,10 +3,10 @@
 // ------------------------------------------------------------
 // Purpose:
 // - Server-authoritative voxel world for a NOA-style Minecraft clone.
-// - Provides deterministic base terrain generation (must match client).
+// - Deterministic base terrain generation (must match client).
 // - Stores ONLY edits (placed/broken blocks) in a compact Map.
-// - Supports chunk snapshots + patching for late joiners.
-// - Designed to be used from Colyseus rooms (MyRoom).
+// - Supports patching for late joiners / resync.
+// - Optional disk persistence so edits survive server restarts.
 //
 // IMPORTANT:
 // - Block IDs MUST match the client registry:
@@ -24,13 +24,22 @@
 //   - getEditsInAABB(min,max) -> array of {x,y,z,id}
 //   - getAllEdits() -> array of {x,y,z,id}
 //   - makeChunkSnapshot(chunkX,chunkY,chunkZ,chunkSize) -> Uint16Array
-//   - encodeEditsPatch(...) -> { edits: {x,y,z,id}[] } for client
+//   - encodeEditsPatch(...) -> { edits: {x,y,z,id}[]; truncated:boolean }
+//   - encodePatchAround(center,radius,opts) -> { edits: ...; truncated:boolean }
+//
+// Persistence (optional):
+//   - loadFromDisk(path?)
+//   - saveToDisk(path?)
+//   - queueSaveToDisk(path?)  (debounced)
 //
 // Notes:
 // - WorldStore does NOT do inventory, reach checks, or permission checks.
 //   That logic lives in the Room.
 // - Coordinates are assumed integer block coords.
 // ============================================================
+
+import fs from "node:fs";
+import path from "node:path";
 
 export type BlockId = number;
 
@@ -41,6 +50,10 @@ export const BLOCKS = {
 } as const;
 
 export type WorldEdit = { x: number; y: number; z: number; id: BlockId };
+
+// ------------------------------------------------------------
+// utils
+// ------------------------------------------------------------
 
 function isFiniteNum(n: any): n is number {
   return typeof n === "number" && Number.isFinite(n);
@@ -62,7 +75,7 @@ function keyOf(x: number, y: number, z: number) {
   return `${x}|${y}|${z}`;
 }
 
-/** Inverse for debugging or utilities (not used by default) */
+/** Inverse for debugging or utilities */
 function parseKey(k: string): { x: number; y: number; z: number } | null {
   if (typeof k !== "string") return null;
   const parts = k.split("|");
@@ -74,6 +87,10 @@ function parseKey(k: string): { x: number; y: number; z: number } | null {
   return { x: x | 0, y: y | 0, z: z | 0 };
 }
 
+// ------------------------------------------------------------
+// base terrain (MUST MATCH CLIENT)
+// ------------------------------------------------------------
+
 /**
  * Deterministic base terrain function.
  * MUST match the client:
@@ -83,13 +100,16 @@ function parseKey(k: string): { x: number; y: number; z: number } | null {
  *   else air
  */
 export function getBaseVoxelID(x: number, y: number, z: number): BlockId {
-  // Use Math.sin/cos exactly as client does
   const height = 2 * Math.sin(x / 10) + 3 * Math.cos(z / 20);
 
   if (y < height - 1) return BLOCKS.DIRT;
   if (y < height) return BLOCKS.GRASS;
   return BLOCKS.AIR;
 }
+
+// ------------------------------------------------------------
+// WorldStore
+// ------------------------------------------------------------
 
 /**
  * WorldStore keeps ONLY edits vs base terrain.
@@ -103,14 +123,26 @@ export class WorldStore {
   public readonly minCoord: number;
   public readonly maxCoord: number;
 
-  constructor(opts?: { minCoord?: number; maxCoord?: number; seed?: number }) {
+  /** persistence */
+  private readonly defaultSavePath: string;
+  private _saveQueued: boolean = false;
+  private _lastSaveOk: boolean = false;
+
+  constructor(opts?: { minCoord?: number; maxCoord?: number; savePath?: string }) {
     this.edits = new Map();
 
-    // seed is unused for now (terrain is deterministic without seed),
-    // but kept so you can extend later to seeded noise.
     this.minCoord = isFiniteNum(opts?.minCoord) ? (opts!.minCoord as number) : -100000;
     this.maxCoord = isFiniteNum(opts?.maxCoord) ? (opts!.maxCoord as number) : 100000;
+
+    this.defaultSavePath =
+      typeof opts?.savePath === "string" && opts.savePath.trim()
+        ? opts.savePath.trim()
+        : path.join(process.cwd(), "world_edits.json");
   }
+
+  // ----------------------------------------------------------
+  // sanitize
+  // ----------------------------------------------------------
 
   /** Clamp coords into safe range for sanity */
   public sanitizeCoord(n: any) {
@@ -126,6 +158,10 @@ export class WorldStore {
       z: this.sanitizeCoord(z),
     };
   }
+
+  // ----------------------------------------------------------
+  // read/write blocks
+  // ----------------------------------------------------------
 
   /** Base block at coordinate (no edits considered) */
   public getBaseBlock(x: number, y: number, z: number): BlockId {
@@ -154,16 +190,17 @@ export class WorldStore {
     z |= 0;
     id = i32(id, BLOCKS.AIR);
 
-    // If id matches base, remove edit.
     const base = this.getBaseBlock(x, y, z);
     const k = keyOf(x, y, z);
 
     if (id === base) {
       this.edits.delete(k);
+      this.queueSaveToDisk();
       return base;
     }
 
     this.edits.set(k, id);
+    this.queueSaveToDisk();
     return id;
   }
 
@@ -194,14 +231,17 @@ export class WorldStore {
     return { prevId, newId };
   }
 
-  /** Returns a shallow copy of the internal edits Map size */
+  // ----------------------------------------------------------
+  // edits inspection
+  // ----------------------------------------------------------
+
   public editsCount() {
     return this.edits.size;
   }
 
-  /** Remove all edits (world reset) */
   public clearAllEdits() {
     this.edits.clear();
+    this.queueSaveToDisk();
   }
 
   /** Get all edits as an array (careful: can be big) */
@@ -248,8 +288,7 @@ export class WorldStore {
 
   /**
    * Builds a chunk snapshot (base + edits merged) for a given chunk origin.
-   * Returns Uint16Array of size chunkSize^3 in X-major order (x -> y -> z)
-   * so you can stream it if you ever want server-side chunk sending.
+   * Returns Uint16Array of size chunkSize^3 in X-major order (x -> y -> z).
    */
   public makeChunkSnapshot(
     chunkX: number,
@@ -284,13 +323,13 @@ export class WorldStore {
     return arr;
   }
 
+  // ----------------------------------------------------------
+  // patch encoding (for clients)
+  // ----------------------------------------------------------
+
   /**
-   * Encode a patch payload for the client. Keeps it plain JSON.
+   * Encode a patch payload for the client (plain JSON).
    * Provide an area; you get back only edits in that area.
-   *
-   * Typical usage:
-   *  - onJoin: send edits in (playerPos +/- viewDistanceBlocks)
-   *  - or send edits for all currently loaded chunks radius
    */
   public encodeEditsPatch(
     min: { x: number; y: number; z: number },
@@ -302,8 +341,7 @@ export class WorldStore {
     const limit = isFiniteNum(opts?.limit) ? Math.max(1, (opts!.limit as number) | 0) : 5000;
 
     if (edits.length > limit) {
-      // deterministic trim (closest to center would be nicer, but no center provided)
-      edits.length = limit;
+      edits.length = limit; // deterministic trim
       return { edits, truncated: true };
     }
 
@@ -322,5 +360,81 @@ export class WorldStore {
     const min = { x: (center.x | 0) - r, y: (center.y | 0) - r, z: (center.z | 0) - r };
     const max = { x: (center.x | 0) + r, y: (center.y | 0) + r, z: (center.z | 0) + r };
     return this.encodeEditsPatch(min, max, opts);
+  }
+
+  // ----------------------------------------------------------
+  // persistence (optional but recommended)
+  // ----------------------------------------------------------
+
+  public getSavePath() {
+    return this.defaultSavePath;
+  }
+
+  public lastSaveOk() {
+    return this._lastSaveOk;
+  }
+
+  public loadFromDisk(customPath?: string) {
+    const p = (customPath || this.defaultSavePath).trim();
+
+    try {
+      if (!fs.existsSync(p)) return false;
+
+      const raw = fs.readFileSync(p, "utf8");
+      const data = JSON.parse(raw);
+
+      this.edits.clear();
+
+      const arr = Array.isArray(data?.edits) ? data.edits : [];
+      for (const e of arr) {
+        const x = this.sanitizeCoord(e?.x);
+        const y = this.sanitizeCoord(e?.y);
+        const z = this.sanitizeCoord(e?.z);
+        const id = i32(e?.id, BLOCKS.AIR);
+
+        // setBlock handles delta-vs-base correctly (removes if matches base)
+        const base = this.getBaseBlock(x, y, z);
+        const k = keyOf(x, y, z);
+
+        if (id === base) {
+          this.edits.delete(k);
+        } else {
+          this.edits.set(k, id);
+        }
+      }
+
+      this._lastSaveOk = true;
+      return true;
+    } catch (err) {
+      console.error("[WorldStore] loadFromDisk failed:", err);
+      this._lastSaveOk = false;
+      return false;
+    }
+  }
+
+  public saveToDisk(customPath?: string) {
+    const p = (customPath || this.defaultSavePath).trim();
+
+    try {
+      const edits = this.getAllEdits();
+      fs.writeFileSync(p, JSON.stringify({ edits }, null, 2), "utf8");
+      this._lastSaveOk = true;
+      return true;
+    } catch (err) {
+      console.error("[WorldStore] saveToDisk failed:", err);
+      this._lastSaveOk = false;
+      return false;
+    }
+  }
+
+  /** Debounced save to avoid writing every block hit */
+  public queueSaveToDisk(customPath?: string) {
+    if (this._saveQueued) return;
+    this._saveQueued = true;
+
+    setTimeout(() => {
+      this._saveQueued = false;
+      this.saveToDisk(customPath);
+    }, 250);
   }
 }
