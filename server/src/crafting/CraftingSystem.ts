@@ -1,21 +1,23 @@
 // ============================================================
 // server/crafting/CraftingSystem.ts  (FULL REWRITE - NO OMITS)
 // ------------------------------------------------------------
-// Supports:
-// - 3x3 grid input (array of 9 kinds), "" for empty
-// - Shapeless recipes: strict exact ingredient count + exact kinds (orderless)
-// - Shaped recipes: supports BOTH
-//    * minimal patterns (e.g. ["#", "#"])
-//    * padded patterns (e.g. ["###", " | ", " | "])
-//   by trimming BOTH the input grid and the recipe pattern to their bounding boxes,
-//   then comparing kind-by-kind using recipe.key.
+// Purpose:
+// - Server-side recipe matching for a 3x3 crafting grid.
+// - Supports:
+//   - Shapeless recipes (exact multiset match)
+//   - Shaped recipes with pattern trimming ("bounding box") so the
+//     recipe can be placed anywhere in the 3x3 as long as the shape matches.
 // Notes:
-// - Pattern rows are normalized to a rectangular matrix (padEnd with " ")
-// - " " in pattern means empty required at that cell
-// - Any non-space char must exist in recipe.key and match expected kind exactly
+// - Grid is array of 9 item kinds (strings). "" means empty.
+// - Recipe patterns use " " (space) for empty cells.
+// - For shaped recipes, we:
+//   1) convert grid -> 3x3 matrix
+//   2) trim empty rows/cols in the input to get its bounding box
+//   3) compare with recipe pattern matrix (dimensions must match)
+//   4) for each cell: space means empty, otherwise map keyChar -> expected kind
 // ============================================================
 
-import { RECIPES, type CraftingRecipe } from "./Recipes.js";
+import { RECIPES, CraftingRecipe } from "./Recipes.js";
 
 export class CraftingSystem {
   /**
@@ -25,7 +27,7 @@ export class CraftingSystem {
   public static findMatch(grid: string[]): CraftingRecipe | null {
     if (!grid || grid.length !== 9) return null;
 
-    // Pre-calculate inputs for shapeless check
+    // Shapeless pre-calc: list of non-empty kinds
     const nonEmpties = grid.filter((k) => k && k !== "");
 
     for (const recipe of RECIPES) {
@@ -40,15 +42,15 @@ export class CraftingSystem {
   }
 
   // ----------------------------------------------------------------
-  // Shapeless Logic (strict count + exact kinds, orderless)
+  // Shapeless Logic
   // ----------------------------------------------------------------
   private static matchesShapeless(inputs: string[], recipe: CraftingRecipe): boolean {
     if (!recipe.ingredients) return false;
 
-    // Exact count match (strict)
+    // Strict count match (Minecraft-like: must match exactly)
     if (inputs.length !== recipe.ingredients.length) return false;
 
-    // Clone to consume
+    // Clone inputs so we can "consume" matches
     const remaining = [...inputs];
 
     for (const required of recipe.ingredients) {
@@ -61,52 +63,52 @@ export class CraftingSystem {
   }
 
   // ----------------------------------------------------------------
-  // Shaped Logic (robust for minimal + padded patterns)
+  // Shaped Logic
   // ----------------------------------------------------------------
   private static matchesShaped(grid: string[], recipe: CraftingRecipe): boolean {
     if (!recipe.pattern || !recipe.key) return false;
 
-    // 1) Convert 9-slot grid -> 3x3 matrix of kinds
+    // 1) Convert flat grid -> 3x3 matrix
     // 0 1 2
     // 3 4 5
     // 6 7 8
-    const inputMatrix: string[][] = [
-      [String(grid[0] || ""), String(grid[1] || ""), String(grid[2] || "")],
-      [String(grid[3] || ""), String(grid[4] || ""), String(grid[5] || "")],
-      [String(grid[6] || ""), String(grid[7] || ""), String(grid[8] || "")],
+    const matrix: string[][] = [
+      [grid[0], grid[1], grid[2]],
+      [grid[3], grid[4], grid[5]],
+      [grid[6], grid[7], grid[8]],
     ];
 
-    // 2) Trim empty rows/cols from INPUT to get bounding box
-    const inputTrim = this.trimKindMatrix(inputMatrix);
-    if (!inputTrim) return false; // completely empty input can't match shaped
+    // 2) Trim empty rows/cols from input to get bounding box
+    const inputShape = this.trimMatrix(matrix);
 
-    // 3) Normalize recipe pattern to rectangular char matrix (pad rows), then trim outer whitespace
-    const recipeNorm = this.normalizePattern(recipe.pattern);
-    const recipeTrim = this.trimPatternMatrix(recipeNorm);
-    if (!recipeTrim) return false; // pattern is effectively empty
+    // If input is completely empty, it cannot match a shaped recipe
+    if (!inputShape || inputShape.length === 0) return false;
 
-    // 4) Compare dimensions
-    if (inputTrim.matrix.length !== recipeTrim.matrix.length) return false;
-    if (inputTrim.matrix[0].length !== recipeTrim.matrix[0].length) return false;
+    // 3) Parse recipe pattern into matrix of chars
+    // e.g. ["###", " | ", " | "] -> [ ["#","#","#"], [" ","|"," "], [" ","|"," "] ]
+    const recipeMatrix = recipe.pattern.map((row) => row.split(""));
 
-    // 5) Compare content cell-by-cell
-    const h = recipeTrim.matrix.length;
-    const w = recipeTrim.matrix[0].length;
+    // 4) Dimensions must match exactly after trimming
+    if (inputShape.length !== recipeMatrix.length) return false;
+    if (!inputShape[0] || inputShape[0].length !== recipeMatrix[0].length) return false;
 
-    for (let r = 0; r < h; r++) {
-      for (let c = 0; c < w; c++) {
-        const inputKind = inputTrim.matrix[r][c];
-        const keyChar = recipeTrim.matrix[r][c];
+    // 5) Compare contents cell-by-cell
+    for (let r = 0; r < inputShape.length; r++) {
+      for (let c = 0; c < inputShape[0].length; c++) {
+        const inputKind = inputShape[r][c];
+        const keyChar = recipeMatrix[r][c];
 
-        // Space in pattern means "must be empty here"
+        // Space in pattern means empty cell required
         if (keyChar === " ") {
           if (inputKind !== "") return false;
           continue;
         }
 
-        // Non-space char must map to an expected kind
+        // Otherwise the pattern expects an ingredient mapped by recipe.key
         const expected = recipe.key[keyChar];
-        if (!expected) return false; // unknown symbol in recipe
+
+        // If the keyChar doesn't exist in the key map, recipe is malformed
+        if (!expected) return false;
 
         if (inputKind !== expected) return false;
       }
@@ -115,43 +117,33 @@ export class CraftingSystem {
     return true;
   }
 
-  // ----------------------------------------------------------------
-  // Helpers: Pattern normalization + trimming
-  // ----------------------------------------------------------------
-
   /**
-   * Normalize pattern rows into a rectangular character matrix.
-   * Pads each row to max width using spaces.
+   * Removes empty rows/cols from a 3x3 grid to find the "active" area
+   * (the bounding box around all non-empty cells).
+   *
+   * Example:
+   * Input:
+   * [
+   *  ["", "A", ""],
+   *  ["", "A", ""],
+   *  ["", "",  ""]
+   * ]
+   * Output:
+   * [
+   *  ["A"],
+   *  ["A"]
+   * ]
    */
-  private static normalizePattern(pattern: string[]): string[][] {
-    const rows = Array.isArray(pattern) ? pattern : [];
-    const maxW = rows.length ? Math.max(...rows.map((r) => (typeof r === "string" ? r.length : 0))) : 0;
-
-    const matrix: string[][] = [];
-    for (let r = 0; r < rows.length; r++) {
-      const rowStr = typeof rows[r] === "string" ? rows[r] : "";
-      const padded = rowStr.padEnd(maxW, " ");
-      matrix.push(padded.split(""));
-    }
-    return matrix;
-  }
-
-  /**
-   * Trim a kind matrix (strings) by removing fully-empty outer rows/cols.
-   * Returns null if the matrix is entirely empty ("").
-   */
-  private static trimKindMatrix(matrix: string[][]): { matrix: string[][]; minR: number; minC: number } | null {
-    const H = matrix.length;
-    const W = H ? matrix[0].length : 0;
-
-    let minR = H,
+  private static trimMatrix(matrix: string[][]): string[][] {
+    // Find bounds containing all non-empty cells
+    let minR = 3,
       maxR = -1,
-      minC = W,
+      minC = 3,
       maxC = -1;
 
-    for (let r = 0; r < H; r++) {
-      for (let c = 0; c < W; c++) {
-        if (String(matrix[r][c] || "") !== "") {
+    for (let r = 0; r < 3; r++) {
+      for (let c = 0; c < 3; c++) {
+        if (matrix[r][c] !== "") {
           if (r < minR) minR = r;
           if (r > maxR) maxR = r;
           if (c < minC) minC = c;
@@ -160,52 +152,19 @@ export class CraftingSystem {
       }
     }
 
-    if (maxR === -1) return null;
+    // Completely empty matrix
+    if (maxR === -1) return [];
 
-    const out: string[][] = [];
+    // Slice out the bounding box
+    const result: string[][] = [];
     for (let r = minR; r <= maxR; r++) {
       const row: string[] = [];
-      for (let c = minC; c <= maxC; c++) row.push(String(matrix[r][c] || ""));
-      out.push(row);
-    }
-
-    return { matrix: out, minR, minC };
-  }
-
-  /**
-   * Trim a pattern matrix (chars) by removing fully-space outer rows/cols.
-   * Returns null if the matrix is entirely spaces.
-   */
-  private static trimPatternMatrix(matrix: string[][]): { matrix: string[][]; minR: number; minC: number } | null {
-    const H = matrix.length;
-    const W = H ? matrix[0].length : 0;
-
-    let minR = H,
-      maxR = -1,
-      minC = W,
-      maxC = -1;
-
-    for (let r = 0; r < H; r++) {
-      for (let c = 0; c < W; c++) {
-        const ch = String(matrix[r][c] ?? " ");
-        if (ch !== " ") {
-          if (r < minR) minR = r;
-          if (r > maxR) maxR = r;
-          if (c < minC) minC = c;
-          if (c > maxC) maxC = c;
-        }
+      for (let c = minC; c <= maxC; c++) {
+        row.push(matrix[r][c]);
       }
+      result.push(row);
     }
 
-    if (maxR === -1) return null;
-
-    const out: string[][] = [];
-    for (let r = minR; r <= maxR; r++) {
-      const row: string[] = [];
-      for (let c = minC; c <= maxC; c++) row.push(String(matrix[r][c] ?? " "));
-      out.push(row);
-    }
-
-    return { matrix: out, minR, minC };
+    return result;
   }
 }

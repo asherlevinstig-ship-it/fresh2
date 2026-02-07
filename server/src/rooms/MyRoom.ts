@@ -1,30 +1,33 @@
 // ============================================================
-// rooms/MyRoom.ts  (FULL REWRITE - NO OMITS)
+// rooms/MyRoom.ts  (FULL REWRITE - NO OMITS, CLEAN + COMPLETE)
 // ------------------------------------------------------------
-// Minecraft-style Crafting Container (Option B) + Minecraft Cursor:
-// - Craft grid is REAL: p.craft.slots[0..8] (uid refs into p.items)
-// - Craft result is server-derived: p.craft.resultKind/resultQty/recipeId
-// - Minecraft cursor is server-authoritative: p.cursor.kind/p.cursor.qty/p.cursor.meta
-// - Supports Minecraft-like interactions via messages:
-//     * "slot:click"   (left click)
-//     * "slot:rclick"  (right click)
-//     * "slot:dblclick" (double click collect)
-//   across inv:*, craft:*, eq:* slots
-// - Keeps all prior logic (movement, stamina, world, persistence, inv:move, inv:split, craft:take)
-// - Hardened: block placement consumes EXACT kind from hotbar
+// Features (ALL LOGIC PRESERVED + Minecraft Inventory UX):
+// - Colyseus Room (no generics) + typed `declare state: MyRoomState`
+// - Persistent world (WorldStore) autosave + onDispose save
+// - Persistent players (players.json) incl inventory/items/equip/craft/cursor
+// - Movement, sprint stamina drain/regen, swing stamina cost, hotbar equip sync
+// - Inventory add/consume helpers, stacking rules, equip compatibility rules
+// - Option B Crafting: REAL craft container p.craft.slots[0..8] (uid strings)
+//   - Server-derived preview: p.craft.resultKind/resultQty/recipeId
+//   - Craft result click: "craft:take" puts result into CURSOR (Minecraft-like)
+// - Minecraft cursor (server authoritative):
+//   - "slot:click" (left): pickup/place/merge/swap
+//   - "slot:rclick" (right): pickup half / place 1 / swap on mismatch
+//   - "slot:dblclick": collect matching stacks into cursor (from inv + craft)
+// - Legacy messages preserved:
+//   - inv:move (drag/drop) across inv/eq/craft
+//   - inv:split (inv only) half -> first empty inv slot
+//   - inv:add, inv:consumeHotbar
+// - World patch request + block break/place with reach & rate limit
+//   - Place consumes EXACT kind from hotbar
 // ============================================================
 
 import { Room, Client } from "colyseus";
 import * as fs from "fs";
 import * as path from "path";
 
-// Imports with .js extensions for Node16/NodeNext resolution
 import { WorldStore, BLOCKS, type BlockId } from "../world/WorldStore.js";
-import {
-  MyRoomState,
-  PlayerState,
-  ItemState,
-} from "./schema/MyRoomState.js";
+import { MyRoomState, PlayerState, ItemState } from "./schema/MyRoomState.js";
 import { CraftingSystem } from "../crafting/CraftingSystem.js";
 import type { CraftingRecipe } from "../crafting/Recipes.js";
 
@@ -53,14 +56,11 @@ type InvSplitMsg = { slot: string };
 type InvConsumeHotbarMsg = { qty?: number };
 type InvAddMsg = { kind: string; qty?: number };
 
-// Option B: client clicks crafting result (server authoritative)
-type CraftTakeMsg = {};
-
-// Minecraft cursor interactions
 type SlotClickMsg = { slot: string };
 type SlotDblClickMsg = { slot?: string };
 
-// World/block messages
+type CraftTakeMsg = {};
+
 type BlockBreakMsg = { x: number; y: number; z: number; src?: string };
 type BlockPlaceMsg = { x: number; y: number; z: number; kind: string; src?: string };
 
@@ -87,6 +87,17 @@ function dist3(ax: number, ay: number, az: number, bx: number, by: number, bz: n
   const dy = ay - by;
   const dz = az - bz;
   return Math.sqrt(dx * dx + dy * dy + dz * dz);
+}
+
+function sanitizeInt(n: any, fallback = 0) {
+  const v = Number(n);
+  if (!Number.isFinite(v)) return fallback;
+  return v | 0;
+}
+
+function isValidBlockCoord(n: any) {
+  const v = Number(n);
+  return Number.isFinite(v) && Math.floor(v) === v;
 }
 
 // ------------------------------------------------------------
@@ -149,11 +160,13 @@ function getSlotUid(p: PlayerState, slot: SlotRef): string {
     if (slot.index < 0 || slot.index >= total) return "";
     return String(p.inventory.slots[slot.index] || "");
   }
+
   if (slot.kind === "eq") {
     return String((p.equip as any)[slot.key] || "");
   }
+
   ensureCraftSlotsLength(p);
-  if (slot.index < 0 || slot.index >= 9) return "";
+  if (slot.index < 0 || slot.index > 8) return "";
   return String(p.craft.slots[slot.index] || "");
 }
 
@@ -174,7 +187,7 @@ function setSlotUid(p: PlayerState, slot: SlotRef, uid: string) {
   }
 
   ensureCraftSlotsLength(p);
-  if (slot.index < 0 || slot.index >= 9) return;
+  if (slot.index < 0 || slot.index > 8) return;
   p.craft.slots[slot.index] = uid;
 }
 
@@ -291,7 +304,7 @@ function addKindToInventory(p: PlayerState, kind: string, qty: number) {
   const maxStack = maxStackForKind(kind);
   let remaining = qty;
 
-  // 1. Stack into existing slots
+  // 1) Stack into existing slots
   while (remaining > 0) {
     const stackUid = findStackableUid(p, kind);
     if (!stackUid) break;
@@ -308,7 +321,7 @@ function addKindToInventory(p: PlayerState, kind: string, qty: number) {
     remaining -= add;
   }
 
-  // 2. Create new stacks in empty slots
+  // 2) New stacks in empty slots
   while (remaining > 0) {
     const idx = firstEmptyInvIndex(p);
     if (idx === -1) break;
@@ -327,40 +340,6 @@ function addKindToInventory(p: PlayerState, kind: string, qty: number) {
   }
 
   return qty - remaining;
-}
-
-function canAddKindToInventory(p: PlayerState, kind: string, qty: number) {
-  ensureSlotsLength(p);
-  if (!kind || qty <= 0) return true;
-
-  const maxStack = maxStackForKind(kind);
-  let remaining = qty;
-
-  // Space in existing stacks
-  if (maxStack > 1) {
-    for (let i = 0; i < p.inventory.slots.length; i++) {
-      const uid = String(p.inventory.slots[i] || "");
-      if (!uid) continue;
-      const it = p.items.get(uid);
-      if (!it) continue;
-      if (String(it.kind || "") !== kind) continue;
-
-      const cur = isFiniteNum(it.qty) ? it.qty : 0;
-      const space = Math.max(0, maxStack - cur);
-      if (space <= 0) continue;
-
-      const take = Math.min(space, remaining);
-      remaining -= take;
-      if (remaining <= 0) return true;
-    }
-  }
-
-  // Space in empty slots
-  const empties = p.inventory.slots.reduce((acc, uid) => acc + (!String(uid || "") ? 1 : 0), 0);
-  const perSlot = Math.max(1, maxStack);
-  const capacityFromEmpties = empties * perSlot;
-
-  return remaining <= capacityFromEmpties;
 }
 
 function consumeFromHotbar(p: PlayerState, qty: number) {
@@ -390,7 +369,6 @@ function consumeFromHotbar(p: PlayerState, qty: number) {
   return take;
 }
 
-// IMPORTANT: server must only consume the exact kind being placed
 function consumeSpecificFromHotbar(p: PlayerState, kind: string, qty: number) {
   ensureSlotsLength(p);
 
@@ -420,11 +398,12 @@ function consumeSpecificFromHotbar(p: PlayerState, kind: string, qty: number) {
 }
 
 // ------------------------------------------------------------
-// Crafting Helpers (Option B)
+// Crafting Helpers (Option B: real craft container)
 // ------------------------------------------------------------
 
 function getCraftKinds(p: PlayerState): string[] {
   ensureCraftSlotsLength(p);
+
   const kinds: string[] = new Array(9).fill("");
   for (let i = 0; i < 9; i++) {
     const uid = String(p.craft.slots[i] || "");
@@ -456,7 +435,8 @@ function recomputeCraftResult(p: PlayerState) {
   p.craft.recipeId = String(match.id || "");
 }
 
-function craftTrimMatrixWithBounds(matrix: string[][]): { trimmed: string[][]; minR: number; minC: number } | null {
+/** Trim input 3x3 matrix to bounding box and return bounds */
+function trimMatrixWithBounds(matrix: string[][]): { trimmed: string[][]; minR: number; minC: number } | null {
   let minR = 3,
     maxR = -1,
     minC = 3,
@@ -485,65 +465,23 @@ function craftTrimMatrixWithBounds(matrix: string[][]): { trimmed: string[][]; m
   return { trimmed, minR, minC };
 }
 
-function patternToMatrixAndTrimWithBounds(pattern: string[]): { trimmed: string[][]; minR: number; minC: number } | null {
-  const maxW = Math.max(...pattern.map((r) => r.length));
-  const raw = pattern.map((row) => row.padEnd(maxW, " ").split(""));
-
-  const H = raw.length;
-  const W = maxW;
-
-  let minR = H,
-    maxR = -1,
-    minC = W,
-    maxC = -1;
-
-  for (let r = 0; r < H; r++) {
-    for (let c = 0; c < W; c++) {
-      if (raw[r][c] !== " ") {
-        if (r < minR) minR = r;
-        if (r > maxR) maxR = r;
-        if (c < minC) minC = c;
-        if (c > maxC) maxC = c;
-      }
-    }
-  }
-
-  if (maxR === -1) return null;
-
-  const trimmed: string[][] = [];
-  for (let r = minR; r <= maxR; r++) {
-    const row: string[] = [];
-    for (let c = minC; c <= maxC; c++) row.push(raw[r][c]);
-    trimmed.push(row);
-  }
-
-  return { trimmed, minR, minC };
-}
-
 /**
- * Consume recipe ingredients from the player's REAL craft grid (p.craft.slots).
- * Assumes recipe match is valid; still performs safety checks.
+ * Consume recipe ingredients from the player's craft container (p.craft.slots).
+ * Assumes CraftingSystem matched; still performs sanity checks.
  */
 function consumeCraftIngredients(p: PlayerState, recipe: CraftingRecipe): boolean {
   ensureCraftSlotsLength(p);
 
   const kinds = getCraftKinds(p);
 
-  const inputMatrix: string[][] = [
-    [kinds[0], kinds[1], kinds[2]],
-    [kinds[3], kinds[4], kinds[5]],
-    [kinds[6], kinds[7], kinds[8]],
-  ];
-
+  // Shapeless: consume 1 from any matching slot per ingredient
   if (recipe.type === "shapeless") {
     if (!recipe.ingredients) return false;
 
     const available: { idx: number; kind: string }[] = [];
     for (let i = 0; i < 9; i++) {
-      const k = kinds[i];
-      if (k) available.push({ idx: i, kind: k });
+      if (kinds[i]) available.push({ idx: i, kind: kinds[i] });
     }
-
     if (available.length !== recipe.ingredients.length) return false;
 
     const used = new Set<number>();
@@ -566,6 +504,7 @@ function consumeCraftIngredients(p: PlayerState, recipe: CraftingRecipe): boolea
     for (const craftIdx of toConsume) {
       const uid = String(p.craft.slots[craftIdx] || "");
       if (!uid) return false;
+
       const it = p.items.get(uid);
       if (!it) return false;
 
@@ -582,27 +521,36 @@ function consumeCraftIngredients(p: PlayerState, recipe: CraftingRecipe): boolea
     return true;
   }
 
+  // Shaped: align trimmed input bounding box to recipe matrix dimensions
   if (!recipe.pattern || !recipe.key) return false;
 
-  const inTrim = craftTrimMatrixWithBounds(inputMatrix);
-  const patTrim = patternToMatrixAndTrimWithBounds(recipe.pattern);
+  const inputMatrix: string[][] = [
+    [kinds[0], kinds[1], kinds[2]],
+    [kinds[3], kinds[4], kinds[5]],
+    [kinds[6], kinds[7], kinds[8]],
+  ];
 
-  if (!inTrim || !patTrim) return false;
+  const inTrim = trimMatrixWithBounds(inputMatrix);
+  if (!inTrim) return false;
 
-  if (inTrim.trimmed.length !== patTrim.trimmed.length) return false;
-  if (inTrim.trimmed[0].length !== patTrim.trimmed[0].length) return false;
+  const recipeMatrix = recipe.pattern.map((row) => row.split(""));
 
-  for (let r = 0; r < patTrim.trimmed.length; r++) {
-    for (let c = 0; c < patTrim.trimmed[0].length; c++) {
-      const ch = patTrim.trimmed[r][c];
-      if (ch === " ") continue;
+  if (inTrim.trimmed.length !== recipeMatrix.length) return false;
+  if (!inTrim.trimmed[0] || inTrim.trimmed[0].length !== recipeMatrix[0].length) return false;
 
-      const expectedKind = recipe.key[ch];
-      if (!expectedKind) return false;
+  // Consume exactly the pattern's non-space positions inside the input's bounding box
+  for (let r = 0; r < recipeMatrix.length; r++) {
+    for (let c = 0; c < recipeMatrix[0].length; c++) {
+      const keyChar = recipeMatrix[r][c];
+      if (keyChar === " ") continue;
+
+      const expected = recipe.key[keyChar];
+      if (!expected) return false;
 
       const absR = inTrim.minR + r;
       const absC = inTrim.minC + c;
       const craftIdx = absR * 3 + absC;
+
       if (craftIdx < 0 || craftIdx > 8) return false;
 
       const uid = String(p.craft.slots[craftIdx] || "");
@@ -611,7 +559,7 @@ function consumeCraftIngredients(p: PlayerState, recipe: CraftingRecipe): boolea
       const it = p.items.get(uid);
       if (!it) return false;
 
-      if (String(it.kind || "") !== expectedKind) return false;
+      if (String(it.kind || "") !== expected) return false;
 
       const cur = isFiniteNum(it.qty) ? it.qty : 0;
       if (cur <= 0) return false;
@@ -628,21 +576,16 @@ function consumeCraftIngredients(p: PlayerState, recipe: CraftingRecipe): boolea
 }
 
 // ------------------------------------------------------------
-// Minecraft Cursor Helpers
+// Minecraft Cursor Helpers (server authoritative)
 // ------------------------------------------------------------
 
 type CursorPayload = {
-  uid?: string;
+  uid?: string; // for tools (non-stackables) we keep original uid
   durability?: number;
   maxDurability?: number;
   itemMeta?: string;
 };
 
-/**
- * CursorState is kind/qty/meta (string).
- * For non-stackables (tools), we preserve the real ItemState uid + durability via cursor.meta JSON.
- * For stackables, cursor.meta is usually empty.
- */
 function cursorIsEmpty(p: PlayerState) {
   const k = String(p.cursor.kind || "");
   const q = isFiniteNum(p.cursor.qty) ? p.cursor.qty : 0;
@@ -676,7 +619,7 @@ function cursorSetStack(p: PlayerState, kind: string, qty: number, metaPayload?:
   if (!p.cursor.kind || p.cursor.qty <= 0) cursorClear(p);
 }
 
-function isCursorToolHoldingUid(p: PlayerState) {
+function cursorIsToolHoldingUid(p: PlayerState) {
   if (cursorIsEmpty(p)) return false;
   const maxS = maxStackForKind(String(p.cursor.kind || ""));
   if (maxS > 1) return false;
@@ -684,54 +627,6 @@ function isCursorToolHoldingUid(p: PlayerState) {
   return !!meta.uid;
 }
 
-/**
- * Get ItemState at a slot (inv/eq/craft) by uid.
- */
-function getSlotItem(p: PlayerState, slot: SlotRef): ItemState | null {
-  const uid = getSlotUid(p, slot);
-  if (!uid) return null;
-  return p.items.get(uid) || null;
-}
-
-function removeSlotItemCompletely(p: PlayerState, slot: SlotRef) {
-  const uid = getSlotUid(p, slot);
-  if (!uid) return;
-  setSlotUid(p, slot, "");
-  // If the item is not referenced anywhere else, we could delete; but we do not track refs.
-  // We keep deletion behavior consistent with original: delete only when qty <= 0 and removed from slot we consumed.
-  // Here we only remove the slot binding; deletion is handled by caller if needed.
-}
-
-function slotIsCraft(slot: SlotRef) {
-  return slot.kind === "craft";
-}
-
-function slotIsEq(slot: SlotRef) {
-  return slot.kind === "eq";
-}
-
-function slotIsInv(slot: SlotRef) {
-  return slot.kind === "inv";
-}
-
-function ensureAllLengths(p: PlayerState) {
-  ensureSlotsLength(p);
-  ensureCraftSlotsLength(p);
-  p.hotbarIndex = normalizeHotbarIndex(p.hotbarIndex);
-}
-
-/**
- * Validate if cursor item can be placed into equipment slot.
- */
-function canPlaceCursorIntoEquip(p: PlayerState, eqKey: EquipKey) {
-  if (cursorIsEmpty(p)) return true;
-  return isEquipSlotCompatible(eqKey, String(p.cursor.kind || ""));
-}
-
-/**
- * Create a new ItemState stack from cursor (stackable) and place into target slot.
- * Returns uid created.
- */
 function createItemFromCursor(p: PlayerState, ownerSessionId: string, kind: string, qty: number): string {
   const uid = makeUid(ownerSessionId, "cursor");
   const it = new ItemState();
@@ -739,7 +634,7 @@ function createItemFromCursor(p: PlayerState, ownerSessionId: string, kind: stri
   it.kind = String(kind || "");
   it.qty = Math.max(0, Math.floor(Number(qty) || 0));
 
-  // Tools typically max stack 1; if cursor kind is tool and cursor meta had durability, restore it
+  // Restore tool details if provided in cursor meta
   if (maxStackForKind(it.kind) <= 1) {
     const meta = cursorGetMeta(p);
     it.durability = isFiniteNum(meta.durability) ? meta.durability! : 0;
@@ -751,298 +646,107 @@ function createItemFromCursor(p: PlayerState, ownerSessionId: string, kind: stri
   return uid;
 }
 
-/**
- * Left click semantics (Minecraft):
- * - If cursor empty:
- *    - pick up full stack from slot into cursor (slot becomes empty)
- * - Else cursor not empty:
- *    - If slot empty: place full cursor stack into slot
- *    - Else slot has item:
- *       - If same kind and stackable: merge as much as possible into slot (up to max stack)
- *         (cursor keeps remainder)
- *       - Else swap cursor and slot (full stacks)
- */
-function handleLeftClick(p: PlayerState, client: Client, slot: SlotRef) {
-  ensureAllLengths(p);
+function canPlaceCursorIntoEquip(p: PlayerState, eqKey: EquipKey) {
+  if (cursorIsEmpty(p)) return true;
+  return isEquipSlotCompatible(eqKey, String(p.cursor.kind || ""));
+}
 
-  // Disallow direct click interactions on craft result (not a SlotRef)
-  // (Handled by craft:take message)
+/** Pickup FULL stack from slot into cursor (left click on slot while cursor empty) */
+function cursorPickupFullFromSlot(p: PlayerState, slot: SlotRef) {
+  const uid = getSlotUid(p, slot);
+  if (!uid) return;
 
-  // Equipment placement compatibility when cursor not empty and target is eq
-  if (!cursorIsEmpty(p) && slot.kind === "eq") {
-    if (!canPlaceCursorIntoEquip(p, slot.key)) return;
-  }
+  const it = p.items.get(uid);
+  if (!it) return;
 
-  const slotUid = getSlotUid(p, slot);
-  const slotItem = slotUid ? p.items.get(slotUid) : null;
+  const kind = String(it.kind || "");
+  const qty = isFiniteNum(it.qty) ? it.qty : 0;
+  if (!kind || qty <= 0) return;
 
-  // Cursor empty -> pickup full stack
-  if (cursorIsEmpty(p)) {
-    if (!slotUid || !slotItem) return;
+  const maxS = maxStackForKind(kind);
 
-    const kind = String(slotItem.kind || "");
-    const qty = isFiniteNum(slotItem.qty) ? slotItem.qty : 0;
-    if (!kind || qty <= 0) return;
-
-    const maxS = maxStackForKind(kind);
-
-    // Non-stackable: preserve uid + durability/maxDurability/meta in cursor.meta and KEEP item in map
-    if (maxS <= 1) {
-      cursorSetStack(p, kind, 1, {
-        uid: String(slotItem.uid || slotUid),
-        durability: isFiniteNum(slotItem.durability) ? slotItem.durability : 0,
-        maxDurability: isFiniteNum(slotItem.maxDurability) ? slotItem.maxDurability : 0,
-        itemMeta: String(slotItem.meta || ""),
-      });
-      // Remove from slot but do NOT delete item
-      setSlotUid(p, slot, "");
-      syncEquipToolToHotbar(p);
-      if (slotIsCraft(slot)) recomputeCraftResult(p);
-      return;
-    }
-
-    // Stackable: move whole stack to cursor; delete item state and clear slot
-    cursorSetStack(p, kind, qty);
-    setSlotUid(p, slot, "");
-    p.items.delete(slotUid);
-
-    syncEquipToolToHotbar(p);
-    if (slotIsCraft(slot)) recomputeCraftResult(p);
-    return;
-  }
-
-  // Cursor not empty
-  const cKind = String(p.cursor.kind || "");
-  const cQty = isFiniteNum(p.cursor.qty) ? p.cursor.qty : 0;
-  if (!cKind || cQty <= 0) {
-    cursorClear(p);
-    return;
-  }
-
-  // If slot empty -> place full cursor into slot
-  if (!slotUid || !slotItem) {
-    // For tools: place original uid back (from cursor.meta), otherwise create new item state
-    const maxS = maxStackForKind(cKind);
-
-    if (maxS <= 1 && isCursorToolHoldingUid(p)) {
-      const meta = cursorGetMeta(p);
-      const uid = String(meta.uid || "");
-      if (!uid) return;
-
-      // If that uid doesn't exist anymore, recreate it from cursor (should not happen normally)
-      if (!p.items.get(uid)) {
-        const uid2 = createItemFromCursor(p, client.sessionId, cKind, 1);
-        setSlotUid(p, slot, uid2);
-      } else {
-        setSlotUid(p, slot, uid);
-      }
-
-      cursorClear(p);
-      syncEquipToolToHotbar(p);
-      if (slotIsCraft(slot)) recomputeCraftResult(p);
-      return;
-    }
-
-    // Stackable: create new item stack for the slot and remove cursor
-    const uid = createItemFromCursor(p, client.sessionId, cKind, cQty);
-    setSlotUid(p, slot, uid);
-    cursorClear(p);
-
-    syncEquipToolToHotbar(p);
-    if (slotIsCraft(slot)) recomputeCraftResult(p);
-    return;
-  }
-
-  // Slot has item
-  const sKind = String(slotItem.kind || "");
-  const sQty = isFiniteNum(slotItem.qty) ? slotItem.qty : 0;
-  const sMax = maxStackForKind(sKind);
-  const cMax = maxStackForKind(cKind);
-
-  // If same kind and both stackable -> merge
-  if (sKind && sKind === cKind && sMax > 1 && cMax > 1) {
-    const space = Math.max(0, sMax - sQty);
-    if (space <= 0) return;
-
-    const moved = Math.min(space, cQty);
-    slotItem.qty = sQty + moved;
-    p.cursor.qty = cQty - moved;
-
-    if ((p.cursor.qty || 0) <= 0) cursorClear(p);
-
-    syncEquipToolToHotbar(p);
-    if (slotIsCraft(slot)) recomputeCraftResult(p);
-    return;
-  }
-
-  // Otherwise swap full stacks
-  // Take slot stack into cursor; put cursor stack into slot.
-
-  // Move slot into cursor:
-  // - If slot is tool: capture uid/durability in cursor meta
-  if (sMax <= 1) {
-    cursorSetStack(p, sKind, 1, {
-      uid: String(slotItem.uid || slotUid),
-      durability: isFiniteNum(slotItem.durability) ? slotItem.durability : 0,
-      maxDurability: isFiniteNum(slotItem.maxDurability) ? slotItem.maxDurability : 0,
-      itemMeta: String(slotItem.meta || ""),
+  // Tool (non-stackable): keep uid in cursor meta, do NOT delete item
+  if (maxS <= 1) {
+    cursorSetStack(p, kind, 1, {
+      uid: String(it.uid || uid),
+      durability: isFiniteNum(it.durability) ? it.durability : 0,
+      maxDurability: isFiniteNum(it.maxDurability) ? it.maxDurability : 0,
+      itemMeta: String(it.meta || ""),
     });
-    // Remove slot binding but keep item
     setSlotUid(p, slot, "");
-  } else {
-    cursorSetStack(p, sKind, sQty);
-    // Remove slot binding and delete old item state (cursor now holds it)
-    setSlotUid(p, slot, "");
-    p.items.delete(slotUid);
-  }
-
-  // Now place old cursor stack into slot (we saved it before overwriting? We didn't.)
-  // So we must capture old cursor BEFORE swap.
-  // To fix: compute swap using temp variables first.
-}
-
-/**
- * Right click semantics (Minecraft):
- * - If cursor empty:
- *    - pick up HALF stack from slot (rounded up) into cursor
- * - Else cursor not empty:
- *    - If slot empty: place ONE item into slot
- *    - Else slot has item:
- *       - If same kind and stackable: place ONE item into slot (if space)
- *       - Else swap full stacks (Minecraft effectively behaves like left click here)
- */
-function handleRightClick(p: PlayerState, client: Client, slot: SlotRef) {
-  ensureAllLengths(p);
-
-  // Equipment placement compatibility
-  if (!cursorIsEmpty(p) && slot.kind === "eq") {
-    if (!canPlaceCursorIntoEquip(p, slot.key)) return;
-  }
-
-  const slotUid = getSlotUid(p, slot);
-  const slotItem = slotUid ? p.items.get(slotUid) : null;
-
-  // Cursor empty -> pickup half
-  if (cursorIsEmpty(p)) {
-    if (!slotUid || !slotItem) return;
-
-    const kind = String(slotItem.kind || "");
-    const qty = isFiniteNum(slotItem.qty) ? slotItem.qty : 0;
-    if (!kind || qty <= 0) return;
-
-    const maxS = maxStackForKind(kind);
-
-    // Non-stackable: right click picks it up (same as left pickup)
-    if (maxS <= 1) {
-      cursorSetStack(p, kind, 1, {
-        uid: String(slotItem.uid || slotUid),
-        durability: isFiniteNum(slotItem.durability) ? slotItem.durability : 0,
-        maxDurability: isFiniteNum(slotItem.maxDurability) ? slotItem.maxDurability : 0,
-        itemMeta: String(slotItem.meta || ""),
-      });
-      setSlotUid(p, slot, "");
-      syncEquipToolToHotbar(p);
-      if (slotIsCraft(slot)) recomputeCraftResult(p);
-      return;
-    }
-
-    // Stackable: take half rounded up
-    const take = Math.ceil(qty / 2);
-    const remain = qty - take;
-
-    cursorSetStack(p, kind, take);
-
-    if (remain > 0) {
-      slotItem.qty = remain;
-    } else {
-      setSlotUid(p, slot, "");
-      p.items.delete(slotUid);
-    }
-
-    syncEquipToolToHotbar(p);
-    if (slotIsCraft(slot)) recomputeCraftResult(p);
     return;
   }
 
-  // Cursor not empty
+  // Stackable: move stack to cursor; delete item state
+  cursorSetStack(p, kind, qty);
+  setSlotUid(p, slot, "");
+  p.items.delete(uid);
+}
+
+/** Place FULL cursor stack into an EMPTY slot */
+function cursorPlaceFullIntoEmptySlot(p: PlayerState, client: Client, slot: SlotRef) {
   const cKind = String(p.cursor.kind || "");
   const cQty = isFiniteNum(p.cursor.qty) ? p.cursor.qty : 0;
-  if (!cKind || cQty <= 0) {
+  if (!cKind || cQty <= 0) return;
+
+  const maxC = maxStackForKind(cKind);
+
+  // Tool: reattach existing uid
+  if (maxC <= 1 && cursorIsToolHoldingUid(p)) {
+    const meta = cursorGetMeta(p);
+    const uid = String(meta.uid || "");
+    if (!uid) return;
+
+    if (!p.items.get(uid)) {
+      const uid2 = createItemFromCursor(p, client.sessionId, cKind, 1);
+      setSlotUid(p, slot, uid2);
+    } else {
+      setSlotUid(p, slot, uid);
+    }
+
     cursorClear(p);
     return;
   }
 
-  // Slot empty -> place ONE
-  if (!slotUid || !slotItem) {
-    const maxC = maxStackForKind(cKind);
-
-    // Tool: place the tool (qty=1), behaves like left click (place full)
-    if (maxC <= 1 && isCursorToolHoldingUid(p)) {
-      const meta = cursorGetMeta(p);
-      const uid = String(meta.uid || "");
-      if (!uid) return;
-
-      if (!p.items.get(uid)) {
-        const uid2 = createItemFromCursor(p, client.sessionId, cKind, 1);
-        setSlotUid(p, slot, uid2);
-      } else {
-        setSlotUid(p, slot, uid);
-      }
-
-      cursorClear(p);
-      syncEquipToolToHotbar(p);
-      if (slotIsCraft(slot)) recomputeCraftResult(p);
-      return;
-    }
-
-    // Stackable: place one item by creating (or stacking into existing, but slot is empty)
-    const uid = createItemFromCursor(p, client.sessionId, cKind, 1);
-    setSlotUid(p, slot, uid);
-
-    p.cursor.qty = cQty - 1;
-    if ((p.cursor.qty || 0) <= 0) cursorClear(p);
-
-    syncEquipToolToHotbar(p);
-    if (slotIsCraft(slot)) recomputeCraftResult(p);
-    return;
-  }
-
-  // Slot has item
-  const sKind = String(slotItem.kind || "");
-  const sQty = isFiniteNum(slotItem.qty) ? slotItem.qty : 0;
-  const sMax = maxStackForKind(sKind);
-  const cMax = maxStackForKind(cKind);
-
-  // Same kind + stackable -> place ONE if space
-  if (sKind === cKind && sMax > 1 && cMax > 1) {
-    const space = Math.max(0, sMax - sQty);
-    if (space <= 0) return;
-
-    slotItem.qty = sQty + 1;
-    p.cursor.qty = cQty - 1;
-
-    if ((p.cursor.qty || 0) <= 0) cursorClear(p);
-
-    syncEquipToolToHotbar(p);
-    if (slotIsCraft(slot)) recomputeCraftResult(p);
-    return;
-  }
-
-  // Otherwise swap full stacks (right click acts like left click when different)
-  handleLeftClickSwap(p, client, slot);
-
-  syncEquipToolToHotbar(p);
-  if (slotIsCraft(slot)) recomputeCraftResult(p);
+  // Stackable: create new item stack
+  const uid = createItemFromCursor(p, client.sessionId, cKind, cQty);
+  setSlotUid(p, slot, uid);
+  cursorClear(p);
 }
 
-/**
- * Left click swap helper:
- * swaps cursor stack and slot stack (full).
- * This is used by left click when different kinds, and by right click on different kinds.
- */
-function handleLeftClickSwap(p: PlayerState, client: Client, slot: SlotRef) {
-  ensureAllLengths(p);
+/** Attempt to merge cursor stack into slot stack (same kind, stackable). Returns true if handled. */
+function cursorTryMergeIntoSlot(p: PlayerState, slot: SlotRef): boolean {
+  const uid = getSlotUid(p, slot);
+  if (!uid) return false;
 
+  const it = p.items.get(uid);
+  if (!it) return false;
+
+  const sKind = String(it.kind || "");
+  const sQty = isFiniteNum(it.qty) ? it.qty : 0;
+
+  const cKind = String(p.cursor.kind || "");
+  const cQty = isFiniteNum(p.cursor.qty) ? p.cursor.qty : 0;
+
+  if (!sKind || !cKind || cQty <= 0) return false;
+  if (sKind !== cKind) return false;
+
+  const maxS = maxStackForKind(sKind);
+  if (maxS <= 1) return false;
+
+  const space = Math.max(0, maxS - sQty);
+  if (space <= 0) return true; // nothing to do but considered handled
+
+  const moved = Math.min(space, cQty);
+  it.qty = sQty + moved;
+  p.cursor.qty = cQty - moved;
+
+  if ((p.cursor.qty || 0) <= 0) cursorClear(p);
+  return true;
+}
+
+/** Swap cursor stack with slot stack (full swap, Minecraft left click mismatch) */
+function cursorSwapWithSlot(p: PlayerState, client: Client, slot: SlotRef) {
   const slotUid = getSlotUid(p, slot);
   const slotItem = slotUid ? p.items.get(slotUid) : null;
 
@@ -1052,35 +756,17 @@ function handleLeftClickSwap(p: PlayerState, client: Client, slot: SlotRef) {
 
   if (!cKind0 || cQty0 <= 0) return;
 
-  // If slot empty, swap becomes place full into slot + clear cursor
+  // If slot is empty, swap degenerates to place full
   if (!slotUid || !slotItem) {
-    const maxC = maxStackForKind(cKind0);
-
-    if (maxC <= 1 && isCursorToolHoldingUid(p)) {
-      const uid = String(cMeta0.uid || "");
-      if (!uid) return;
-      if (!p.items.get(uid)) {
-        const uid2 = createItemFromCursor(p, client.sessionId, cKind0, 1);
-        setSlotUid(p, slot, uid2);
-      } else {
-        setSlotUid(p, slot, uid);
-      }
-      cursorClear(p);
-      return;
-    }
-
-    const uid = createItemFromCursor(p, client.sessionId, cKind0, cQty0);
-    setSlotUid(p, slot, uid);
-    cursorClear(p);
+    cursorPlaceFullIntoEmptySlot(p, client, slot);
     return;
   }
 
-  // Slot has item: capture slot stack
+  // Capture slot stack for new cursor
   const sKind = String(slotItem.kind || "");
   const sQty = isFiniteNum(slotItem.qty) ? slotItem.qty : 0;
   const sMax = maxStackForKind(sKind);
 
-  // Prepare what cursor will become (slot stack)
   let newCursorKind = "";
   let newCursorQty = 0;
   let newCursorMeta: CursorPayload = {};
@@ -1095,64 +781,131 @@ function handleLeftClickSwap(p: PlayerState, client: Client, slot: SlotRef) {
         maxDurability: isFiniteNum(slotItem.maxDurability) ? slotItem.maxDurability : 0,
         itemMeta: String(slotItem.meta || ""),
       };
-      // Remove slot binding but keep tool item in map
+      // remove slot binding only (keep tool item)
       setSlotUid(p, slot, "");
     } else {
       newCursorKind = sKind;
       newCursorQty = sQty;
-      // Remove slot binding and delete old item state (cursor will hold stack)
+      // remove slot binding + delete item state (cursor will hold it)
       setSlotUid(p, slot, "");
       p.items.delete(slotUid);
     }
   }
 
-  // Now place old cursor into the slot
+  // Place old cursor into slot (recreate stack or reattach tool uid)
   const maxC = maxStackForKind(cKind0);
-
   if (maxC <= 1 && cMeta0.uid) {
     const uid = String(cMeta0.uid || "");
     if (!uid) return;
+
     if (!p.items.get(uid)) {
       const uid2 = createItemFromCursor(p, client.sessionId, cKind0, 1);
       setSlotUid(p, slot, uid2);
     } else {
       setSlotUid(p, slot, uid);
     }
-    // old cursor placed, now set cursor to newCursor
-    cursorSetStack(p, newCursorKind, newCursorQty, newCursorMeta);
-    return;
+  } else {
+    const uidPlaced = createItemFromCursor(p, client.sessionId, cKind0, cQty0);
+    setSlotUid(p, slot, uidPlaced);
   }
 
-  const uidPlaced = createItemFromCursor(p, client.sessionId, cKind0, cQty0);
-  setSlotUid(p, slot, uidPlaced);
-
-  // Set cursor to slot stack (or empty if slot was empty/invalid)
+  // Now cursor becomes former slot stack
   cursorSetStack(p, newCursorKind, newCursorQty, newCursorMeta);
 }
 
-/**
- * Double click collect semantics (Minecraft):
- * - If cursor holds a STACKABLE item:
- *    collect matching stacks from inventory + craft grid into cursor, up to max stack size.
- * - Does not pull from equipment.
- */
-function handleDoubleClick(p: PlayerState) {
-  ensureAllLengths(p);
+/** Right-click pickup HALF (ceil) from slot into cursor while cursor empty */
+function cursorPickupHalfFromSlot(p: PlayerState, slot: SlotRef) {
+  const uid = getSlotUid(p, slot);
+  if (!uid) return;
 
+  const it = p.items.get(uid);
+  if (!it) return;
+
+  const kind = String(it.kind || "");
+  const qty = isFiniteNum(it.qty) ? it.qty : 0;
+  if (!kind || qty <= 0) return;
+
+  const maxS = maxStackForKind(kind);
+
+  // Tool: behaves like pickup full
+  if (maxS <= 1) {
+    cursorPickupFullFromSlot(p, slot);
+    return;
+  }
+
+  const take = Math.ceil(qty / 2);
+  const remain = qty - take;
+
+  cursorSetStack(p, kind, take);
+
+  if (remain > 0) {
+    it.qty = remain;
+  } else {
+    setSlotUid(p, slot, "");
+    p.items.delete(uid);
+  }
+}
+
+/** Right-click place ONE item from cursor into slot (empty or same-kind stack). Returns true if handled. */
+function cursorPlaceOneIntoSlot(p: PlayerState, client: Client, slot: SlotRef): boolean {
+  const cKind = String(p.cursor.kind || "");
+  const cQty = isFiniteNum(p.cursor.qty) ? p.cursor.qty : 0;
+  if (!cKind || cQty <= 0) return false;
+
+  const maxC = maxStackForKind(cKind);
+
+  // Tool: right-click place behaves like place full (qty=1)
+  if (maxC <= 1) {
+    const uidSlot = getSlotUid(p, slot);
+    if (uidSlot) return false; // if occupied, let caller swap
+    cursorPlaceFullIntoEmptySlot(p, client, slot);
+    return true;
+  }
+
+  const slotUid = getSlotUid(p, slot);
+  const slotItem = slotUid ? p.items.get(slotUid) : null;
+
+  // Empty slot -> create stack of 1
+  if (!slotUid || !slotItem) {
+    const uidNew = createItemFromCursor(p, client.sessionId, cKind, 1);
+    setSlotUid(p, slot, uidNew);
+
+    p.cursor.qty = cQty - 1;
+    if ((p.cursor.qty || 0) <= 0) cursorClear(p);
+    return true;
+  }
+
+  // Same kind stack with space -> add 1
+  const sKind = String(slotItem.kind || "");
+  const sQty = isFiniteNum(slotItem.qty) ? slotItem.qty : 0;
+
+  if (sKind !== cKind) return false;
+
+  const maxS = maxStackForKind(sKind);
+  if (maxS <= 1) return false;
+
+  if (sQty >= maxS) return true;
+
+  slotItem.qty = sQty + 1;
+  p.cursor.qty = cQty - 1;
+  if ((p.cursor.qty || 0) <= 0) cursorClear(p);
+  return true;
+}
+
+/** Double click: collect matching stacks from inv + craft into cursor (stackables only) */
+function cursorDoubleClickCollect(p: PlayerState) {
   if (cursorIsEmpty(p)) return;
 
   const kind = String(p.cursor.kind || "");
-  const qty = isFiniteNum(p.cursor.qty) ? p.cursor.qty : 0;
+  let qty = isFiniteNum(p.cursor.qty) ? p.cursor.qty : 0;
   if (!kind || qty <= 0) return;
 
   const maxS = maxStackForKind(kind);
   if (maxS <= 1) return;
-
-  let curQty = qty;
-  if (curQty >= maxS) return;
+  if (qty >= maxS) return;
 
   const takeFromSlot = (slot: SlotRef) => {
-    if (curQty >= maxS) return;
+    if (qty >= maxS) return;
 
     const uid = getSlotUid(p, slot);
     if (!uid) return;
@@ -1165,12 +918,12 @@ function handleDoubleClick(p: PlayerState) {
     const sQty = isFiniteNum(it.qty) ? it.qty : 0;
     if (sQty <= 0) return;
 
-    const space = maxS - curQty;
+    const space = maxS - qty;
     const moved = Math.min(space, sQty);
     if (moved <= 0) return;
 
     it.qty = sQty - moved;
-    curQty += moved;
+    qty += moved;
 
     if (it.qty <= 0) {
       setSlotUid(p, slot, "");
@@ -1178,22 +931,21 @@ function handleDoubleClick(p: PlayerState) {
     }
   };
 
-  // Collect from inventory slots first, then craft slots (Minecraft collects from container)
+  // Inventory
   const total = getTotalSlots(p);
   for (let i = 0; i < total; i++) {
     takeFromSlot({ kind: "inv", index: i });
-    if (curQty >= maxS) break;
+    if (qty >= maxS) break;
   }
 
+  // Craft
   for (let i = 0; i < 9; i++) {
     takeFromSlot({ kind: "craft", index: i });
-    if (curQty >= maxS) break;
+    if (qty >= maxS) break;
   }
 
-  p.cursor.qty = curQty;
-
-  syncEquipToolToHotbar(p);
-  recomputeCraftResult(p);
+  p.cursor.qty = qty;
+  if (!p.cursor.kind || (p.cursor.qty || 0) <= 0) cursorClear(p);
 }
 
 // ------------------------------------------------------------
@@ -1223,22 +975,7 @@ function blockIdToKind(id: BlockId): string {
 }
 
 // ------------------------------------------------------------
-// Coordinate Sanity
-// ------------------------------------------------------------
-
-function sanitizeInt(n: any, fallback = 0) {
-  const v = Number(n);
-  if (!Number.isFinite(v)) return fallback;
-  return v | 0;
-}
-
-function isValidBlockCoord(n: any) {
-  const v = Number(n);
-  return Number.isFinite(v) && Math.floor(v) === v;
-}
-
-// ------------------------------------------------------------
-// Room Implementation
+// Room
 // ------------------------------------------------------------
 
 export class MyRoom extends Room {
@@ -1246,11 +983,14 @@ export class MyRoom extends Room {
 
   public maxClients = 16;
 
+  // Shared world per server process
   private static WORLD = new WorldStore({ minCoord: -100000, maxCoord: 100000 });
 
+  // Persistence paths
   private worldPath = path.join(process.cwd(), "world_data.json");
   private playersPath = path.join(process.cwd(), "players.json");
 
+  // Rate limiting
   private lastBlockOpAt = new Map<string, number>();
 
   // --------------------------------------------------------
@@ -1277,6 +1017,9 @@ export class MyRoom extends Room {
       } catch (e) {}
     }
 
+    ensureSlotsLength(p);
+    ensureCraftSlotsLength(p);
+
     const itemsArray = Array.from(p.items.entries()).map((entry: any) => {
       const [uid, item] = entry;
       return {
@@ -1288,9 +1031,6 @@ export class MyRoom extends Room {
         meta: item.meta,
       };
     });
-
-    ensureSlotsLength(p);
-    ensureCraftSlotsLength(p);
 
     const saveData = {
       x: p.x,
@@ -1305,7 +1045,6 @@ export class MyRoom extends Room {
       craft: Array.from(p.craft.slots),
       items: itemsArray,
       equip: p.equip.toJSON(),
-      // Cursor (Minecraft-style)
       cursor: { kind: p.cursor.kind, qty: p.cursor.qty, meta: p.cursor.meta },
     };
 
@@ -1315,23 +1054,20 @@ export class MyRoom extends Room {
   }
 
   // --------------------------------------------------------
-  // Room Lifecycle
+  // Lifecycle
   // --------------------------------------------------------
 
   public onCreate(options: any) {
     this.setState(new MyRoomState());
     console.log("MyRoom created:", this.roomId, options);
 
-    // 1. Load World from Disk
+    // 1) Load World
     if (fs.existsSync(this.worldPath)) {
       console.log(`[PERSIST] Loading world from ${this.worldPath}...`);
       try {
         const loaded = MyRoom.WORLD.loadFromFileSync(this.worldPath);
-        if (loaded) {
-          console.log(`[PERSIST] Loaded ${MyRoom.WORLD.editsCount()} edits.`);
-        } else {
-          console.log(`[PERSIST] File existed but failed to load.`);
-        }
+        if (loaded) console.log(`[PERSIST] Loaded ${MyRoom.WORLD.editsCount()} edits.`);
+        else console.log(`[PERSIST] File existed but failed to load.`);
       } catch (e) {
         console.error(`[PERSIST] Error loading world:`, e);
       }
@@ -1339,14 +1075,11 @@ export class MyRoom extends Room {
       console.log(`[PERSIST] No save file found at ${this.worldPath}. Starting fresh.`);
     }
 
-    // 2. Configure Autosave
-    MyRoom.WORLD.configureAutosave({
-      path: this.worldPath,
-      minIntervalMs: 30000,
-    });
+    // 2) Autosave
+    MyRoom.WORLD.configureAutosave({ path: this.worldPath, minIntervalMs: 30000 });
 
-    // 3. Simulation Tick
-    const TICK_MS = 50; // 20 Hz
+    // 3) Simulation Tick
+    const TICK_MS = 50;
     const STAMINA_DRAIN_PER_SEC = 18;
     const STAMINA_REGEN_PER_SEC = 12;
     const SWING_COST = 8;
@@ -1366,7 +1099,7 @@ export class MyRoom extends Room {
         p.hp = clamp(isFiniteNum(p.hp) ? p.hp : p.maxHp, 0, p.maxHp);
         p.stamina = clamp(isFiniteNum(p.stamina) ? p.stamina : p.maxStamina, 0, p.maxStamina);
 
-        // Sprint drain/regen
+        // Sprint
         if (p.sprinting) {
           const drain = STAMINA_DRAIN_PER_SEC * dt;
           p.stamina = clamp(p.stamina - drain, 0, p.maxStamina);
@@ -1380,11 +1113,11 @@ export class MyRoom extends Room {
         const t0 = lastSwingAt.get(sid) || 0;
         if (p.swinging && nowMs() - t0 > SWING_FLAG_MS) p.swinging = false;
 
-        // Sync Equip
+        // Sync equip
         p.hotbarIndex = normalizeHotbarIndex(p.hotbarIndex);
         syncEquipToolToHotbar(p);
 
-        // Keep craft preview accurate
+        // Craft preview
         recomputeCraftResult(p);
 
         // Cursor sanity
@@ -1397,7 +1130,7 @@ export class MyRoom extends Room {
     }, TICK_MS);
 
     // --------------------------------------------------------
-    // Movement Handlers
+    // Movement
     // --------------------------------------------------------
 
     this.onMessage("move", (client: Client, msg: MoveMsg) => {
@@ -1444,7 +1177,7 @@ export class MyRoom extends Room {
     });
 
     // --------------------------------------------------------
-    // Inventory Handlers (legacy + drag/drop + split)
+    // Inventory (legacy)
     // --------------------------------------------------------
 
     this.onMessage("inv:consumeHotbar", (client: Client, msg: InvConsumeHotbarMsg) => {
@@ -1465,10 +1198,7 @@ export class MyRoom extends Room {
       syncEquipToolToHotbar(p);
     });
 
-    /**
-     * Legacy move handler (drag & drop) across inv/eq/craft.
-     * This remains available even with cursor logic.
-     */
+    // Drag/drop across inv/eq/craft
     this.onMessage("inv:move", (client: Client, msg: InvMoveMsg) => {
       const p = this.state.players.get(client.sessionId);
       if (!p) return;
@@ -1497,13 +1227,13 @@ export class MyRoom extends Room {
       const fromItem = fromUid ? p.items.get(fromUid) : null;
       const toItem = toUid ? p.items.get(toUid) : null;
 
-      // Equipment compatibility
+      // Equip compatibility
       if (to.kind === "eq") {
         if (fromItem && !isEquipSlotCompatible(to.key, String(fromItem.kind || ""))) return;
         if (toItem && !isEquipSlotCompatible(to.key, String(toItem.kind || ""))) return;
       }
 
-      // Empty destination: move
+      // Move into empty
       if (!toUid) {
         setSlotUid(p, to, fromUid);
         setSlotUid(p, from, "");
@@ -1512,7 +1242,7 @@ export class MyRoom extends Room {
         return;
       }
 
-      // Empty source: move
+      // Move from empty
       if (!fromUid) {
         setSlotUid(p, from, toUid);
         setSlotUid(p, to, "");
@@ -1545,17 +1275,14 @@ export class MyRoom extends Room {
         }
       }
 
-      // Direct swap
+      // Swap
       setSlotUid(p, to, fromUid);
       setSlotUid(p, from, toUid);
       syncEquipToolToHotbar(p);
       if (from.kind === "craft" || to.kind === "craft") recomputeCraftResult(p);
     });
 
-    /**
-     * Legacy split (inv only): splits stack in half to first empty inv slot.
-     * Cursor-based splitting uses slot:rclick with empty cursor.
-     */
+    // Legacy split (inv only) -> first empty inv slot
     this.onMessage("inv:split", (client: Client, msg: InvSplitMsg) => {
       const p = this.state.players.get(client.sessionId);
       if (!p) return;
@@ -1564,6 +1291,7 @@ export class MyRoom extends Room {
       if (!slot || slot.kind !== "inv") return;
 
       ensureSlotsLength(p);
+
       const uid = getSlotUid(p, slot);
       if (!uid) return;
 
@@ -1598,7 +1326,7 @@ export class MyRoom extends Room {
     });
 
     // --------------------------------------------------------
-    // Minecraft Cursor Interaction Handlers
+    // Minecraft Cursor Messages
     // --------------------------------------------------------
 
     this.onMessage("slot:click", (client: Client, msg: SlotClickMsg) => {
@@ -1608,18 +1336,38 @@ export class MyRoom extends Room {
       const slot = parseSlotRef(msg?.slot);
       if (!slot) return;
 
-      // For safety: if slot is eq and cursor item incompatible, ignore
+      ensureSlotsLength(p);
+      ensureCraftSlotsLength(p);
+
+      // Equip restriction
       if (!cursorIsEmpty(p) && slot.kind === "eq") {
         if (!canPlaceCursorIntoEquip(p, slot.key)) return;
       }
 
-      // Left click:
-      // - If cursor empty: pickup full
-      // - Else: place/merge/swap
+      const slotUid = getSlotUid(p, slot);
+
+      // Cursor empty -> pickup full
       if (cursorIsEmpty(p)) {
-        handleLeftPickup(p, client, slot);
-      } else {
-        handleLeftPlaceOrMergeOrSwap(p, client, slot);
+        cursorPickupFullFromSlot(p, slot);
+        syncEquipToolToHotbar(p);
+        if (slot.kind === "craft") recomputeCraftResult(p);
+        return;
+      }
+
+      // Cursor not empty
+      // If slot empty -> place full
+      if (!slotUid) {
+        cursorPlaceFullIntoEmptySlot(p, client, slot);
+        syncEquipToolToHotbar(p);
+        if (slot.kind === "craft") recomputeCraftResult(p);
+        return;
+      }
+
+      // Slot occupied:
+      // Try merge; if not possible -> swap
+      const merged = cursorTryMergeIntoSlot(p, slot);
+      if (!merged) {
+        cursorSwapWithSlot(p, client, slot);
       }
 
       syncEquipToolToHotbar(p);
@@ -1633,8 +1381,32 @@ export class MyRoom extends Room {
       const slot = parseSlotRef(msg?.slot);
       if (!slot) return;
 
-      // Right click:
-      handleRightClick(p, client, slot);
+      ensureSlotsLength(p);
+      ensureCraftSlotsLength(p);
+
+      // Equip restriction
+      if (!cursorIsEmpty(p) && slot.kind === "eq") {
+        if (!canPlaceCursorIntoEquip(p, slot.key)) return;
+      }
+
+      const slotUid = getSlotUid(p, slot);
+
+      // Cursor empty -> pickup half
+      if (cursorIsEmpty(p)) {
+        cursorPickupHalfFromSlot(p, slot);
+        syncEquipToolToHotbar(p);
+        if (slot.kind === "craft") recomputeCraftResult(p);
+        return;
+      }
+
+      // Cursor not empty:
+      // Try place one (empty or same stack). If can't, swap.
+      const handled = cursorPlaceOneIntoSlot(p, client, slot);
+      if (!handled) {
+        // If slot is empty and couldn't place (rare), fallback to place full
+        if (!slotUid) cursorPlaceFullIntoEmptySlot(p, client, slot);
+        else cursorSwapWithSlot(p, client, slot);
+      }
 
       syncEquipToolToHotbar(p);
       if (slot.kind === "craft") recomputeCraftResult(p);
@@ -1644,26 +1416,19 @@ export class MyRoom extends Room {
       const p = this.state.players.get(client.sessionId);
       if (!p) return;
 
-      handleDoubleClick(p);
+      ensureSlotsLength(p);
+      ensureCraftSlotsLength(p);
+
+      cursorDoubleClickCollect(p);
 
       syncEquipToolToHotbar(p);
       recomputeCraftResult(p);
     });
 
     // --------------------------------------------------------
-    // Crafting Handler (Option B) - Result Click
+    // Crafting Result Click (Option B)
     // --------------------------------------------------------
 
-    /**
-     * Client clicks the crafting result slot.
-     * Minecraft-like behavior:
-     * - If cursor empty: result goes to cursor (up to max stack)
-     * - If cursor same kind and has space: add into cursor
-     * - Otherwise: reject
-     *
-     * Consumes ingredients from craft grid and repeats ONLY once per click (like a normal click).
-     * (Shift-click multi-craft can be added later as a separate message.)
-     */
     this.onMessage("craft:take", (client: Client, _msg: CraftTakeMsg) => {
       const p = this.state.players.get(client.sessionId);
       if (!p) return;
@@ -1685,29 +1450,21 @@ export class MyRoom extends Room {
       const match = CraftingSystem.findMatch(kinds);
 
       if (!match) {
-        p.craft.resultKind = "";
-        p.craft.resultQty = 0;
-        p.craft.recipeId = "";
+        recomputeCraftResult(p);
         client.send("craft:reject", { reason: "no_match" });
         return;
       }
 
-      if (String(match.result.kind || "") !== resultKind || (match.result.qty || 0) !== resultQty) {
-        recomputeCraftResult(p);
-        client.send("craft:reject", { reason: "result_changed" });
-        return;
-      }
-
-      // Cursor placement rules
+      // Cursor placement rules for result
       const maxS = maxStackForKind(resultKind);
+
       if (maxS <= 1) {
-        // Non-stackable crafted item: cursor must be empty
+        // Tool result: cursor must be empty
         if (!cursorIsEmpty(p)) {
           client.send("craft:reject", { reason: "cursor_not_empty" });
           return;
         }
       } else {
-        // Stackable: cursor must be empty OR same kind with enough space
         if (!cursorIsEmpty(p)) {
           if (String(p.cursor.kind || "") !== resultKind) {
             client.send("craft:reject", { reason: "cursor_wrong_kind" });
@@ -1721,7 +1478,7 @@ export class MyRoom extends Room {
         }
       }
 
-      // Consume from craft grid
+      // Consume ingredients from craft container
       const ok = consumeCraftIngredients(p, match);
       if (!ok) {
         recomputeCraftResult(p);
@@ -1729,22 +1486,37 @@ export class MyRoom extends Room {
         return;
       }
 
-      // Put result into cursor
-      if (cursorIsEmpty(p)) {
-        cursorSetStack(p, resultKind, resultQty);
+      // Put result into cursor (stackable) or create tool item + store uid in cursor meta
+      if (maxS <= 1) {
+        // Create tool item instance, then store its uid in cursor meta
+        const uid = makeUid(client.sessionId, "crafted");
+        const it = new ItemState();
+        it.uid = uid;
+        it.kind = resultKind;
+        it.qty = 1;
+        it.maxDurability = resultKind.startsWith("tool:") ? 100 : 0;
+        it.durability = it.maxDurability ? it.maxDurability : 0;
+        p.items.set(uid, it);
+
+        cursorSetStack(p, resultKind, 1, {
+          uid,
+          durability: it.durability,
+          maxDurability: it.maxDurability,
+          itemMeta: String(it.meta || ""),
+        });
       } else {
-        // same kind stackable case
-        const cQty = isFiniteNum(p.cursor.qty) ? p.cursor.qty : 0;
-        p.cursor.qty = cQty + resultQty;
+        if (cursorIsEmpty(p)) cursorSetStack(p, resultKind, resultQty);
+        else p.cursor.qty = (isFiniteNum(p.cursor.qty) ? p.cursor.qty : 0) + resultQty;
       }
 
       recomputeCraftResult(p);
+      syncEquipToolToHotbar(p);
 
       client.send("craft:success", { item: resultKind, qty: resultQty });
     });
 
     // --------------------------------------------------------
-    // World & Block Handlers
+    // World / Blocks
     // --------------------------------------------------------
 
     this.onMessage("world:patch:req", (client: Client, msg: WorldPatchReqMsg) => {
@@ -1759,7 +1531,6 @@ export class MyRoom extends Room {
       const limit = clamp(Math.floor(Number(msg?.limit ?? 5000)), 100, 50000);
 
       const patch = MyRoom.WORLD.encodePatchAround({ x: cx, y: cy, z: cz }, r, { limit });
-
       client.send("world:patch", patch);
     });
 
@@ -1775,16 +1546,8 @@ export class MyRoom extends Room {
       return true;
     };
 
-    const withinWorld = (x: number, y: number, z: number) => {
-      return (
-        x >= -MAX_COORD &&
-        x <= MAX_COORD &&
-        y >= -MAX_COORD &&
-        y <= MAX_COORD &&
-        z >= -MAX_COORD &&
-        z <= MAX_COORD
-      );
-    };
+    const withinWorld = (x: number, y: number, z: number) =>
+      x >= -MAX_COORD && x <= MAX_COORD && y >= -MAX_COORD && y <= MAX_COORD && z >= -MAX_COORD && z <= MAX_COORD;
 
     const reject = (client: Client, reason: string, extra?: any) => {
       client.send("block:reject", { reason, ...(extra || {}) });
@@ -1801,6 +1564,7 @@ export class MyRoom extends Room {
       }
 
       if (!isValidBlockCoord(msg?.x) || !isValidBlockCoord(msg?.y) || !isValidBlockCoord(msg?.z)) return;
+
       const x = sanitizeInt(msg.x, 0);
       const y = sanitizeInt(msg.y, 0);
       const z = sanitizeInt(msg.z, 0);
@@ -1848,6 +1612,7 @@ export class MyRoom extends Room {
       }
 
       if (!isValidBlockCoord(msg?.x) || !isValidBlockCoord(msg?.y) || !isValidBlockCoord(msg?.z)) return;
+
       const x = sanitizeInt(msg.x, 0);
       const y = sanitizeInt(msg.y, 0);
       const z = sanitizeInt(msg.z, 0);
@@ -1875,7 +1640,7 @@ export class MyRoom extends Room {
         return;
       }
 
-      // Consume EXACT kind from hotbar
+      // Consume EXACT kind
       const took = consumeSpecificFromHotbar(p, kind, 1);
       if (took <= 0) {
         reject(client, "no_matching_block_in_hotbar", { op: "place", src, kind });
@@ -1890,125 +1655,6 @@ export class MyRoom extends Room {
     this.onMessage("hello", (client: Client, _message: any) => {
       client.send("hello_ack", { ok: true, serverTime: Date.now() });
     });
-
-    // --------------------------------------------------------
-    // Internal: Minecraft left click helpers (implemented here to keep file cohesive)
-    // --------------------------------------------------------
-
-    function pickupFullIntoCursor(p: PlayerState, slot: SlotRef) {
-      const uid = getSlotUid(p, slot);
-      if (!uid) return;
-
-      const it = p.items.get(uid);
-      if (!it) return;
-
-      const kind = String(it.kind || "");
-      const qty = isFiniteNum(it.qty) ? it.qty : 0;
-      if (!kind || qty <= 0) return;
-
-      const maxS = maxStackForKind(kind);
-
-      if (maxS <= 1) {
-        cursorSetStack(p, kind, 1, {
-          uid: String(it.uid || uid),
-          durability: isFiniteNum(it.durability) ? it.durability : 0,
-          maxDurability: isFiniteNum(it.maxDurability) ? it.maxDurability : 0,
-          itemMeta: String(it.meta || ""),
-        });
-        setSlotUid(p, slot, "");
-        return;
-      }
-
-      cursorSetStack(p, kind, qty);
-      setSlotUid(p, slot, "");
-      p.items.delete(uid);
-    }
-
-    function placeCursorFullIntoEmptySlot(p: PlayerState, client: Client, slot: SlotRef) {
-      const cKind = String(p.cursor.kind || "");
-      const cQty = isFiniteNum(p.cursor.qty) ? p.cursor.qty : 0;
-      if (!cKind || cQty <= 0) return;
-
-      const maxC = maxStackForKind(cKind);
-
-      if (maxC <= 1 && isCursorToolHoldingUid(p)) {
-        const meta = cursorGetMeta(p);
-        const uid = String(meta.uid || "");
-        if (!uid) return;
-
-        if (!p.items.get(uid)) {
-          const uid2 = createItemFromCursor(p, client.sessionId, cKind, 1);
-          setSlotUid(p, slot, uid2);
-        } else {
-          setSlotUid(p, slot, uid);
-        }
-
-        cursorClear(p);
-        return;
-      }
-
-      const uid = createItemFromCursor(p, client.sessionId, cKind, cQty);
-      setSlotUid(p, slot, uid);
-      cursorClear(p);
-    }
-
-    function mergeCursorIntoSlotIfPossible(p: PlayerState, slot: SlotRef): boolean {
-      const uid = getSlotUid(p, slot);
-      if (!uid) return false;
-
-      const it = p.items.get(uid);
-      if (!it) return false;
-
-      const sKind = String(it.kind || "");
-      const sQty = isFiniteNum(it.qty) ? it.qty : 0;
-      const cKind = String(p.cursor.kind || "");
-      const cQty = isFiniteNum(p.cursor.qty) ? p.cursor.qty : 0;
-
-      if (!sKind || !cKind || cQty <= 0) return false;
-      if (sKind !== cKind) return false;
-
-      const maxS = maxStackForKind(sKind);
-      if (maxS <= 1) return false;
-
-      const space = Math.max(0, maxS - sQty);
-      if (space <= 0) return true;
-
-      const moved = Math.min(space, cQty);
-      it.qty = sQty + moved;
-      p.cursor.qty = cQty - moved;
-      if ((p.cursor.qty || 0) <= 0) cursorClear(p);
-      return true;
-    }
-
-    function swapCursorWithSlot(p: PlayerState, client: Client, slot: SlotRef) {
-      // Use the already-correct swap implementation
-      handleLeftClickSwap(p, client, slot);
-    }
-
-    function handleLeftPickup(p: PlayerState, client: Client, slot: SlotRef) {
-      // cursor empty -> pickup full
-      pickupFullIntoCursor(p, slot);
-    }
-
-    function handleLeftPlaceOrMergeOrSwap(p: PlayerState, client: Client, slot: SlotRef) {
-      const uid = getSlotUid(p, slot);
-      const it = uid ? p.items.get(uid) : null;
-
-      // Equipment restriction
-      if (slot.kind === "eq" && !canPlaceCursorIntoEquip(p, slot.key)) return;
-
-      if (!uid || !it) {
-        placeCursorFullIntoEmptySlot(p, client, slot);
-        return;
-      }
-
-      // Try merge
-      const merged = mergeCursorIntoSlotIfPossible(p, slot);
-      if (merged) return;
-
-      // Swap
-      swapCursorWithSlot(p, client, slot);
-    }
   }
 
   public onJoin(client: Client, options: JoinOptions) {
@@ -2066,7 +1712,6 @@ export class MyRoom extends Room {
         p.equip.offhand = saved.equip.offhand || "";
       }
 
-      // Restore cursor (optional)
       if (saved.cursor) {
         p.cursor.kind = String(saved.cursor.kind || "");
         p.cursor.qty = Math.max(0, Math.floor(Number(saved.cursor.qty || 0)));
@@ -2077,11 +1722,13 @@ export class MyRoom extends Room {
       }
     } else {
       console.log(`[PERSIST] New player ${distinctId}, giving starter gear.`);
+
       p.x = 0;
       p.y = 10;
       p.z = 0;
       p.yaw = 0;
       p.pitch = 0;
+
       p.maxHp = 20;
       p.hp = 20;
       p.maxStamina = 100;
@@ -2121,6 +1768,7 @@ export class MyRoom extends Room {
 
     client.send("welcome", { roomId: this.roomId, sessionId: client.sessionId });
 
+    // Initial patch around spawn
     const patch = MyRoom.WORLD.encodePatchAround({ x: p.x, y: p.y, z: p.z }, 96, { limit: 8000 });
     client.send("world:patch", patch);
   }
@@ -2131,9 +1779,7 @@ export class MyRoom extends Room {
     const p = this.state.players.get(client.sessionId);
     const distinctId = (client as any).auth?.distinctId;
 
-    if (p && distinctId) {
-      this.savePlayerData(distinctId, p);
-    }
+    if (p && distinctId) this.savePlayerData(distinctId, p);
 
     this.state.players.delete(client.sessionId);
     this.lastBlockOpAt.delete(client.sessionId);
