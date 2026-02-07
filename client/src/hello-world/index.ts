@@ -14,8 +14,8 @@
  */
 
 import { Engine } from "noa-engine";
-import Colyseus from "colyseus.js";
 import * as BABYLON from "babylonjs";
+import * as Colyseus from "colyseus.js"; // Adjusted import for better compatibility
 
 /* ============================================================
  * 1. RECIPE DATA & SYSTEM (Client-Side Prediction)
