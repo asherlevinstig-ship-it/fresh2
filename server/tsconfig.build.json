@@ -1,14 +1,22 @@
 {
+  "$schema": "https://json.schemastore.org/tsconfig",
+  "display": "Colyseus Server (ESM Build)",
   "extends": "./tsconfig.json",
-  "include": ["src"],
   "compilerOptions": {
-    "outDir": "build",
+    /* Ensure build output location */
     "rootDir": "src",
+    "outDir": "build",
 
-    "module": "CommonJS",
-    "moduleResolution": "Node",
+    /* Decorators (repeat to be explicit for CI/build) */
+    "experimentalDecorators": true,
+    "emitDecoratorMetadata": false,
+    "useDefineForClassFields": false,
 
-    "declaration": false,
-    "sourceMap": false
-  }
+    /* Production-friendly emit */
+    "sourceMap": false,
+    "removeComments": true,
+    "noEmitOnError": true
+  },
+  "include": ["src/**/*.ts"],
+  "exclude": ["node_modules", "build", "dist", "**/*.test.ts", "**/*.spec.ts"]
 }

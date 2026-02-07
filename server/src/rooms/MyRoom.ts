@@ -30,9 +30,11 @@
 //     - "block:update" (live edits)
 // ============================================================
 
-import { Room, Client } from "@colyseus/core";
-import { MyRoomState, PlayerState } from "./schema/MyRoomState";
-import { WorldStore, BLOCKS, type BlockId } from "../world/WorldStore";
+import { Room, Client, CloseCode } from "@colyseus/core";
+
+import { WorldStore, BLOCKS, type BlockId } from "../world/WorldStore.js";
+import { MyRoomState, PlayerState, ItemState } from "./schema/MyRoomState.js";
+
 
 
 

@@ -1,20 +1,49 @@
 {
+  "$schema": "https://json.schemastore.org/tsconfig",
+  "display": "Colyseus Server (ESM Dev)",
   "compilerOptions": {
-    "outDir": "build",
-    "target": "ESNext",
+    /* Language + runtime */
+    "target": "ES2022",
+    "lib": ["ES2022"],
+
+    /* ESM (because package.json has \"type\": \"module\") */
     "module": "NodeNext",
     "moduleResolution": "NodeNext",
-    "strict": true,
-    "allowJs": true,
-    "strictNullChecks": false,
+
+    /* Project layout */
+    "rootDir": "src",
+    "outDir": "build",
+    "baseUrl": ".",
+
+    /* Node / TS interop */
+    "types": ["node"],
     "esModuleInterop": true,
+    "allowSyntheticDefaultImports": true,
+    "resolveJsonModule": true,
+
+    /* Decorators (required for @colyseus/schema @type()) */
     "experimentalDecorators": true,
-    "skipLibCheck": true,
+    "emitDecoratorMetadata": false,
+    "useDefineForClassFields": false,
+
+    /* Strictness */
+    "strict": true,
+    "noImplicitAny": true,
+    "strictNullChecks": true,
+    "noFallthroughCasesInSwitch": true,
     "forceConsistentCasingInFileNames": true,
-    "useDefineForClassFields": false
+
+    /* Emit */
+    "declaration": false,
+    "declarationMap": false,
+    "sourceMap": true,
+    "inlineSources": false,
+    "removeComments": false,
+    "noEmitOnError": true,
+
+    /* Speed */
+    "skipLibCheck": true
   },
-  "include": [
-    "src",
-    "test"
-  ]
+  "include": ["src/**/*.ts"],
+  "exclude": ["node_modules", "build", "dist", "**/*.test.ts", "**/*.spec.ts"]
 }
