@@ -1,26 +1,15 @@
 // @ts-nocheck
 /*
- * fresh2 - client main/index (NOA main entry) - FULL REWRITE (MATCHES SERVER TERRAIN)
+ * fresh2 - client main/index (FINAL FULL VERSION)
  * -------------------------------------------------------------------
- * Includes:
- * - In-game UI Debug Console overlay (NO DevTools needed)
- * - F4 toggle, F6 clear, F7 toggle console mirroring
- * - F2 toggles browser context menu (for inspector if you still want it)
- * - F3 toggles build/debug logs
- * - World generation: Synced with Server (Bedrock, Stone, Trees)
- * - First/Third person view mode enforcement EVERY FRAME
- * - FPS rig + 3rd-person avatar rigs (local + remote)
- * - Crosshair overlay
- * - Hotbar overlay (inv:0..8), server-authoritative hotbarIndex
- * - Inventory overlay (I) with drag/drop and split (right-click inside UI)
- * - Colyseus (@colyseus/sdk) state sync + remote interpolation
- * - Server-authoritative blocks:
- * - Mine: send "block:break" (NO local setBlock)
- * - Build: send "block:place" (NO local setBlock)
- * - Apply world edits ONLY from:
- * - "world:patch" (on join / later)
- * - "block:update" (authoritative updates)
- * - Show "block:reject" reasons in UI console
+ * INCLUDES:
+ * - 3x3 Crafting Grid (Virtual Mapping Strategy)
+ * - Inventory UI (Drag & Drop, Splitting)
+ * - Server-Authoritative Logic (Colyseus)
+ * - World Generation (Synced Bedrock/Trees)
+ * - 3D Rigs (FPS Hands + 3rd Person Avatars)
+ * - Network Interpolation (Smooth movement)
+ * - Debug Console (F4)
  */
 
 import { Engine } from "noa-engine";
@@ -28,7 +17,120 @@ import { Client as ColyClient } from "@colyseus/sdk";
 import * as BABYLON from "babylonjs";
 
 /* ============================================================
- * NOA BOOTSTRAP
+ * 1. RECIPE DATA & SYSTEM (Client-Side Prediction)
+ * ============================================================
+ */
+
+const RECIPES = [
+  {
+    id: "planks_from_log",
+    type: "shapeless",
+    ingredients: ["block:log"],
+    result: { kind: "block:plank", qty: 4 },
+  },
+  {
+    id: "sticks",
+    type: "shaped",
+    pattern: ["#", "#"],
+    key: { "#": "block:plank" },
+    result: { kind: "item:stick", qty: 4 },
+  },
+  {
+    id: "pickaxe_wood",
+    type: "shaped",
+    pattern: ["###", " | ", " | "],
+    key: { "#": "block:plank", "|": "item:stick" },
+    result: { kind: "tool:pickaxe_wood", qty: 1 },
+  },
+  {
+    id: "pickaxe_stone",
+    type: "shaped",
+    pattern: ["###", " | ", " | "],
+    key: { "#": "block:stone", "|": "item:stick" },
+    result: { kind: "tool:pickaxe_stone", qty: 1 },
+  },
+];
+
+const CraftingSystem = {
+  findMatch(gridKinds) {
+    if (!gridKinds || gridKinds.length !== 9) return null;
+    const nonEmpties = gridKinds.filter((k) => k && k !== "");
+
+    for (const recipe of RECIPES) {
+      if (recipe.type === "shapeless") {
+        if (this.matchesShapeless(nonEmpties, recipe)) return recipe;
+      } else {
+        if (this.matchesShaped(gridKinds, recipe)) return recipe;
+      }
+    }
+    return null;
+  },
+
+  matchesShapeless(inputs, recipe) {
+    if (!recipe.ingredients) return false;
+    if (inputs.length !== recipe.ingredients.length) return false;
+    const remaining = [...inputs];
+    for (const required of recipe.ingredients) {
+      const idx = remaining.indexOf(required);
+      if (idx === -1) return false;
+      remaining.splice(idx, 1);
+    }
+    return true;
+  },
+
+  matchesShaped(grid, recipe) {
+    if (!recipe.pattern || !recipe.key) return false;
+    const matrix = [
+      [grid[0], grid[1], grid[2]],
+      [grid[3], grid[4], grid[5]],
+      [grid[6], grid[7], grid[8]],
+    ];
+    const inputShape = this.trimMatrix(matrix);
+    const recipeMatrix = recipe.pattern.map((row) => row.split(""));
+
+    if (inputShape.length !== recipeMatrix.length) return false;
+    if (inputShape[0].length !== recipeMatrix[0].length) return false;
+
+    for (let r = 0; r < inputShape.length; r++) {
+      for (let c = 0; c < inputShape[0].length; c++) {
+        const inputKind = inputShape[r][c];
+        const keyChar = recipeMatrix[r][c];
+        if (keyChar === " ") {
+          if (inputKind !== "") return false;
+        } else {
+          const expected = recipe.key[keyChar];
+          if (inputKind !== expected) return false;
+        }
+      }
+    }
+    return true;
+  },
+
+  trimMatrix(matrix) {
+    let minR = 3, maxR = -1, minC = 3, maxC = -1;
+    for (let r = 0; r < 3; r++) {
+      for (let c = 0; c < 3; c++) {
+        if (matrix[r][c] !== "") {
+          if (r < minR) minR = r;
+          if (r > maxR) maxR = r;
+          if (c < minC) minC = c;
+          if (c > maxC) maxC = c;
+        }
+      }
+    }
+    if (maxR === -1) return [];
+    const res = [];
+    for (let r = minR; r <= maxR; r++) {
+      const row = [];
+      for (let c = minC; c <= maxC; c++) row.push(matrix[r][c]);
+      res.push(row);
+    }
+    return res;
+  },
+};
+
+/* ============================================================
+ * 2. NOA ENGINE SETUP
  * ============================================================
  */
 
@@ -45,1071 +147,486 @@ const opts = {
 };
 
 const noa = new Engine(opts);
-const noaAny = /** @type {any} */ (noa);
-
 console.log("noa-engine booted:", noa.version);
 
 /* ============================================================
- * GLOBAL STATE
+ * 3. GLOBAL STATE
  * ============================================================
  */
 
 let viewMode = 0; // 0 = first, 1 = third
-let forceCrosshair = true;
-let showDebugProof = false;
 let inventoryOpen = false;
-
-// Debug / inspector helpers
-let ALLOW_BROWSER_CONTEXT_MENU = false; // F2 toggles this
-let DEBUG_BUILD = false; // F3 toggles this
 
 // Multiplayer
 let colyRoom = null;
-const remotePlayers = {}; // { [sessionId]: { mesh, parts, targetPos, targetRot, lastPos } }
+const remotePlayers = {}; // { [sid]: { mesh, parts, targetPos, targetRot, lastPos } }
 let lastPlayersKeys = new Set();
 
-// World sync (authoritative edits applied to client)
-const WORLD_SYNC = {
-  patchAppliedOnce: false,
-  lastPatchCount: 0,
-  lastPatchTruncated: false,
-  lastUpdateAt: 0,
-  updatesThisSecond: 0,
-  _perSecT: performance.now(),
+// Client State
+const LOCAL_INV = {
+  cols: 9, rows: 4,
+  slots: [], // uid strings
+  items: {}, // uid -> ItemState
+  equip: { head: "", chest: "", legs: "", feet: "", tool: "", offhand: "" },
+};
+
+// Crafting State (Virtual Mapping)
+const LOCAL_CRAFT = {
+  indices: new Array(9).fill(-1), // maps craft slot 0..8 -> inventory index 0..35
+  result: null,
+};
+
+const LOCAL_HOTBAR = { index: 0 };
+const LOCAL_STATS = { hp: 20, maxHp: 20, stamina: 100, maxStamina: 100 };
+
+const MESH = {
+  weaponRoot: null, armsRoot: null, armL: null, armR: null, tool: null, // FPS
+  avatarRoot: null, avParts: {}, // TPS
 };
 
 const STATE = {
   scene: null,
-
-  // NOA follow state (if available)
-  camFollowState: null,
-  baseFollowOffset: [0, 0, 0],
-
-  // time
   lastTime: performance.now(),
-  _moveAccum: 0,
-
-  // animation
-  lastHeading: 0,
-  lastPitch: 0,
   bobPhase: 0,
-  lastPlayerPos: null,
-
   swingT: 999,
   swingDuration: 0.22,
-
-  // safe pos cache
-  lastValidPlayerPos: [0, 2, 0],
-};
-
-const MESH = {
-  // Debug
-  proofA: null,
-  frontCube: null,
-
-  // FPS Rig
-  weaponRoot: null,
-  armsRoot: null,
-  armL: null,
-  armR: null,
-  tool: null,
-
-  // Third-person avatar (local)
-  avatarRoot: null,
-  avParts: {},
-
-  // inventory drag ghost
-  dragGhost: null,
+  lastPlayerPos: null,
 };
 
 /* ============================================================
- * CLIENT REPLICATED SNAPSHOT (from server state)
- * ============================================================
- */
-
-const LOCAL_INV = {
-  cols: 9,
-  rows: 4,
-  slots: [], // string[] uids
-  items: {}, // uid -> { uid, kind, qty, durability, maxDurability, meta }
-  equip: { head: "", chest: "", legs: "", feet: "", tool: "", offhand: "" },
-};
-
-const LOCAL_HOTBAR = { index: 0 };
-
-const LOCAL_STATS = {
-  hp: 20,
-  maxHp: 20,
-  stamina: 100,
-  maxStamina: 100,
-  sprinting: false,
-  swinging: false,
-};
-
-/* ============================================================
- * UI DEBUG CONSOLE (NO DEVTOOLS NEEDED)
- * Toggle: F4  |  Clear: F6  |  Mirror console: F7
+ * 4. UI: DEBUG CONSOLE (Robust)
  * ============================================================
  */
 
 const UI_CONSOLE = (() => {
-  const MAX_LINES = 180;
-
   const wrap = document.createElement("div");
   wrap.id = "ui-console";
   Object.assign(wrap.style, {
-    position: "fixed",
-    left: "14px",
-    bottom: "90px",
-    width: "min(620px, 92vw)",
-    maxHeight: "42vh",
-    zIndex: "10050",
-    display: "none",
-    pointerEvents: "none",
-    fontFamily:
-      "ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, 'Liberation Mono', 'Courier New', monospace",
+    position: "fixed", left: "14px", bottom: "90px", width: "min(600px, 90vw)",
+    maxHeight: "300px", zIndex: "10050", display: "none", pointerEvents: "none",
+    fontFamily: "monospace", color: "white", fontSize: "12px", textShadow: "1px 1px 0 #000"
   });
-
-  const panel = document.createElement("div");
-  Object.assign(panel.style, {
-    background: "rgba(0,0,0,0.72)",
-    border: "1px solid rgba(255,255,255,0.14)",
-    borderRadius: "14px",
-    boxShadow: "0 16px 50px rgba(0,0,0,0.55)",
-    padding: "10px 10px 8px",
-    backdropFilter: "blur(6px)",
-    overflow: "hidden",
-  });
-
-  const header = document.createElement("div");
-  Object.assign(header.style, {
-    display: "flex",
-    alignItems: "center",
-    justifyContent: "space-between",
-    gap: "10px",
-    marginBottom: "8px",
-    opacity: "0.92",
-    pointerEvents: "none",
-  });
-
-  const title = document.createElement("div");
-  title.textContent = "Debug Console";
-  Object.assign(title.style, { fontWeight: "900", fontSize: "12px" });
-
-  const hint = document.createElement("div");
-  hint.textContent = "F4 toggle • F6 clear • F7 mirror";
-  Object.assign(hint.style, { fontSize: "11px", opacity: "0.65" });
-
-  header.appendChild(title);
-  header.appendChild(hint);
-
+  
   const scroller = document.createElement("div");
   Object.assign(scroller.style, {
-    maxHeight: "34vh",
-    overflow: "auto",
-    paddingRight: "4px",
-    pointerEvents: "auto",
+    background: "rgba(0,0,0,0.6)", padding: "10px", borderRadius: "8px",
+    overflowY: "auto", maxHeight: "100%", pointerEvents: "auto"
   });
-  scroller.style.scrollbarWidth = "thin";
-
-  const list = document.createElement("div");
-  Object.assign(list.style, {
-    display: "flex",
-    flexDirection: "column",
-    gap: "4px",
-  });
-
-  scroller.appendChild(list);
-
-  const toast = document.createElement("div");
-  Object.assign(toast.style, {
-    marginTop: "8px",
-    padding: "8px 10px",
-    borderRadius: "12px",
-    background: "rgba(255,255,255,0.06)",
-    border: "1px solid rgba(255,255,255,0.10)",
-    fontSize: "12px",
-    opacity: "0.92",
-    pointerEvents: "none",
-    whiteSpace: "nowrap",
-    overflow: "hidden",
-    textOverflow: "ellipsis",
-  });
-  toast.textContent = "Ready.";
-
-  panel.appendChild(header);
-  panel.appendChild(scroller);
-  panel.appendChild(toast);
-  wrap.appendChild(panel);
+  
+  wrap.appendChild(scroller);
   document.body.appendChild(wrap);
 
-  function fmtArg(a) {
-    if (a == null) return String(a);
-    if (typeof a === "string") return a;
-    if (typeof a === "number" || typeof a === "boolean") return String(a);
-    try {
-      return JSON.stringify(a);
-    } catch {
-      return String(a);
-    }
-  }
-
-  function append(kind, args) {
-    const t = new Date();
-    const hh = String(t.getHours()).padStart(2, "0");
-    const mm = String(t.getMinutes()).padStart(2, "0");
-    const ss = String(t.getSeconds()).padStart(2, "0");
-
-    const msg = args.map(fmtArg).join(" ");
-    const line = `[${hh}:${mm}:${ss}] ${msg}`;
-
-    const row = document.createElement("div");
-    row.textContent = line;
-    Object.assign(row.style, {
-      fontSize: "11.5px",
-      lineHeight: "1.25",
-      padding: "3px 6px",
-      borderRadius: "10px",
-      background: "rgba(255,255,255,0.04)",
-      border: "1px solid rgba(255,255,255,0.06)",
-      whiteSpace: "pre-wrap",
-      wordBreak: "break-word",
-    });
-
-    if (kind === "warn") {
-      row.style.background = "rgba(255, 193, 7, 0.10)";
-      row.style.borderColor = "rgba(255, 193, 7, 0.18)";
-    }
-    if (kind === "error") {
-      row.style.background = "rgba(244, 67, 54, 0.14)";
-      row.style.borderColor = "rgba(244, 67, 54, 0.22)";
-    }
-
-    list.appendChild(row);
-
-    while (list.childNodes.length > MAX_LINES) {
-      list.removeChild(list.firstChild);
-    }
-
+  function log(msg, color="#fff") {
+    const el = document.createElement("div");
+    el.textContent = `> ${msg}`;
+    el.style.color = color;
+    scroller.appendChild(el);
     scroller.scrollTop = scroller.scrollHeight;
-    toast.textContent = msg || "(empty)";
   }
 
-  function clear() {
-    list.innerHTML = "";
-    toast.textContent = "Cleared.";
-  }
-
-  function show(on) {
-    wrap.style.display = on ? "block" : "none";
-  }
-
-  function toggle() {
-    show(wrap.style.display === "none");
-  }
-
-  function log(...args) {
-    append("log", args);
-  }
-  function warn(...args) {
-    append("warn", args);
-  }
-  function error(...args) {
-    append("error", args);
-  }
-
-  const orig = {
-    log: console.log.bind(console),
-    warn: console.warn.bind(console),
-    error: console.error.bind(console),
+  return {
+    log: (m) => log(m),
+    warn: (m) => log(m, "#ffaa00"),
+    error: (m) => log(m, "#ff5555"),
+    toggle: () => { wrap.style.display = wrap.style.display === "none" ? "block" : "none"; }
   };
-
-  let mirrorConsole = true;
-
-  function setMirror(on) {
-    mirrorConsole = !!on;
-    if (mirrorConsole) {
-      console.log = (...args) => {
-        try {
-          log(...args);
-        } catch {}
-        orig.log(...args);
-      };
-      console.warn = (...args) => {
-        try {
-          warn(...args);
-        } catch {}
-        orig.warn(...args);
-      };
-      console.error = (...args) => {
-        try {
-          error(...args);
-        } catch {}
-        orig.error(...args);
-      };
-      orig.log("[UI_CONSOLE] mirroring enabled");
-      log("[UI_CONSOLE] mirroring enabled");
-    } else {
-      console.log = orig.log;
-      console.warn = orig.warn;
-      console.error = orig.error;
-      orig.log("[UI_CONSOLE] mirroring disabled");
-    }
-  }
-
-  setMirror(true);
-
-  window.addEventListener(
-    "keydown",
-    (e) => {
-      if (e.code === "F4") {
-        e.preventDefault();
-        toggle();
-      }
-      if (e.code === "F6") {
-        e.preventDefault();
-        clear();
-      }
-      if (e.code === "F7") {
-        e.preventDefault();
-        setMirror(!mirrorConsole);
-      }
-    },
-    true
-  );
-
-  return { log, warn, error, clear, show, toggle, setMirror };
 })();
 
-const uiLog = (...a) => UI_CONSOLE.log(...a);
-const uiWarn = (...a) => UI_CONSOLE.warn(...a);
-const uiError = (...a) => UI_CONSOLE.error(...a);
+const uiLog = UI_CONSOLE.log;
 
 /* ============================================================
- * HELPERS
- * ============================================================
- */
-
-function safeNum(v, fallback = 0) {
-  return typeof v === "number" && Number.isFinite(v) ? v : fallback;
-}
-
-function clamp(v, a, b) {
-  return Math.max(a, Math.min(b, v));
-}
-
-function lerp(a, b, t) {
-  return a + (b - a) * t;
-}
-
-function resolveScene() {
-  const r = noaAny.rendering;
-  if (r?.getScene) return r.getScene();
-  if (r?.scene) return r.scene;
-  return null;
-}
-
-function noaAddMesh(mesh, isStatic = false, pos = null) {
-  try {
-    noa.rendering.addMeshToScene(mesh, !!isStatic, pos || null);
-    mesh.alwaysSelectAsActiveMesh = true;
-  } catch (e) {
-    uiWarn("[NOA_RENDER] addMeshToScene failed:", e);
-  }
-}
-
-function createSolidMat(scene, name, color3) {
-  const existing = scene.getMaterialByName(name);
-  if (existing) return existing;
-
-  const mat = new BABYLON.StandardMaterial(name, scene);
-  mat.diffuseColor = color3;
-  mat.emissiveColor = color3.scale(0.35);
-  mat.specularColor = new BABYLON.Color3(0, 0, 0);
-  mat.backFaceCulling = false;
-  return mat;
-}
-
-function setEnabled(meshOrNode, on) {
-  if (!meshOrNode) return;
-  if (meshOrNode.setEnabled) meshOrNode.setEnabled(!!on);
-}
-
-function isFinite3(p) {
-  return (
-    p &&
-    p.length >= 3 &&
-    Number.isFinite(p[0]) &&
-    Number.isFinite(p[1]) &&
-    Number.isFinite(p[2])
-  );
-}
-
-function getSafePlayerPos() {
-  let p = null;
-  try {
-    p = noa.entities.getPosition(noa.playerEntity);
-  } catch {}
-
-  if (isFinite3(p)) {
-    const x = p[0];
-    const y = clamp(p[1], -100000, 100000);
-    const z = p[2];
-    STATE.lastValidPlayerPos = [x, y, z];
-    return STATE.lastValidPlayerPos;
-  }
-
-  return STATE.lastValidPlayerPos;
-}
-
-function forceRigBounds(parts) {
-  if (!parts) return;
-
-  if (parts.root?.computeWorldMatrix) parts.root.computeWorldMatrix(true);
-
-  const meshes = [
-    parts.head,
-    parts.body,
-    parts.armL,
-    parts.armR,
-    parts.legL,
-    parts.legR,
-    parts.tool,
-  ].filter(Boolean);
-
-  for (const m of meshes) {
-    try {
-      m.computeWorldMatrix(true);
-      m.refreshBoundingInfo(true);
-      if (m._updateSubMeshesBoundingInfo) m._updateSubMeshesBoundingInfo();
-    } catch {}
-  }
-}
-
-/* ============================================================
- * UI: CROSSHAIR
- * ============================================================
- */
-
-function createCrosshairOverlay() {
-  const div = document.createElement("div");
-  div.id = "noa-crosshair";
-  Object.assign(div.style, {
-    position: "fixed",
-    top: "50%",
-    left: "50%",
-    width: "22px",
-    height: "22px",
-    transform: "translate(-50%, -50%)",
-    pointerEvents: "none",
-    zIndex: "9999",
-    display: "none",
-  });
-
-  const lineStyle = {
-    position: "absolute",
-    backgroundColor: "rgba(255,255,255,0.9)",
-    boxShadow: "0 0 2px black",
-  };
-
-  const h = document.createElement("div");
-  Object.assign(h.style, lineStyle, { width: "100%", height: "2px", top: "10px", left: "0" });
-
-  const v = document.createElement("div");
-  Object.assign(v.style, lineStyle, { width: "2px", height: "100%", left: "10px", top: "0" });
-
-  div.appendChild(h);
-  div.appendChild(v);
-  document.body.appendChild(div);
-
-  function refresh() {
-    const locked = document.pointerLockElement === noa.container.canvas;
-    const show = forceCrosshair || viewMode === 0 || locked;
-    div.style.display = show ? "block" : "none";
-  }
-
-  document.addEventListener("pointerlockchange", refresh);
-  setInterval(refresh, 500);
-
-  return { refresh };
-}
-
-const crosshairUI = createCrosshairOverlay();
-
-/* ============================================================
- * UI: HOTBAR
- * ============================================================
- */
-
-function createHotbarOverlay() {
-  const wrap = document.createElement("div");
-  wrap.id = "noa-hotbar";
-  Object.assign(wrap.style, {
-    position: "fixed",
-    left: "50%",
-    bottom: "18px",
-    transform: "translateX(-50%)",
-    zIndex: "9999",
-    pointerEvents: "none",
-    display: "grid",
-    gridTemplateColumns: "repeat(9, 54px)",
-    gap: "8px",
-    padding: "10px 12px",
-    borderRadius: "16px",
-    background: "rgba(0,0,0,0.35)",
-    border: "1px solid rgba(255,255,255,0.14)",
-    boxShadow: "0 12px 34px rgba(0,0,0,0.35)",
-    backdropFilter: "blur(6px)",
-  });
-
-  const slots = [];
-  for (let i = 0; i < 9; i++) {
-    const slot = document.createElement("div");
-    slot.dataset.idx = String(i);
-    Object.assign(slot.style, {
-      width: "54px",
-      height: "54px",
-      borderRadius: "14px",
-      background: "rgba(15,15,18,0.65)",
-      border: "1px solid rgba(255,255,255,0.12)",
-      position: "relative",
-      overflow: "hidden",
-    });
-
-    const icon = document.createElement("div");
-    Object.assign(icon.style, {
-      position: "absolute",
-      left: "8px",
-      top: "8px",
-      right: "8px",
-      bottom: "8px",
-      display: "flex",
-      alignItems: "center",
-      justifyContent: "center",
-      fontSize: "12px",
-      opacity: "0.95",
-      textAlign: "center",
-      lineHeight: "1.15",
-      fontFamily: "system-ui, -apple-system, Segoe UI, Roboto, Arial",
-      textShadow: "0 1px 2px rgba(0,0,0,0.85)",
-      userSelect: "none",
-      whiteSpace: "nowrap",
-    });
-
-    const qty = document.createElement("div");
-    Object.assign(qty.style, {
-      position: "absolute",
-      right: "8px",
-      bottom: "6px",
-      fontSize: "12px",
-      fontWeight: "800",
-      opacity: "0.92",
-      textShadow: "0 1px 2px rgba(0,0,0,0.85)",
-      fontFamily: "system-ui, -apple-system, Segoe UI, Roboto, Arial",
-      userSelect: "none",
-    });
-
-    const keycap = document.createElement("div");
-    keycap.textContent = String(i + 1);
-    Object.assign(keycap.style, {
-      position: "absolute",
-      left: "8px",
-      bottom: "6px",
-      fontSize: "11px",
-      opacity: "0.55",
-      fontWeight: "700",
-      fontFamily: "system-ui, -apple-system, Segoe UI, Roboto, Arial",
-      userSelect: "none",
-    });
-
-    slot.appendChild(icon);
-    slot.appendChild(qty);
-    slot.appendChild(keycap);
-    wrap.appendChild(slot);
-
-    slots.push({ slot, icon, qty });
-  }
-
-  document.body.appendChild(wrap);
-
-  function itemShort(kind) {
-    if (!kind) return "";
-    const k = String(kind);
-    const last = k.includes(":") ? k.split(":").pop() : k;
-    return last.length > 14 ? last.slice(0, 14) + "…" : last;
-  }
-
-  function refresh() {
-    for (let i = 0; i < 9; i++) {
-      const uid = LOCAL_INV.slots?.[i] || "";
-      const it = uid ? LOCAL_INV.items[uid] : null;
-
-      slots[i].icon.textContent = it ? itemShort(it.kind) : "";
-      slots[i].qty.textContent = it && safeNum(it.qty, 0) > 1 ? String(it.qty | 0) : "";
-
-      const selected = i === (LOCAL_HOTBAR.index | 0);
-      slots[i].slot.style.borderColor = selected ? "rgba(255,255,255,0.65)" : "rgba(255,255,255,0.12)";
-      slots[i].slot.style.boxShadow = selected ? "0 0 0 2px rgba(255,255,255,0.18) inset" : "none";
-    }
-  }
-
-  return { refresh };
-}
-
-const hotbarUI = createHotbarOverlay();
-
-/* ============================================================
- * UI: INVENTORY (drag/drop + split)
+ * 5. UI: INVENTORY & CRAFTING (The Logic Core)
  * ============================================================
  */
 
 function createInventoryOverlay() {
   const overlay = document.createElement("div");
-  overlay.id = "noa-inventory";
   Object.assign(overlay.style, {
-    position: "fixed",
-    inset: "0",
-    display: "none",
-    zIndex: "9998",
-    background: "rgba(0,0,0,0.35)",
-    backdropFilter: "blur(6px)",
+    position: "fixed", inset: "0", display: "none", zIndex: "9998",
+    background: "rgba(0,0,0,0.5)", backdropFilter: "blur(4px)"
   });
 
   const panel = document.createElement("div");
   Object.assign(panel.style, {
-    position: "absolute",
-    left: "50%",
-    top: "50%",
-    transform: "translate(-50%, -50%)",
-    width: "min(860px, 92vw)",
-    borderRadius: "18px",
-    background: "rgba(20,20,24,0.88)",
-    border: "1px solid rgba(255,255,255,0.14)",
-    boxShadow: "0 18px 60px rgba(0,0,0,0.55)",
-    padding: "16px",
-    fontFamily: "system-ui, -apple-system, Segoe UI, Roboto, Arial",
-    color: "rgba(255,255,255,0.92)",
+    position: "absolute", left: "50%", top: "50%", transform: "translate(-50%, -50%)",
+    width: "min(800px, 95vw)", background: "rgba(30,30,35,0.95)", borderRadius: "12px",
+    border: "1px solid #444", boxShadow: "0 10px 40px rgba(0,0,0,0.5)",
+    padding: "20px", display: "grid", gridTemplateColumns: "240px 1fr", gap: "20px",
+    fontFamily: "system-ui, sans-serif", color: "#eee"
   });
 
-  const topRow = document.createElement("div");
-  Object.assign(topRow.style, {
-    display: "flex",
-    alignItems: "center",
-    justifyContent: "space-between",
-    gap: "12px",
-    marginBottom: "12px",
+  // --- Left: Crafting & Equip ---
+  const leftCol = document.createElement("div");
+  leftCol.innerHTML = `<div style="font-weight:bold; margin-bottom:8px">Crafting</div>`;
+  
+  const craftWrap = document.createElement("div");
+  Object.assign(craftWrap.style, {
+    display: "flex", gap: "10px", alignItems: "center", background: "#222",
+    padding: "10px", borderRadius: "8px", border: "1px solid #333"
   });
 
-  const title = document.createElement("div");
-  title.textContent = "Inventory";
-  Object.assign(title.style, { fontSize: "18px", fontWeight: "800", letterSpacing: "0.2px" });
+  // 3x3 Grid
+  const craftGrid = document.createElement("div");
+  Object.assign(craftGrid.style, { display: "grid", gridTemplateColumns: "repeat(3, 48px)", gap: "4px" });
+  const craftCells = [];
+  for(let i=0; i<9; i++) {
+    const { cell, icon, qty } = makeSlot(`craft:${i}`);
+    craftGrid.appendChild(cell);
+    craftCells.push({ cell, icon, qty });
+  }
 
-  const hint = document.createElement("div");
-  hint.textContent = "Drag to move • Right-click: split • Esc/I to close";
-  Object.assign(hint.style, { fontSize: "12px", opacity: "0.75" });
+  // Result
+  const resWrap = document.createElement("div");
+  const { cell: resCell, icon: resIcon, qty: resQty } = makeSlot("craft:result");
+  resCell.style.border = "1px solid #6c6";
+  resWrap.appendChild(resCell);
 
-  topRow.appendChild(title);
-  topRow.appendChild(hint);
+  craftWrap.appendChild(craftGrid);
+  craftWrap.appendChild(document.createTextNode("→"));
+  craftWrap.appendChild(resWrap);
+  leftCol.appendChild(craftWrap);
 
-  const gridWrap = document.createElement("div");
-  Object.assign(gridWrap.style, { display: "grid", gridTemplateColumns: "1fr 260px", gap: "16px" });
-
-  const invGrid = document.createElement("div");
-  Object.assign(invGrid.style, {
-    display: "grid",
-    gridTemplateColumns: `repeat(${LOCAL_INV.cols || 9}, 64px)`,
-    gap: "10px",
-    padding: "12px",
-    borderRadius: "16px",
-    background: "rgba(0,0,0,0.25)",
-    border: "1px solid rgba(255,255,255,0.10)",
-    justifyContent: "center",
-  });
-
-  const eqArea = document.createElement("div");
-  Object.assign(eqArea.style, {
-    padding: "12px",
-    borderRadius: "16px",
-    background: "rgba(0,0,0,0.25)",
-    border: "1px solid rgba(255,255,255,0.10)",
-    height: "fit-content",
-  });
-
-  const eqTitle = document.createElement("div");
-  eqTitle.textContent = "Equipment";
-  Object.assign(eqTitle.style, { fontSize: "14px", fontWeight: "800", marginBottom: "10px" });
-
+  // Equipment
+  leftCol.appendChild(document.createElement("hr")); 
   const eqGrid = document.createElement("div");
-  Object.assign(eqGrid.style, { display: "grid", gridTemplateColumns: "repeat(2, 1fr)", gap: "10px" });
-
+  Object.assign(eqGrid.style, { display: "grid", gridTemplateColumns: "repeat(3, 48px)", gap: "4px" });
   const eqKeys = ["head", "chest", "legs", "feet", "tool", "offhand"];
   const eqCells = {};
-
-  function makeSlotBox(label, slotId) {
-    const cell = document.createElement("div");
-    cell.dataset.slot = slotId;
-    Object.assign(cell.style, {
-      height: "64px",
-      borderRadius: "14px",
-      background: "rgba(15,15,18,0.65)",
-      border: "1px solid rgba(255,255,255,0.12)",
-      position: "relative",
-      overflow: "hidden",
-      userSelect: "none",
-    });
-
-    const lab = document.createElement("div");
-    lab.textContent = label;
-    Object.assign(lab.style, {
-      position: "absolute",
-      left: "10px",
-      top: "8px",
-      fontSize: "11px",
-      opacity: "0.55",
-      fontWeight: "700",
-    });
-
-    const icon = document.createElement("div");
-    Object.assign(icon.style, {
-      position: "absolute",
-      left: "10px",
-      right: "10px",
-      bottom: "10px",
-      top: "24px",
-      display: "flex",
-      alignItems: "center",
-      justifyContent: "center",
-      fontSize: "12px",
-      textAlign: "center",
-      lineHeight: "1.15",
-      opacity: "0.92",
-      textShadow: "0 1px 2px rgba(0,0,0,0.85)",
-      whiteSpace: "nowrap",
-    });
-
-    const qty = document.createElement("div");
-    Object.assign(qty.style, {
-      position: "absolute",
-      right: "10px",
-      bottom: "8px",
-      fontSize: "12px",
-      fontWeight: "900",
-      opacity: "0.88",
-      textShadow: "0 1px 2px rgba(0,0,0,0.85)",
-    });
-
-    cell.appendChild(lab);
-    cell.appendChild(icon);
-    cell.appendChild(qty);
-
-    return { cell, icon, qty };
-  }
-
-  const invCells = [];
-  function rebuildInvGrid() {
-    invGrid.innerHTML = "";
-    invCells.length = 0;
-
-    const cols = LOCAL_INV.cols || 9;
-    const rows = LOCAL_INV.rows || 4;
-    invGrid.style.gridTemplateColumns = `repeat(${cols}, 64px)`;
-
-    const total = cols * rows;
-    for (let i = 0; i < total; i++) {
-      const { cell, icon, qty } = makeSlotBox("", `inv:${i}`);
-      cell.firstChild.style.display = "none";
-      invGrid.appendChild(cell);
-      invCells.push({ cell, icon, qty });
-    }
-  }
-
-  for (const k of eqKeys) {
-    const pretty = k[0].toUpperCase() + k.slice(1);
-    const { cell, icon, qty } = makeSlotBox(pretty, `eq:${k}`);
-    eqGrid.appendChild(cell);
+  eqKeys.forEach(k => {
+    const { cell, icon, qty } = makeSlot(`eq:${k}`);
     eqCells[k] = { cell, icon, qty };
+    eqGrid.appendChild(cell);
+  });
+  leftCol.appendChild(eqGrid);
+
+  // --- Right: Inventory ---
+  const rightCol = document.createElement("div");
+  rightCol.innerHTML = `<div style="font-weight:bold; margin-bottom:8px">Inventory</div>`;
+  
+  const invGrid = document.createElement("div");
+  Object.assign(invGrid.style, { display: "grid", gridTemplateColumns: "repeat(9, 48px)", gap: "4px" });
+  const invCells = [];
+  for(let i=0; i<36; i++) {
+    const { cell, icon, qty } = makeSlot(`inv:${i}`);
+    invGrid.appendChild(cell);
+    invCells.push({ cell, icon, qty });
   }
+  rightCol.appendChild(invGrid);
 
-  eqArea.appendChild(eqTitle);
-  eqArea.appendChild(eqGrid);
-
-  gridWrap.appendChild(invGrid);
-  gridWrap.appendChild(eqArea);
-
-  panel.appendChild(topRow);
-  panel.appendChild(gridWrap);
+  panel.appendChild(leftCol);
+  panel.appendChild(rightCol);
   overlay.appendChild(panel);
   document.body.appendChild(overlay);
 
-  const drag = { active: false, from: "", over: "", uid: "" };
-
-  function itemShort(kind) {
-    if (!kind) return "";
-    const last = String(kind).includes(":") ? String(kind).split(":").pop() : String(kind);
-    return last.length > 18 ? last.slice(0, 18) + "…" : last;
+  // --- Helpers ---
+  function makeSlot(id) {
+    const cell = document.createElement("div");
+    cell.dataset.id = id;
+    Object.assign(cell.style, {
+      width: "48px", height: "48px", background: "rgba(255,255,255,0.05)",
+      border: "1px solid #444", borderRadius: "4px", position: "relative",
+      cursor: "pointer", userSelect: "none"
+    });
+    const icon = document.createElement("div");
+    Object.assign(icon.style, {
+      position: "absolute", inset: "2px", display: "flex", alignItems: "center",
+      justifyContent: "center", fontSize: "10px", textAlign: "center", pointerEvents: "none"
+    });
+    const qty = document.createElement("div");
+    Object.assign(qty.style, {
+      position: "absolute", bottom: "1px", right: "2px", fontSize: "11px", fontWeight: "bold", pointerEvents: "none"
+    });
+    return { cell, icon, qty };
   }
 
-  function slotUid(slotId) {
-    if (!slotId) return "";
-    if (slotId.startsWith("inv:")) {
-      const idx = Number(slotId.slice(4));
-      return LOCAL_INV.slots?.[idx] || "";
-    }
-    if (slotId.startsWith("eq:")) {
-      const key = slotId.slice(3);
-      return LOCAL_INV.equip?.[key] || "";
-    }
-    return "";
+  function getInvItem(idx) {
+    if (idx < 0 || idx >= LOCAL_INV.slots.length) return null;
+    const uid = LOCAL_INV.slots[idx];
+    return uid ? LOCAL_INV.items[uid] : null;
   }
 
-  function renderCell(cellObj, uid, isHotbarSelected) {
-    const it = uid ? LOCAL_INV.items[uid] : null;
-    cellObj.icon.textContent = it ? itemShort(it.kind) : "";
-    cellObj.qty.textContent = it && safeNum(it.qty, 0) > 1 ? String(it.qty | 0) : "";
-
-    cellObj.cell.style.borderColor = isHotbarSelected ? "rgba(255,255,255,0.65)" : "rgba(255,255,255,0.12)";
-    cellObj.cell.style.boxShadow = isHotbarSelected ? "0 0 0 2px rgba(255,255,255,0.18) inset" : "none";
+  function getItemShort(kind) {
+    return kind ? kind.split(":")[1] || kind : "";
   }
 
+  // --- Render Loop ---
   function refresh() {
-    if (invCells.length !== (LOCAL_INV.cols || 9) * (LOCAL_INV.rows || 4)) {
-      rebuildInvGrid();
-      bindCells();
+    // Inventory
+    for(let i=0; i<36; i++) {
+      const it = getInvItem(i);
+      invCells[i].icon.textContent = it ? getItemShort(it.kind) : "";
+      invCells[i].qty.textContent = it && it.qty > 1 ? it.qty : "";
+      
+      const isCraftUsed = LOCAL_CRAFT.indices.includes(i);
+      invCells[i].cell.style.opacity = isCraftUsed ? "0.3" : "1";
     }
-
-    for (let i = 0; i < invCells.length; i++) {
-      const uid = LOCAL_INV.slots?.[i] || "";
-      const isHotbarSelected = i >= 0 && i <= 8 && i === (LOCAL_HOTBAR.index | 0);
-      renderCell(invCells[i], uid, isHotbarSelected);
+    // Crafting
+    for(let i=0; i<9; i++) {
+      const invIdx = LOCAL_CRAFT.indices[i];
+      const it = getInvItem(invIdx);
+      craftCells[i].icon.textContent = it ? getItemShort(it.kind) : "";
+      craftCells[i].qty.textContent = it && it.qty > 1 ? it.qty : "";
     }
-
-    for (const k of eqKeys) {
-      renderCell(eqCells[k], LOCAL_INV.equip?.[k] || "", false);
-    }
+    // Result
+    const res = LOCAL_CRAFT.result;
+    resIcon.textContent = res ? getItemShort(res.kind) : "";
+    resQty.textContent = res ? res.qty : "";
+    
+    // Equip
+    eqKeys.forEach(k => {
+      const uid = LOCAL_INV.equip[k];
+      const it = uid ? LOCAL_INV.items[uid] : null;
+      eqCells[k].icon.textContent = it ? getItemShort(it.kind) : "";
+    });
   }
 
-  function sendInvMove(from, to) {
-    if (!colyRoom) return;
-    try {
-      colyRoom.send("inv:move", { from, to });
-    } catch {}
-  }
+  // --- Drag & Drop Logic ---
+  const drag = { active: false, srcId: null, invIdx: -1, ghost: null };
+  
+  function startDrag(e, slotId) {
+    let it = null;
+    let invIdx = -1;
 
-  function sendInvSplit(slot) {
-    if (!colyRoom) return;
-    try {
-      colyRoom.send("inv:split", { slot });
-    } catch {}
-  }
+    if (slotId.startsWith("inv:")) {
+      invIdx = parseInt(slotId.split(":")[1]);
+      if (LOCAL_CRAFT.indices.includes(invIdx)) return; // Locked
+      it = getInvItem(invIdx);
+    } else if (slotId.startsWith("craft:")) {
+      const cIdx = parseInt(slotId.split(":")[1]);
+      if (isNaN(cIdx)) return; // result slot
+      invIdx = LOCAL_CRAFT.indices[cIdx];
+      it = getInvItem(invIdx);
+    }
 
-  function makeGhost(text) {
+    if (!it) return;
+
+    drag.active = true;
+    drag.srcId = slotId;
+    drag.invIdx = invIdx;
+
     const g = document.createElement("div");
-    g.textContent = text;
+    g.textContent = getItemShort(it.kind);
     Object.assign(g.style, {
-      position: "fixed",
-      left: "0px",
-      top: "0px",
-      transform: "translate(-9999px, -9999px)",
-      zIndex: "10000",
-      pointerEvents: "none",
-      padding: "10px 12px",
-      borderRadius: "14px",
-      background: "rgba(0,0,0,0.80)",
-      border: "1px solid rgba(255,255,255,0.14)",
-      color: "white",
-      fontFamily: "system-ui, -apple-system, Segoe UI, Roboto, Arial",
-      fontSize: "12px",
-      fontWeight: "800",
-      textShadow: "0 1px 2px rgba(0,0,0,0.85)",
-      boxShadow: "0 10px 30px rgba(0,0,0,0.5)",
-      maxWidth: "220px",
-      whiteSpace: "nowrap",
-      overflow: "hidden",
-      textOverflow: "ellipsis",
+      position: "fixed", background: "#222", border: "1px solid white", padding: "4px",
+      pointerEvents: "none", zIndex: "10001", borderRadius: "4px", color: "#fff"
     });
     document.body.appendChild(g);
-    return g;
+    drag.ghost = g;
+    moveGhost(e);
   }
 
-  function setGhostPos(x, y) {
-    if (!MESH.dragGhost) return;
-    MESH.dragGhost.style.transform = `translate(${x + 12}px, ${y + 12}px)`;
+  function moveGhost(e) {
+    if(drag.ghost) {
+      drag.ghost.style.left = e.clientX + 10 + "px";
+      drag.ghost.style.top = e.clientY + 10 + "px";
+    }
   }
 
-  function beginDrag(slotId, x, y) {
-    const uid = slotUid(slotId);
-    if (!uid) return;
-
-    const it = LOCAL_INV.items[uid];
-    drag.active = true;
-    drag.from = slotId;
-    drag.over = "";
-    drag.uid = uid;
-
-    const label = it ? `${itemShort(it.kind)}${safeNum(it.qty, 0) > 1 ? ` x${it.qty | 0}` : ""}` : uid;
-
-    if (!MESH.dragGhost) MESH.dragGhost = makeGhost(label);
-    else MESH.dragGhost.textContent = label;
-
-    setGhostPos(x, y);
-  }
-
-  function endDrag() {
+  function endDrag(e) {
     if (!drag.active) return;
-
-    if (MESH.dragGhost) MESH.dragGhost.style.transform = "translate(-9999px, -9999px)";
-    if (drag.over && drag.over !== drag.from) sendInvMove(drag.from, drag.over);
-
+    drag.ghost.remove();
     drag.active = false;
-    drag.from = "";
-    drag.over = "";
-    drag.uid = "";
-  }
 
-  function onCellDown(slotId, e) {
-    if (e.button === 2) {
-      e.preventDefault();
-      sendInvSplit(slotId);
+    const el = document.elementFromPoint(e.clientX, e.clientY);
+    const dropSlot = el ? el.closest("[data-id]") : null;
+    
+    // Logic: 
+    // If drop on Craft Slot -> Map index
+    // If drop on Inv Slot -> Move item (Server)
+    // If drop outside -> Clear craft mapping (if source was craft)
+
+    if (!dropSlot) {
+      if (drag.srcId.startsWith("craft:")) {
+        const cIdx = parseInt(drag.srcId.split(":")[1]);
+        LOCAL_CRAFT.indices[cIdx] = -1;
+        updateCraft();
+        refresh();
+      }
       return;
     }
-    if (e.button === 0) {
-      e.preventDefault();
-      beginDrag(slotId, e.clientX, e.clientY);
+
+    const destId = dropSlot.dataset.id;
+    
+    // 1. Drop onto Crafting Grid
+    if (destId.startsWith("craft:") && !destId.includes("result")) {
+      const cIdx = parseInt(destId.split(":")[1]);
+      
+      // If dragging FROM craft, swap indices
+      if (drag.srcId.startsWith("craft:")) {
+        const oldCIdx = parseInt(drag.srcId.split(":")[1]);
+        const temp = LOCAL_CRAFT.indices[cIdx];
+        LOCAL_CRAFT.indices[cIdx] = LOCAL_CRAFT.indices[oldCIdx];
+        LOCAL_CRAFT.indices[oldCIdx] = temp;
+      } else {
+        // Dragging FROM inv
+        LOCAL_CRAFT.indices[cIdx] = drag.invIdx;
+      }
+      updateCraft();
+      refresh();
+      return;
+    }
+
+    // 2. Drop onto Inventory
+    if (destId.startsWith("inv:")) {
+      // If coming from Craft, just clear craft slot
+      if (drag.srcId.startsWith("craft:")) {
+        const cIdx = parseInt(drag.srcId.split(":")[1]);
+        LOCAL_CRAFT.indices[cIdx] = -1;
+        updateCraft();
+        refresh();
+        return;
+      }
+      // If coming from Inv, move item
+      if (colyRoom && drag.srcId !== destId) {
+        colyRoom.send("inv:move", { from: drag.srcId, to: destId });
+      }
     }
   }
 
-  function onCellEnter(slotId) {
-    if (!drag.active) return;
-    drag.over = slotId;
+  function updateCraft() {
+    const kinds = LOCAL_CRAFT.indices.map(idx => {
+      const it = getInvItem(idx);
+      return it ? it.kind : "";
+    });
+    const match = CraftingSystem.findMatch(kinds);
+    LOCAL_CRAFT.result = match ? match.result : null;
   }
 
-  function bindCells() {
-    overlay.addEventListener("contextmenu", (e) => e.preventDefault());
+  // Bind Events
+  window.addEventListener("mousemove", (e) => { if(drag.active) moveGhost(e); });
+  window.addEventListener("mouseup", endDrag);
 
-    for (const c of invCells) {
-      const slotId = c.cell.dataset.slot;
-      c.cell.style.pointerEvents = "auto";
-      c.cell.onmousedown = (e) => onCellDown(slotId, e);
-      c.cell.onmouseenter = () => onCellEnter(slotId);
-    }
-
-    for (const k of eqKeys) {
-      const c = eqCells[k];
-      const slotId = `eq:${k}`;
-      c.cell.style.pointerEvents = "auto";
-      c.cell.onmousedown = (e) => onCellDown(slotId, e);
-      c.cell.onmouseenter = () => onCellEnter(slotId);
-    }
-  }
-
-  rebuildInvGrid();
-  bindCells();
-
-  window.addEventListener("mousemove", (e) => {
-    if (!drag.active) return;
-    setGhostPos(e.clientX, e.clientY);
+  // Slot Clicks
+  [...invCells, ...craftCells, ...Object.values(eqCells), {cell:resCell}].forEach(o => {
+    o.cell.addEventListener("mousedown", (e) => {
+      const id = o.cell.dataset.id;
+      if (id === "craft:result") {
+        if (LOCAL_CRAFT.result && colyRoom) {
+          colyRoom.send("craft:commit", { srcIndices: LOCAL_CRAFT.indices });
+        }
+      } else {
+        startDrag(e, id);
+      }
+    });
   });
 
-  window.addEventListener("mouseup", () => {
-    if (!drag.active) return;
-    endDrag();
-  });
-
-  function setVisible(on) {
-    overlay.style.display = on ? "block" : "none";
-    if (!on) endDrag();
-    else refresh();
-  }
-
-  function isOpen() {
-    return overlay.style.display !== "none";
-  }
-
-  return { setVisible, refresh, isOpen };
+  return {
+    toggle: () => {
+      const open = overlay.style.display === "none";
+      overlay.style.display = open ? "block" : "none";
+      if (open) { 
+        refresh(); 
+        document.exitPointerLock(); 
+      } else { 
+        noa.container.canvas.requestPointerLock(); 
+      }
+      inventoryOpen = open;
+    },
+    refresh,
+    isOpen: () => overlay.style.display !== "none"
+  };
 }
 
 const inventoryUI = createInventoryOverlay();
 
 /* ============================================================
- * WORLD GENERATION (CLIENT BASE TERRAIN)
+ * 6. UI: HOTBAR (DOM Overlay)
  * ============================================================
- * UPDATED: Matches Server logic (Stone, Bedrock, Trees)
  */
 
-// 1. Register Colors (Simple solid mats for now)
-const colors = {
-    dirt: [0.45, 0.36, 0.22],
-    grass: [0.1, 0.8, 0.2],
-    stone: [0.5, 0.5, 0.5],
-    bedrock: [0.2, 0.2, 0.2],
-    log: [0.4, 0.3, 0.1],
-    leaves: [0.2, 0.6, 0.2],
+function createHotbarUI() {
+  const div = document.createElement("div");
+  Object.assign(div.style, {
+    position: "fixed", bottom: "10px", left: "50%", transform: "translateX(-50%)",
+    display: "flex", gap: "5px", padding: "5px", background: "rgba(0,0,0,0.5)", borderRadius: "8px"
+  });
+  
+  const slots = [];
+  for(let i=0; i<9; i++) {
+    const s = document.createElement("div");
+    Object.assign(s.style, {
+      width: "50px", height: "50px", border: "2px solid #555", borderRadius: "4px",
+      position: "relative", background: "rgba(0,0,0,0.3)"
+    });
+    const icon = document.createElement("div");
+    Object.assign(icon.style, {
+      position: "absolute", inset: "0", display: "flex", justifyContent: "center", alignItems: "center",
+      color: "white", fontSize: "10px", textAlign: "center"
+    });
+    const qty = document.createElement("div");
+    Object.assign(qty.style, { position: "absolute", bottom: "2px", right: "2px", fontSize: "10px", fontWeight: "bold", color: "#fff" });
+    s.appendChild(icon);
+    s.appendChild(qty);
+    div.appendChild(s);
+    slots.push({s, icon, qty});
+  }
+  document.body.appendChild(div);
+
+  return {
+    refresh: () => {
+      for(let i=0; i<9; i++) {
+        const uid = LOCAL_INV.slots[i];
+        const it = uid ? LOCAL_INV.items[uid] : null;
+        slots[i].s.style.borderColor = (i === LOCAL_HOTBAR.index) ? "white" : "#555";
+        slots[i].icon.textContent = it ? it.kind.split(":")[1] : "";
+        slots[i].qty.textContent = it && it.qty > 1 ? it.qty : "";
+      }
+    }
+  };
+}
+
+const hotbarUI = createHotbarUI();
+
+/* ============================================================
+ * 7. WORLD GENERATION (Synced with Server)
+ * ============================================================
+ */
+
+// Materials
+const mats = {
+  dirt: [0.45, 0.36, 0.22], grass: [0.1, 0.8, 0.2], stone: [0.5, 0.5, 0.5],
+  bedrock: [0.2, 0.2, 0.2], log: [0.4, 0.3, 0.1], leaves: [0.2, 0.6, 0.2],
+  planks: [0.6, 0.45, 0.25], glass: [0.8, 0.9, 1.0]
+};
+Object.keys(mats).forEach(k => noa.registry.registerMaterial(k, { color: mats[k] }));
+
+const ID = {
+  dirt: noa.registry.registerBlock(1, { material: "dirt" }),
+  grass: noa.registry.registerBlock(2, { material: "grass" }),
+  stone: noa.registry.registerBlock(3, { material: "stone" }),
+  bedrock: noa.registry.registerBlock(4, { material: "bedrock" }),
+  log: noa.registry.registerBlock(5, { material: "log" }),
+  leaves: noa.registry.registerBlock(6, { material: "leaves" }),
+  planks: noa.registry.registerBlock(7, { material: "planks" }),
 };
 
-noa.registry.registerMaterial("dirt", { color: colors.dirt });
-noa.registry.registerMaterial("grass", { color: colors.grass });
-noa.registry.registerMaterial("stone", { color: colors.stone });
-noa.registry.registerMaterial("bedrock", { color: colors.bedrock });
-noa.registry.registerMaterial("log", { color: colors.log });
-noa.registry.registerMaterial("leaves", { color: colors.leaves });
-
-// 2. Register Block IDs (Must match Server)
-const dirtID = noa.registry.registerBlock(1, { material: "dirt" });
-const grassID = noa.registry.registerBlock(2, { material: "grass" });
-const stoneID = noa.registry.registerBlock(3, { material: "stone" });
-const bedrockID = noa.registry.registerBlock(4, { material: "bedrock" });
-const logID = noa.registry.registerBlock(5, { material: "log" });
-const leavesID = noa.registry.registerBlock(6, { material: "leaves" });
-
-// 3. Deterministic Utils
 function hash2(x, z) {
   let n = Math.sin(x * 12.9898 + z * 78.233) * 43758.5453;
   return n - Math.floor(n);
 }
 
-// 4. Client-side terrain function (identical logic to Server)
 function getVoxelID(x, y, z) {
-  // Bedrock floor
-  if (y < -10) return bedrockID;
-
-  // Base height
-  const height = Math.floor(4 * Math.sin(x / 15) + 4 * Math.cos(z / 20));
-
-  // Trees (Deterministic "structures")
-  // Check the air space above ground
-  if (y > height && y < height + 8) {
+  if (y < -10) return ID.bedrock;
+  const h = Math.floor(4 * Math.sin(x / 15) + 4 * Math.cos(z / 20));
+  
+  if (y > h && y < h + 8) { // Trees
      if (hash2(x, z) > 0.98) {
-        const treeBaseY = height + 1;
-        const trunkHeight = 4;
-        
-        // Trunk
-        if (y >= treeBaseY && y < treeBaseY + trunkHeight) {
-           return logID;
-        }
-        
-        // Leaves (Lollipop top)
-        const topY = treeBaseY + trunkHeight - 1;
-        // Simple blob check for this column
-        if (y > topY && y <= topY + 2) {
-           return leavesID;
-        }
+        const tb = h + 1;
+        if (y >= tb && y < tb + 4) return ID.log;
+        if (y > tb + 3 && y <= tb + 5) return ID.leaves;
      }
   }
-
-  // Terrain layers
-  if (y < height - 3) return stoneID;
-  if (y < height) return dirtID;
-  if (y === height) return grassID;
-
+  if (y < h - 3) return ID.stone;
+  if (y < h) return ID.dirt;
+  if (y === h) return ID.grass;
   return 0;
 }
 
-noa.world.on("worldDataNeeded", function (id, data, x, y, z) {
+noa.world.on("worldDataNeeded", (id, data, x, y, z) => {
   for (let i = 0; i < data.shape[0]; i++) {
     for (let j = 0; j < data.shape[1]; j++) {
       for (let k = 0; k < data.shape[2]; k++) {
-        const voxelID = getVoxelID(x + i, y + j, z + k);
-        data.set(i, j, k, voxelID);
+        data.set(i, j, k, getVoxelID(x + i, y + j, z + k));
       }
     }
   }
@@ -1117,1094 +634,253 @@ noa.world.on("worldDataNeeded", function (id, data, x, y, z) {
 });
 
 /* ============================================================
- * SERVER-DRIVEN WORLD PATCH APPLY
+ * 8. VISUALS: RIGS & ANIMATION
  * ============================================================
  */
 
-function applyWorldPatch(patch, source = "world:patch") {
-  try {
-    const edits = patch?.edits || [];
-    const truncated = !!patch?.truncated;
-
-    WORLD_SYNC.lastPatchCount = edits.length | 0;
-    WORLD_SYNC.lastPatchTruncated = truncated;
-
-    uiLog(`[WORLD] ${source} received edits=${edits.length} truncated=${truncated}`);
-
-    // Apply edits to NOA world
-    for (let i = 0; i < edits.length; i++) {
-      const e = edits[i];
-      if (!e) continue;
-      const x = e.x | 0;
-      const y = e.y | 0;
-      const z = e.z | 0;
-      const id = e.id | 0;
-      noa.setBlock(id, x, y, z);
-    }
-
-    WORLD_SYNC.patchAppliedOnce = true;
-    uiLog(`[WORLD] ${source} applied.`);
-  } catch (err) {
-    uiError("[WORLD] apply patch failed:", err);
-  }
+function createSolidMat(scene, name, col) {
+  const m = new BABYLON.StandardMaterial(name, scene);
+  m.diffuseColor = new BABYLON.Color3(...col);
+  return m;
 }
 
-function applyBlockUpdate(msg, source = "block:update") {
-  if (!msg) return;
-  const x = msg.x | 0;
-  const y = msg.y | 0;
-  const z = msg.z | 0;
-  const id = msg.id | 0;
-
-  noa.setBlock(id, x, y, z);
-
-  WORLD_SYNC.lastUpdateAt = performance.now();
-
-  const t = performance.now();
-  if (t - WORLD_SYNC._perSecT > 1000) {
-    WORLD_SYNC._perSecT = t;
-    WORLD_SYNC.updatesThisSecond = 0;
-  }
-  WORLD_SYNC.updatesThisSecond++;
-
-  if (DEBUG_BUILD) uiLog(`[WORLD] ${source} setBlock id=${id} at ${x},${y},${z}`);
-}
-
-/* ============================================================
- * SCENE INIT
- * ============================================================
- */
-
-function ensureSceneReady() {
-  if (STATE.scene) return true;
-
-  const scene = resolveScene();
-  if (!scene) return false;
-
-  STATE.scene = scene;
-
-  if (scene.activeCamera) {
-    scene.activeCamera.minZ = 0.01;
-    scene.activeCamera.maxZ = 5000;
-  }
-
-  try {
-    const st = noa.ents.getState(noa.camera.cameraTarget, "followsEntity");
-    if (st?.offset) {
-      STATE.camFollowState = st;
-      STATE.baseFollowOffset = [...st.offset];
-    }
-  } catch {}
-
-  uiLog("[SCENE] ready");
-  return true;
-}
-
-/* ============================================================
- * RIGS
- * ============================================================
- */
-
-function createAvatarRig(scene, namePrefix) {
-  const root = new BABYLON.TransformNode(namePrefix + "_root", scene);
-
-  const skinMat = createSolidMat(scene, "mat_skin", new BABYLON.Color3(1.0, 0.82, 0.68));
-  const shirtMat = createSolidMat(scene, "mat_shirt", new BABYLON.Color3(0.2, 0.4, 0.95));
-  const pantsMat = createSolidMat(scene, "mat_pants", new BABYLON.Color3(0.1, 0.1, 0.2));
-  const toolMat = createSolidMat(scene, "mat_av_tool", new BABYLON.Color3(0.9, 0.9, 0.95));
-
-  const head = BABYLON.MeshBuilder.CreateBox(namePrefix + "_head", { size: 0.6 }, scene);
-  head.material = skinMat;
-  head.parent = root;
-  head.position.set(0, 1.55, 0);
-
-  const body = BABYLON.MeshBuilder.CreateBox(
-    namePrefix + "_body",
-    { width: 0.7, height: 0.9, depth: 0.35 },
-    scene
-  );
-  body.material = shirtMat;
-  body.parent = root;
-  body.position.set(0, 0.95, 0);
-
-  const armL = BABYLON.MeshBuilder.CreateBox(
-    namePrefix + "_armL",
-    { width: 0.25, height: 0.8, depth: 0.25 },
-    scene
-  );
-  armL.material = shirtMat;
-  armL.parent = root;
-  armL.position.set(-0.55, 1.05, 0);
-
-  const armR = BABYLON.MeshBuilder.CreateBox(
-    namePrefix + "_armR",
-    { width: 0.25, height: 0.8, depth: 0.25 },
-    scene
-  );
-  armR.material = shirtMat;
-  armR.parent = root;
-  armR.position.set(0.55, 1.05, 0);
-
-  const legL = BABYLON.MeshBuilder.CreateBox(
-    namePrefix + "_legL",
-    { width: 0.28, height: 0.85, depth: 0.28 },
-    scene
-  );
-  legL.material = pantsMat;
-  legL.parent = root;
-  legL.position.set(-0.18, 0.35, 0);
-
-  const legR = BABYLON.MeshBuilder.CreateBox(
-    namePrefix + "_legR",
-    { width: 0.28, height: 0.85, depth: 0.28 },
-    scene
-  );
-  legR.material = pantsMat;
-  legR.parent = root;
-  legR.position.set(0.18, 0.35, 0);
-
-  const tool = BABYLON.MeshBuilder.CreateBox(namePrefix + "_tool", { size: 0.28 }, scene);
-  tool.material = toolMat;
-  tool.parent = root;
-  tool.position.set(0.72, 0.85, 0.18);
-  tool.rotation.set(0.2, 0.2, 0.2);
-
-  [head, body, armL, armR, legL, legR, tool].forEach((m) => {
-    m.isPickable = false;
-    noaAddMesh(m, false);
-    m.alwaysSelectAsActiveMesh = true;
-    m.isVisible = true;
-    m.visibility = 1;
-    m.cullingStrategy = BABYLON.AbstractMesh.CULLINGSTRATEGY_BOUNDINGSPHERE_ONLY;
-  });
-
-  return { root, head, body, armL, armR, legL, legR, tool };
-}
-
-function initFpsRig() {
+function initFpsRig(scene) {
   if (MESH.weaponRoot) return;
-  const scene = STATE.scene;
   const cam = scene.activeCamera;
+  const root = new BABYLON.TransformNode("weaponRoot", scene);
+  root.parent = cam;
+  
+  const armMat = createSolidMat(scene, "armMat", [0.2, 0.8, 0.2]);
+  const toolMat = createSolidMat(scene, "toolMat", [0.8, 0.8, 0.8]);
+  
+  const armR = BABYLON.MeshBuilder.CreateBox("armR", {width:0.3, height:0.8, depth:0.3}, scene);
+  armR.material = armMat; armR.parent = root; armR.position.set(0.5, -0.5, 1);
+  armR.rotation.set(0.5, 0, 0);
 
-  const weaponRoot = new BABYLON.TransformNode("weaponRoot", scene);
-  weaponRoot.parent = cam;
-  weaponRoot.position.set(0, 0, 0);
+  const tool = BABYLON.MeshBuilder.CreateBox("tool", {width:0.1, height:0.1, depth:0.6}, scene);
+  tool.material = toolMat; tool.parent = armR; tool.position.set(0, 0.5, 0.2);
 
-  const armsRoot = new BABYLON.TransformNode("armsRoot", scene);
-  armsRoot.parent = weaponRoot;
-
-  const armMat = createSolidMat(scene, "mat_arm", new BABYLON.Color3(0.2, 0.8, 0.2));
-  const toolMat = createSolidMat(scene, "mat_tool", new BABYLON.Color3(0.9, 0.9, 0.95));
-
-  const armL = BABYLON.MeshBuilder.CreateBox("fp_armL", { width: 0.45, height: 0.9, depth: 0.45 }, scene);
-  armL.material = armMat;
-  armL.parent = armsRoot;
-  armL.position.set(-0.55, -0.35, 1.05);
-  armL.rotation.set(0.1, 0.25, 0);
-
-  const armR = BABYLON.MeshBuilder.CreateBox("fp_armR", { width: 0.45, height: 0.9, depth: 0.45 }, scene);
-  armR.material = armMat;
-  armR.parent = armsRoot;
-  armR.position.set(0.55, -0.35, 1.05);
-  armR.rotation.set(0.1, -0.25, 0);
-
-  const tool = BABYLON.MeshBuilder.CreateBox("fp_tool", { size: 0.35 }, scene);
-  tool.material = toolMat;
-  tool.parent = weaponRoot;
-  tool.position.set(0.28, -0.55, 1.1);
-  tool.rotation.set(0.25, 0.1, 0);
-
-  [armL, armR, tool].forEach((m) => {
+  [armR, tool].forEach(m => {
+    noa.rendering.addMeshToScene(m, false);
     m.isPickable = false;
-    noaAddMesh(m, false);
   });
 
-  MESH.weaponRoot = weaponRoot;
-  MESH.armsRoot = armsRoot;
-  MESH.armL = armL;
+  MESH.weaponRoot = root;
   MESH.armR = armR;
   MESH.tool = tool;
 }
 
-function initLocalAvatar() {
-  if (MESH.avatarRoot) return;
-  const rig = createAvatarRig(STATE.scene, "local_av");
-  MESH.avatarRoot = rig.root;
-  MESH.avParts = rig;
+function createAvatar(scene) {
+  const root = new BABYLON.TransformNode("avRoot", scene);
+  const skin = createSolidMat(scene, "skin", [1, 0.8, 0.6]);
+  const shirt = createSolidMat(scene, "shirt", [0.2, 0.4, 0.9]);
+  
+  const head = BABYLON.MeshBuilder.CreateBox("head", {size:0.5}, scene);
+  head.material = skin; head.parent = root; head.position.y = 1.6;
+  
+  const body = BABYLON.MeshBuilder.CreateBox("body", {width:0.5, height:0.8, depth:0.25}, scene);
+  body.material = shirt; body.parent = root; body.position.y = 0.9;
+
+  const parts = { root, head, body };
+  [head, body].forEach(m => {
+    noa.rendering.addMeshToScene(m, false);
+    m.isPickable = false;
+  });
+  return parts;
 }
 
-function initDebugMeshes() {
-  if (MESH.proofA) return;
-  const scene = STATE.scene;
-
-  const proofA = BABYLON.MeshBuilder.CreateBox("proofA", { size: 3 }, scene);
-  proofA.material = createSolidMat(scene, "mat_proofA", new BABYLON.Color3(0, 1, 0));
-  proofA.position.set(0, 14, 0);
-  noaAddMesh(proofA, true);
-
-  const frontCube = BABYLON.MeshBuilder.CreateBox("frontCube", { size: 1.5 }, scene);
-  frontCube.material = createSolidMat(scene, "mat_frontCube", new BABYLON.Color3(0, 0.6, 1));
-  noaAddMesh(frontCube, false);
-
-  MESH.proofA = proofA;
-  MESH.frontCube = frontCube;
-
-  refreshDebugProofMeshes();
-}
-
-function refreshDebugProofMeshes() {
-  setEnabled(MESH.proofA, showDebugProof);
-  setEnabled(MESH.frontCube, showDebugProof);
-}
-
-/* ============================================================
- * VIEW MODE ENFORCEMENT
- * ============================================================
- */
-
-function enforceViewModeEveryFrame() {
-  const isFirst = viewMode === 0;
-
-  if (isFirst) {
-    noa.camera.zoomDistance = 0;
-    noa.camera.currentZoom = 0;
-  } else {
-    const z = clamp(noa.camera.zoomDistance || 6, 2, 12);
-    noa.camera.zoomDistance = z;
-    noa.camera.currentZoom = z;
+function updateRigAnim(dt) {
+  // Bobbing
+  if (viewMode === 0 && MESH.weaponRoot) {
+    const moving = noa.entities.getPhysicsBody(noa.playerEntity).velocity[1] === 0 && 
+                   (Math.abs(noa.entities.getPhysicsBody(noa.playerEntity).velocity[0]) > 0.1 ||
+                    Math.abs(noa.entities.getPhysicsBody(noa.playerEntity).velocity[2]) > 0.1);
+    
+    if (moving) STATE.bobPhase += dt * 10;
+    MESH.weaponRoot.position.y = Math.sin(STATE.bobPhase) * 0.02;
+    MESH.weaponRoot.position.x = Math.cos(STATE.bobPhase) * 0.02;
   }
 
-  try {
-    const st = STATE.camFollowState;
-    if (st?.offset) {
-      if (isFirst) {
-        st.offset[0] = STATE.baseFollowOffset[0];
-        st.offset[1] = STATE.baseFollowOffset[1];
-        st.offset[2] = STATE.baseFollowOffset[2];
-      } else {
-        st.offset[0] = STATE.baseFollowOffset[0] + 0.5;
-        st.offset[1] = STATE.baseFollowOffset[1];
-        st.offset[2] = STATE.baseFollowOffset[2];
-      }
-    }
-  } catch {}
-
-  setEnabled(MESH.armsRoot, isFirst);
-  setEnabled(MESH.tool, isFirst);
-  setEnabled(MESH.avatarRoot, !isFirst);
-
-  crosshairUI.refresh();
-  hotbarUI.refresh();
-  if (inventoryUI.isOpen()) inventoryUI.refresh();
-}
-
-function applyViewModeOnce() {
-  initFpsRig();
-  initLocalAvatar();
-  initDebugMeshes();
-  enforceViewModeEveryFrame();
-}
-
-/* ============================================================
- * 3RD PERSON CAMERA HARD FOLLOW
- * ============================================================
- */
-
-function hardFollowThirdPersonCamera() {
-  if (viewMode !== 1) return;
-  if (!STATE.scene || !STATE.scene.activeCamera) return;
-  if (!MESH.avatarRoot) return;
-
-  const cam = STATE.scene.activeCamera;
-
-  cam.upVector = new BABYLON.Vector3(0, 1, 0);
-  if (cam.rotation) cam.rotation.z = 0;
-
-  const target = MESH.avatarRoot.position.clone();
-  const heading = safeNum(noa.camera.heading, 0);
-  const dist = clamp(noa.camera.zoomDistance || 6, 2, 12);
-
-  const backDir = new BABYLON.Vector3(Math.sin(heading), 0, Math.cos(heading));
-  const back = backDir.scale(-dist);
-  const up = new BABYLON.Vector3(0, 1.7, 0);
-
-  const desired = target.add(back).add(up);
-
-  cam.position = BABYLON.Vector3.Lerp(cam.position, desired, 0.25);
-  cam.setTarget(target.add(new BABYLON.Vector3(0, 1.2, 0)));
-
-  if (cam.rotation) cam.rotation.z = 0;
-}
-
-/* ============================================================
- * ANIMATION
- * ============================================================
- */
-
-function updateFpsRig(dt, speed) {
-  if (viewMode !== 0 || !MESH.weaponRoot) return;
-
-  const heading = safeNum(noa.camera.heading, 0);
-  const pitch = safeNum(noa.camera.pitch, 0);
-
-  let dHeading = heading - STATE.lastHeading;
-  let dPitch = pitch - STATE.lastPitch;
-
-  if (dHeading > Math.PI) dHeading -= Math.PI * 2;
-  if (dHeading < -Math.PI) dHeading += Math.PI * 2;
-
-  STATE.lastHeading = heading;
-  STATE.lastPitch = pitch;
-
-  const bobRate = clamp(speed * 7, 0, 12);
-  STATE.bobPhase += bobRate * dt;
-  const bobY = Math.sin(STATE.bobPhase) * 0.03;
-  const bobX = Math.sin(STATE.bobPhase * 0.5) * 0.015;
-
-  const swayX = clamp(-dHeading * 1.6, -0.08, 0.08);
-  const swayY = clamp(dPitch * 1.2, -0.06, 0.06);
-
-  let swingAmt = 0;
-  if (STATE.swingT < STATE.swingDuration) {
-    const t = clamp(STATE.swingT / STATE.swingDuration, 0, 1);
-    swingAmt = Math.sin(t * Math.PI) * 1.0;
-  }
-
-  const wr = MESH.weaponRoot;
-  const s = clamp(dt * 12, 0, 1);
-
-  const targetPos = new BABYLON.Vector3(bobX + swayX * 0.8, -0.02 + bobY - swingAmt * 0.04, 0);
-
-  const targetRot = new BABYLON.Vector3(
-    swayY + swingAmt * 0.9,
-    swayX * 0.8 + swingAmt * 0.15,
-    swayX * 0.6 + swingAmt * 0.25
-  );
-
-  wr.position.copyFrom(BABYLON.Vector3.Lerp(wr.position, targetPos, s));
-  wr.rotation.copyFrom(BABYLON.Vector3.Lerp(wr.rotation, targetRot, s));
-
-  if (MESH.tool) {
-    MESH.tool.rotation.x = 0.25 + swingAmt * 1.2;
-    MESH.tool.rotation.y = 0.1 + swingAmt * 0.15;
-    MESH.tool.rotation.z = 0 + swingAmt * 0.35;
-  }
-}
-
-function updateAvatarAnim(parts, speed, grounded, isSwing) {
-  if (!parts || !parts.root || !parts.root.isEnabled()) return;
-
-  const walkAmp = grounded ? clamp(speed / 4.5, 0, 1) : 0;
-  const walkPhase = STATE.bobPhase * 0.6;
-
-  const legSwing = Math.sin(walkPhase) * 0.7 * walkAmp;
-  const armSwing = Math.sin(walkPhase + Math.PI) * 0.55 * walkAmp;
-
-  if (parts.legL) parts.legL.rotation.x = legSwing;
-  if (parts.legR) parts.legR.rotation.x = -legSwing;
-  if (parts.armL) parts.armL.rotation.x = armSwing;
-
-  let swingAmt = 0;
-  if (isSwing) {
-    const t = clamp(STATE.swingT / STATE.swingDuration, 0, 1);
-    swingAmt = Math.sin(t * Math.PI) * 1.0;
-  }
-
-  if (parts.armR) {
-    parts.armR.rotation.x = -armSwing + swingAmt * 1.4;
-    parts.armR.rotation.z = swingAmt * 0.25;
-  }
-
-  if (parts.tool) {
-    parts.tool.rotation.x = 0.2 + swingAmt * 1.2;
-    parts.tool.rotation.z = 0.2 + swingAmt * 0.35;
-  }
-}
-
-/* ============================================================
- * PHYSICS SNAPSHOT
- * ============================================================
- */
-
-function getLocalPhysics(dt) {
-  let speed = 0;
-  let grounded = false;
-
-  try {
-    const body = noa.entities.getPhysicsBody(noa.playerEntity);
-    if (body) {
-      const v = body.velocity;
-      speed = Math.sqrt(v[0] * v[0] + v[2] * v[2]);
-      if (body.resting[1] < 0) grounded = true;
-    }
-  } catch {}
-
-  const p = getSafePlayerPos();
-  if (!speed && STATE.lastPlayerPos && p) {
-    const dx = p[0] - STATE.lastPlayerPos[0];
-    const dz = p[2] - STATE.lastPlayerPos[2];
-    speed = Math.sqrt(dx * dx + dz * dz) / dt;
-  }
-
-  if (p) STATE.lastPlayerPos = [...p];
-
-  return { speed, grounded };
-}
-
-/* ============================================================
- * ITEM <-> BLOCK HELPERS
- * ============================================================
- */
-
-function getSelectedHotbarItem() {
-  const idx = LOCAL_HOTBAR.index | 0;
-  const uid = LOCAL_INV.slots?.[idx] || "";
-  const it = uid ? LOCAL_INV.items?.[uid] : null;
-  return { idx, uid, it };
-}
-
-function kindToBlockId(kind) {
-  if (kind === "block:dirt") return dirtID;
-  if (kind === "block:grass") return grassID;
-  if (kind === "block:stone") return stoneID;
-  if (kind === "block:bedrock") return bedrockID;
-  if (kind === "block:log") return logID;
-  if (kind === "block:leaves") return leavesID;
-  return 0;
-}
-
-function blockIdToKind(blockId) {
-  if (blockId === dirtID) return "block:dirt";
-  if (blockId === grassID) return "block:grass";
-  if (blockId === stoneID) return "block:stone";
-  if (blockId === bedrockID) return "block:bedrock";
-  if (blockId === logID) return "block:log";
-  if (blockId === leavesID) return "block:leaves";
-  return "";
-}
-
-/* ============================================================
- * MULTIPLAYER SYNC (players)
- * ============================================================
- */
-
-function getPlayersSnapshot(players) {
-  const out = {};
-  if (!players) return out;
-
-  if (typeof players.forEach === "function") {
-    try {
-      players.forEach((player, sessionId) => {
-        out[sessionId] = player;
-      });
-      return out;
-    } catch {}
-  }
-
-  try {
-    for (const k of Object.keys(players)) out[k] = players[k];
-  } catch {}
-
-  return out;
-}
-
-function spawnRemotePlayer(sessionId, player) {
-  if (!sessionId || !player) return;
-  if (colyRoom && sessionId === colyRoom.sessionId) return;
-  if (remotePlayers[sessionId]) return;
-  if (!ensureSceneReady()) return;
-
-  uiLog("[MP] remote joined:", sessionId);
-
-  const rig = createAvatarRig(STATE.scene, "remote_" + sessionId);
-
-  const px = safeNum(player.x, 0);
-  const py = safeNum(player.y, 0);
-  const pz = safeNum(player.z, 0);
-  const yaw = safeNum(player.yaw, 0);
-
-  remotePlayers[sessionId] = {
-    mesh: rig.root,
-    parts: rig,
-    targetPos: { x: px, y: py, z: pz },
-    targetRot: yaw,
-    lastPos: { x: px, y: py, z: pz },
-  };
-
-  rig.root.position.set(px, py + 0.075, pz);
-  rig.root.rotation.y = yaw;
-
-  forceRigBounds(rig);
-}
-
-function removeRemotePlayer(sessionId) {
-  const rp = remotePlayers[sessionId];
-  if (!rp) return;
-
-  uiLog("[MP] remote left:", sessionId);
-
-  try {
-    if (rp.mesh) rp.mesh.dispose();
-  } catch {}
-
-  delete remotePlayers[sessionId];
-}
-
-function updateRemoteTargetsFromState(playersObj) {
-  for (const sessionId of Object.keys(playersObj)) {
-    if (colyRoom && sessionId === colyRoom.sessionId) continue;
-
-    const player = playersObj[sessionId];
-    if (!player) continue;
-
-    if (!remotePlayers[sessionId]) {
-      spawnRemotePlayer(sessionId, player);
-      continue;
-    }
-
-    const rp = remotePlayers[sessionId];
-    rp.targetPos.x = safeNum(player.x, rp.targetPos.x);
-    rp.targetPos.y = safeNum(player.y, rp.targetPos.y);
-    rp.targetPos.z = safeNum(player.z, rp.targetPos.z);
-    rp.targetRot = safeNum(player.yaw, rp.targetRot);
-  }
-}
-
-function snapshotMyState(me) {
-  if (!me) return;
-
-  LOCAL_STATS.hp = safeNum(me.hp, LOCAL_STATS.hp);
-  LOCAL_STATS.maxHp = safeNum(me.maxHp, LOCAL_STATS.maxHp);
-  LOCAL_STATS.stamina = safeNum(me.stamina, LOCAL_STATS.stamina);
-  LOCAL_STATS.maxStamina = safeNum(me.maxStamina, LOCAL_STATS.maxStamina);
-  LOCAL_STATS.sprinting = !!me.sprinting;
-  LOCAL_STATS.swinging = !!me.swinging;
-
-  LOCAL_HOTBAR.index = safeNum(me.hotbarIndex, LOCAL_HOTBAR.index) | 0;
-
-  LOCAL_INV.cols = safeNum(me.inventory?.cols, LOCAL_INV.cols) | 0;
-  LOCAL_INV.rows = safeNum(me.inventory?.rows, LOCAL_INV.rows) | 0;
-
-  const slots = [];
-  try {
-    const src = me.inventory?.slots;
-    if (src && typeof src.length === "number") {
-      for (let i = 0; i < src.length; i++) slots.push(String(src[i] || ""));
-    }
-  } catch {}
-  LOCAL_INV.slots = slots;
-
-  const eq = me.equip || {};
-  LOCAL_INV.equip = {
-    head: String(eq.head || ""),
-    chest: String(eq.chest || ""),
-    legs: String(eq.legs || ""),
-    feet: String(eq.feet || ""),
-    tool: String(eq.tool || ""),
-    offhand: String(eq.offhand || ""),
-  };
-
-  const items = {};
-  try {
-    const m = me.items;
-    if (m && typeof m.forEach === "function") {
-      m.forEach((it, uid) => {
-        items[String(uid)] = {
-          uid: String(it.uid || uid),
-          kind: String(it.kind || ""),
-          qty: safeNum(it.qty, 0) | 0,
-          durability: safeNum(it.durability, 0) | 0,
-          maxDurability: safeNum(it.maxDurability, 0) | 0,
-          meta: String(it.meta || ""),
-        };
-      });
-    } else if (m && typeof m === "object") {
-      for (const uid of Object.keys(m)) {
-        const it = m[uid];
-        items[String(uid)] = {
-          uid: String(it.uid || uid),
-          kind: String(it.kind || ""),
-          qty: safeNum(it.qty, 0) | 0,
-          durability: safeNum(it.durability, 0) | 0,
-          maxDurability: safeNum(it.maxDurability, 0) | 0,
-          meta: String(it.meta || ""),
-        };
-      }
-    }
-  } catch {}
-  LOCAL_INV.items = items;
-
-  hotbarUI.refresh();
-  if (inventoryUI.isOpen()) inventoryUI.refresh();
-}
-
-function syncPlayersFromState(state) {
-  if (!state) return;
-
-  const playersObj = getPlayersSnapshot(state.players);
-  const newKeys = new Set(Object.keys(playersObj));
-
-  for (const k of newKeys) {
-    if (!lastPlayersKeys.has(k)) spawnRemotePlayer(k, playersObj[k]);
-  }
-
-  for (const k of lastPlayersKeys) {
-    if (!newKeys.has(k)) removeRemotePlayer(k);
-  }
-
-  updateRemoteTargetsFromState(playersObj);
-  lastPlayersKeys = newKeys;
-
-  if (colyRoom && playersObj[colyRoom.sessionId]) {
-    snapshotMyState(playersObj[colyRoom.sessionId]);
-  }
-}
-
-/* ============================================================
- * NETWORK SEND HELPERS
- * ============================================================
- */
-
-function sendHotbarIndex(index) {
-  if (!colyRoom) return;
-  try {
-    colyRoom.send("hotbar:set", { index: index | 0 });
-  } catch {}
-}
-
-function sendSprint(on) {
-  if (!colyRoom) return;
-  try {
-    colyRoom.send("sprint", { on: !!on });
-  } catch {}
-}
-
-function sendSwing() {
-  if (!colyRoom) return;
-  try {
-    colyRoom.send("swing", { t: performance.now() });
-  } catch {}
-}
-
-// SERVER-AUTH BLOCK OPS
-function sendBlockBreak(x, y, z, src = "unknown") {
-  if (!colyRoom) return;
-  try {
-    colyRoom.send("block:break", { x: x | 0, y: y | 0, z: z | 0, src });
-    if (DEBUG_BUILD) uiLog(`[NET] -> block:break ${x | 0},${y | 0},${z | 0} src=${src}`);
-  } catch (e) {
-    uiWarn("[NET] block:break send failed:", e);
-  }
-}
-
-function sendBlockPlace(x, y, z, kind, src = "unknown") {
-  if (!colyRoom) return;
-  try {
-    colyRoom.send("block:place", { x: x | 0, y: y | 0, z: z | 0, kind: String(kind || ""), src });
-    if (DEBUG_BUILD) uiLog(`[NET] -> block:place ${kind} at ${x | 0},${y | 0},${z | 0} src=${src}`);
-  } catch (e) {
-    uiWarn("[NET] block:place send failed:", e);
-  }
-}
-
-/* ============================================================
- * BUILDING (client chooses target, server decides)
- * ============================================================
- */
-
-function canPlaceAtClientSideHint(x, y, z) {
-  // purely a local hint to avoid obvious self-place spam
-  const p = getSafePlayerPos();
-  const px = p[0],
-    py = p[1],
-    pz = p[2];
-
-  const dx = Math.abs(x + 0.5 - px);
-  const dz = Math.abs(z + 0.5 - pz);
-  const dy = Math.abs(y + 0.5 - (py + 0.9));
-
-  const insidePlayer = dx < 0.45 && dz < 0.45 && dy < 1.0;
-  if (insidePlayer) return false;
-
-  return true;
-}
-
-function placeSelectedBlock(source = "unknown") {
-  if (inventoryOpen) {
-    if (DEBUG_BUILD) uiWarn("[BUILD] blocked: inventory open");
-    return;
-  }
-
-  STATE.swingT = 0;
-  sendSwing();
-
-  if (!noa.targetedBlock) {
-    if (DEBUG_BUILD) uiWarn("[BUILD] no targetedBlock (aim at a block face)", "src=", source);
-    return;
-  }
-
-  const { idx, uid, it } = getSelectedHotbarItem();
-
-  if (!uid || !it) {
-    if (DEBUG_BUILD) uiWarn("[BUILD] selected hotbar is empty", "idx=", idx, "src=", source);
-    return;
-  }
-
-  const kind = it?.kind || "";
-  if (!kind.startsWith("block:")) {
-    if (DEBUG_BUILD) uiWarn("[BUILD] selected item is not a block:", kind, "src=", source);
-    return;
-  }
-
-  const pos = noa.targetedBlock.adjacent;
-  const x = pos[0] | 0,
-    y = pos[1] | 0,
-    z = pos[2] | 0;
-
-  // local hint only
-  if (!canPlaceAtClientSideHint(x, y, z)) {
-    if (DEBUG_BUILD) uiWarn("[BUILD] blocked (inside player) at:", x, y, z, "src=", source);
-    return;
-  }
-
-  // IMPORTANT: no local setBlock, server decides
-  sendBlockPlace(x, y, z, kind, source);
-}
-
-/* ============================================================
- * INPUTS
- * ============================================================
- */
-
-window.addEventListener(
-  "keydown",
-  (e) => {
-    // F2: toggle browser context menu availability (for inspector)
-    if (e.code === "F2") {
-      e.preventDefault();
-      ALLOW_BROWSER_CONTEXT_MENU = !ALLOW_BROWSER_CONTEXT_MENU;
-      uiLog("[DEBUG] Browser context menu:", ALLOW_BROWSER_CONTEXT_MENU ? "ENABLED" : "DISABLED");
-      return;
-    }
-
-    // F3: toggle build logs
-    if (e.code === "F3") {
-      e.preventDefault();
-      DEBUG_BUILD = !DEBUG_BUILD;
-      uiLog("[DEBUG] Build logs:", DEBUG_BUILD ? "ON" : "OFF");
-      return;
-    }
-
-    if (e.code === "KeyV") {
-      viewMode = (viewMode + 1) % 2;
-      applyViewModeOnce();
-    }
-
-    if (e.code === "KeyC") {
-      forceCrosshair = !forceCrosshair;
-      crosshairUI.refresh();
-    }
-
-    if (e.code === "KeyP") {
-      showDebugProof = !showDebugProof;
-      refreshDebugProofMeshes();
-    }
-
-    if (e.code === "KeyI") {
-      e.preventDefault();
-      inventoryOpen = !inventoryOpen;
-      inventoryUI.setVisible(inventoryOpen);
-
-      if (inventoryOpen && document.pointerLockElement === noa.container.canvas) {
-        document.exitPointerLock?.();
-      }
-    }
-
-    if (e.code === "Escape") {
-      if (inventoryOpen) {
-        inventoryOpen = false;
-        inventoryUI.setVisible(false);
-      }
-    }
-
-    // building via keyboard ALWAYS works (even when context menu is enabled)
-    if (!inventoryOpen && (e.code === "KeyB" || e.code === "KeyE")) {
-      placeSelectedBlock(e.code);
-    }
-
-    if (!inventoryOpen) {
-      if (e.code === "Digit1") sendHotbarIndex(0);
-      if (e.code === "Digit2") sendHotbarIndex(1);
-      if (e.code === "Digit3") sendHotbarIndex(2);
-      if (e.code === "Digit4") sendHotbarIndex(3);
-      if (e.code === "Digit5") sendHotbarIndex(4);
-      if (e.code === "Digit6") sendHotbarIndex(5);
-      if (e.code === "Digit7") sendHotbarIndex(6);
-      if (e.code === "Digit8") sendHotbarIndex(7);
-      if (e.code === "Digit9") sendHotbarIndex(8);
-    }
-  },
-  true
-);
-
-// Context menu handling:
-// - If ALLOW_BROWSER_CONTEXT_MENU = true, do NOT prevent default
-// - Else prevent on canvas/pointer lock so right click can be used for building
-document.addEventListener(
-  "contextmenu",
-  (e) => {
-    if (ALLOW_BROWSER_CONTEXT_MENU) return;
-
-    const canvas = noa?.container?.canvas;
-    const overCanvas =
-      e.target === canvas ||
-      (canvas && typeof canvas.contains === "function" && canvas.contains(e.target));
-
-    if (document.pointerLockElement === canvas || overCanvas) {
-      e.preventDefault();
-    }
-  },
-  true
-);
-
-// Zoom + hotbar scroll
-noa.on("tick", function () {
-  const scroll = noa.inputs.pointerState.scrolly;
-
-  if (scroll !== 0 && viewMode === 1 && !inventoryOpen) {
-    noa.camera.zoomDistance = clamp(noa.camera.zoomDistance + (scroll > 0 ? 1 : -1), 2, 12);
-    noa.camera.currentZoom = noa.camera.zoomDistance;
-  }
-
-  if (!inventoryOpen && scroll !== 0) {
-    const dir = scroll > 0 ? 1 : -1;
-    const next = (LOCAL_HOTBAR.index + dir + 9) % 9;
-    sendHotbarIndex(next);
-  }
-});
-
-// Sprint intent (Shift)
-window.addEventListener(
-  "keydown",
-  (e) => {
-    if (e.code === "ShiftLeft" || e.code === "ShiftRight") {
-      if (!inventoryOpen) sendSprint(true);
-    }
-  },
-  true
-);
-window.addEventListener(
-  "keyup",
-  (e) => {
-    if (e.code === "ShiftLeft" || e.code === "ShiftRight") {
-      sendSprint(false);
-    }
-  },
-  true
-);
-
-/* ============================================================
- * MINE / BUILD INPUT (SERVER AUTHORITATIVE)
- * ============================================================
- */
-
-// Mine (left click default "fire")
-noa.inputs.down.on("fire", function () {
-  if (inventoryOpen) return;
-
-  STATE.swingT = 0;
-  sendSwing();
-
-  if (!noa.targetedBlock) return;
-
-  const tgt = noa.targetedBlock.position;
-  const x = tgt[0] | 0;
-  const y = tgt[1] | 0;
-  const z = tgt[2] | 0;
-
-  // IMPORTANT: no local setBlock, server decides
-  sendBlockBreak(x, y, z, "mouse1");
-});
-
-// Build (right click) only when browser context menu is disabled
-noa.inputs.down.on("alt-fire", function () {
-  if (ALLOW_BROWSER_CONTEXT_MENU) return;
-  placeSelectedBlock("mouse2");
-});
-
-// Ensure right mouse triggers alt-fire
-noa.inputs.bind("alt-fire", "mouse2");
-
-/* ============================================================
- * MAIN RENDER LOOP
- * ============================================================
- */
-
-noa.on("beforeRender", function () {
-  if (!ensureSceneReady()) return;
-
-  initFpsRig();
-  initLocalAvatar();
-  initDebugMeshes();
-
-  enforceViewModeEveryFrame();
-
-  const now = performance.now();
-  const dt = clamp((now - STATE.lastTime) / 1000, 0, 0.05);
-  STATE.lastTime = now;
+  // Swinging
   STATE.swingT += dt;
+  if (STATE.swingT < STATE.swingDuration) {
+    const prog = STATE.swingT / STATE.swingDuration;
+    const ang = Math.sin(prog * Math.PI) * 1.5;
+    if (MESH.armR) MESH.armR.rotation.x = 0.5 + ang;
+  } else {
+    if (MESH.armR) MESH.armR.rotation.x = 0.5;
+  }
+}
 
-  const { speed, grounded } = getLocalPhysics(dt);
+/* ============================================================
+ * 9. NETWORKING & SYNC
+ * ============================================================
+ */
 
-  updateFpsRig(dt, speed);
+function snapshotState(me) {
+  if (!me) return;
+  LOCAL_STATS.hp = me.hp;
+  LOCAL_STATS.stamina = me.stamina;
+  LOCAL_HOTBAR.index = me.hotbarIndex;
+  
+  LOCAL_INV.slots = (me.inventory.slots || []).map(String);
+  const items = {};
+  if (me.items) me.items.forEach((it, uid) => items[uid] = { kind: it.kind, qty: it.qty });
+  LOCAL_INV.items = items;
+  LOCAL_INV.equip = JSON.parse(JSON.stringify(me.equip || {}));
 
-  // local avatar
-  if (MESH.avatarRoot) {
-    const p = getSafePlayerPos();
-    MESH.avatarRoot.position.set(p[0], p[1] + 0.075, p[2]);
-    MESH.avatarRoot.rotation.y = safeNum(noa.camera.heading, 0);
-    MESH.avatarRoot.computeWorldMatrix(true);
-    forceRigBounds(MESH.avParts);
-    updateAvatarAnim(MESH.avParts, speed, grounded, STATE.swingT < STATE.swingDuration);
+  // Clean craft indices if item gone
+  for(let i=0; i<9; i++) {
+    const idx = LOCAL_CRAFT.indices[i];
+    if (idx !== -1 && !LOCAL_INV.slots[idx]) LOCAL_CRAFT.indices[i] = -1;
+  }
+  
+  if (inventoryUI.isOpen()) inventoryUI.refresh();
+  hotbarUI.refresh();
+}
+
+const ENDPOINT = "ws://localhost:2567";
+const client = new ColyClient(ENDPOINT);
+
+client.joinOrCreate("my_room", { name: "Steve" }).then(room => {
+  colyRoom = room;
+  uiLog("Connected to Server!");
+
+  room.onStateChange(state => {
+    // 1. Sync Self
+    const me = state.players.get(room.sessionId);
+    if (me) snapshotState(me);
+
+    // 2. Sync Remotes
+    state.players.forEach((p, sid) => {
+      if (sid === room.sessionId) return;
+      if (!remotePlayers[sid]) {
+        // Spawn
+        const rig = createAvatar(noa.rendering.getScene());
+        remotePlayers[sid] = { mesh: rig.root, targetPos: [p.x, p.y, p.z] };
+        uiLog(`Player ${sid} joined`);
+      }
+      // Update Target
+      remotePlayers[sid].targetPos = [p.x, p.y, p.z];
+      remotePlayers[sid].mesh.rotation.y = p.yaw;
+    });
+  });
+
+  room.onMessage("world:patch", (patch) => {
+    (patch.edits || []).forEach(e => noa.setBlock(e.id, e.x, e.y, e.z));
+  });
+
+  room.onMessage("block:update", (msg) => {
+    noa.setBlock(msg.id, msg.x, msg.y, msg.z);
+  });
+  
+  room.onMessage("craft:success", (msg) => {
+    uiLog(`Crafted: ${msg.item}`);
+    LOCAL_CRAFT.indices.fill(-1); // Clear grid on success
+    LOCAL_CRAFT.result = null;
+    inventoryUI.refresh();
+  });
+
+}).catch(e => uiLog(`Connect Error: ${e}`, "red"));
+
+/* ============================================================
+ * 10. INPUTS & GAME LOOP
+ * ============================================================
+ */
+
+// View Mode
+function setView(mode) {
+  viewMode = mode;
+  noa.camera.zoomDistance = mode === 1 ? 6 : 0;
+  if (MESH.weaponRoot) MESH.weaponRoot.setEnabled(mode === 0);
+  if (MESH.avatarRoot) MESH.avatarRoot.setEnabled(mode === 1);
+}
+
+// Mouse
+noa.inputs.down.on("fire", () => {
+  if (inventoryOpen) return;
+  STATE.swingT = 0;
+  if (colyRoom) colyRoom.send("swing");
+  
+  if (noa.targetedBlock) {
+    const p = noa.targetedBlock.position;
+    if (colyRoom) colyRoom.send("block:break", { x: p[0], y: p[1], z: p[2] });
+    noa.setBlock(0, p[0], p[1], p[2]); // Predict
+  }
+});
+
+noa.inputs.down.on("alt-fire", () => {
+  if (inventoryOpen || !noa.targetedBlock) return;
+  const p = noa.targetedBlock.adjacent;
+  const idx = LOCAL_HOTBAR.index;
+  const uid = LOCAL_INV.slots[idx];
+  const it = uid ? LOCAL_INV.items[uid] : null;
+  
+  if (it && it.kind.startsWith("block:")) {
+    let id = 0;
+    if (it.kind.includes("dirt")) id = ID.dirt;
+    if (it.kind.includes("log")) id = ID.log;
+    if (it.kind.includes("plank")) id = ID.planks;
+    if (it.kind.includes("stone")) id = ID.stone;
+    
+    if (id !== 0) {
+      if (colyRoom) colyRoom.send("block:place", { x: p[0], y: p[1], z: p[2], kind: it.kind });
+      noa.setBlock(id, p[0], p[1], p[2]); // Predict
+    }
+  }
+});
+
+// Keys
+window.addEventListener("keydown", (e) => {
+  if (e.code === "KeyI" || e.code === "Tab") {
+    e.preventDefault();
+    inventoryUI.toggle();
+  }
+  if (e.code === "F4") {
+    e.preventDefault();
+    UI_CONSOLE.toggle();
+  }
+  if (e.code === "KeyV") {
+    setView(viewMode === 0 ? 1 : 0);
+  }
+  
+  if (!inventoryOpen) {
+    if (e.key >= "1" && e.key <= "9") {
+       const idx = parseInt(e.key) - 1;
+       if (colyRoom) colyRoom.send("hotbar:set", { index: idx });
+       LOCAL_HOTBAR.index = idx;
+       hotbarUI.refresh();
+    }
+  }
+});
+
+// Loop
+noa.on("beforeRender", () => {
+  if (!STATE.scene) {
+    STATE.scene = noa.rendering.getScene();
+    initFpsRig(STATE.scene);
   }
 
-  hardFollowThirdPersonCamera();
+  const dt = noa.engineTimer.dt / 1000;
+  updateRigAnim(dt);
 
-  // remote interpolation
+  // Network Interpolation (Remote Players)
   for (const sid in remotePlayers) {
     const rp = remotePlayers[sid];
-    if (!rp || !rp.mesh) continue;
-
-    const t = 0.2;
-
-    rp.mesh.position.x = lerp(rp.mesh.position.x, rp.targetPos.x, t);
-    rp.mesh.position.y = lerp(rp.mesh.position.y, rp.targetPos.y + 0.075, t);
-    rp.mesh.position.z = lerp(rp.mesh.position.z, rp.targetPos.z, t);
-
-    rp.mesh.rotation.y = lerp(rp.mesh.rotation.y, rp.targetRot, t);
-
-    forceRigBounds(rp.parts);
-
-    const dx = rp.mesh.position.x - rp.lastPos.x;
-    const dz = rp.mesh.position.z - rp.lastPos.z;
-    const dist = Math.sqrt(dx * dx + dz * dz);
-    const remoteSpeed = dt > 0 ? dist / dt : 0;
-
-    rp.lastPos.x = rp.mesh.position.x;
-    rp.lastPos.y = rp.mesh.position.y;
-    rp.lastPos.z = rp.mesh.position.z;
-
-    updateAvatarAnim(rp.parts, remoteSpeed, true, false);
+    const cur = rp.mesh.position;
+    const tgt = rp.targetPos;
+    cur.x += (tgt[0] - cur.x) * 0.1;
+    cur.y += (tgt[1] - cur.y) * 0.1;
+    cur.z += (tgt[2] - cur.z) * 0.1;
   }
-
-  // debug cube
-  if (showDebugProof && MESH.frontCube && STATE.scene?.activeCamera) {
-    const cam = STATE.scene.activeCamera;
-    const fwd = cam.getForwardRay(3).direction;
-    MESH.frontCube.position.copyFrom(cam.position).addInPlace(fwd.scale(3));
-  }
-
-  // send move at ~10Hz
-  if (colyRoom) {
-    STATE._moveAccum += dt;
-    if (STATE._moveAccum >= 0.1) {
-      STATE._moveAccum = 0;
-
-      const p = getSafePlayerPos();
-      const yaw = noa.camera.heading;
-      const pitch = noa.camera.pitch;
-
-      try {
-        colyRoom.send("move", { x: p[0], y: p[1], z: p[2], yaw, pitch, viewMode });
-      } catch {}
-    }
+  
+  // Send Move
+  if (colyRoom && !inventoryOpen && (STATE.bobPhase % 5 < 1)) { // Throttle
+    const p = noa.entities.getPosition(noa.playerEntity);
+    const cam = noa.camera;
+    colyRoom.send("move", { x: p[0], y: p[1], z: p[2], yaw: cam.heading, pitch: cam.pitch });
   }
 });
 
-/* ============================================================
- * COLYSEUS CLIENT
- * ============================================================
- */
-
-const ENDPOINT =
-  import.meta.env && import.meta.env.VITE_COLYSEUS_ENDPOINT
-    ? import.meta.env.VITE_COLYSEUS_ENDPOINT
-    : "ws://localhost:2567";
-
-const colyseusClient = new ColyClient(ENDPOINT);
-
-async function connectColyseus() {
-  uiLog("[MP] connecting:", ENDPOINT);
-
-  try {
-    const room = await colyseusClient.joinOrCreate("my_room", { name: "Steve" });
-    colyRoom = room;
-
-    uiLog("[MP] connected session:", room.sessionId);
-
-    // Debug messages
-    room.onMessage("welcome", (msg) => uiLog("[server] welcome:", msg));
-    room.onMessage("hello_ack", (msg) => uiLog("[server] hello_ack:", msg));
-
-    // WORLD: patch + updates + rejects
-    room.onMessage("world:patch", (patch) => {
-      uiLog("[NET] <- world:patch", {
-        edits: patch?.edits?.length || 0,
-        truncated: !!patch?.truncated,
-      });
-      applyWorldPatch(patch, "world:patch");
-    });
-
-    room.onMessage("block:update", (msg) => {
-      applyBlockUpdate(msg, "block:update");
-    });
-
-    room.onMessage("block:reject", (msg) => {
-      // Always show rejects – they explain why mining/build didn't happen.
-      const reason = msg?.reason || "unknown";
-      uiWarn("[REJECT]", reason, msg);
-    });
-
-    // State sync (players + inventory/hotbar)
-    if (room.state) syncPlayersFromState(room.state);
-
-    room.onStateChange((state) => {
-      syncPlayersFromState(state);
-    });
-
-    room.send("hello", { hi: true });
-
-    // Friendly reminders in UI
-    uiLog("[HELP] F4 debug console • F3 build logs • LMB mine • RMB build (when context menu disabled)");
-    uiLog("[HELP] B/E build always • 1..9 hotbar • I inventory • V view mode • F2 context menu");
-  } catch (err) {
-    uiError("[MP] connection failed:", err);
-  }
-}
-
-connectColyseus();
-
-/* ============================================================
- * BOOT
- * ============================================================
- */
-
-const bootInterval = setInterval(() => {
-  if (ensureSceneReady()) {
-    clearInterval(bootInterval);
-    applyViewModeOnce();
-    uiLog("[BOOT] scene ready");
-
-    // Small live status line once per second
-    setInterval(() => {
-      const last = WORLD_SYNC.lastUpdateAt ? ((performance.now() - WORLD_SYNC.lastUpdateAt) | 0) : -1;
-      if (DEBUG_BUILD) {
-        uiLog(
-          `[WORLD] patchApplied=${WORLD_SYNC.patchAppliedOnce} lastPatch=${WORLD_SYNC.lastPatchCount}` +
-            ` truncated=${WORLD_SYNC.lastPatchTruncated} updates/s=${WORLD_SYNC.updatesThisSecond}` +
-            ` lastUpdateAgoMs=${last}`
-        );
-      }
-    }, 1000);
-  }
-}, 100);
+// Initial patch request
+noa.entities.setPosition(noa.playerEntity, 0, 10, 0);

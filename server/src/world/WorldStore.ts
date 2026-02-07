@@ -1,11 +1,12 @@
 // ============================================================
-// server/world/WorldStore.ts  (FULL REWRITE - ADVANCED TERRAIN)
+// server/world/WorldStore.ts  (FULL REWRITE - CRAFTING SUPPORT)
 // ============================================================
 // Purpose:
 // - Server-authoritative voxel world.
 // - Deterministic base terrain (Bedrock, Stone, Dirt, Grass, Trees).
 // - Stores ONLY edits (deltas) to save memory.
 // - Full persistence support (JSON file I/O).
+// - Includes PLANKS block ID for crafting.
 // ============================================================
 
 import * as fs from "fs";
@@ -21,6 +22,7 @@ export const BLOCKS = {
   BEDROCK: 4,
   LOG: 5,
   LEAVES: 6,
+  PLANKS: 7, // Added for crafting
 } as const;
 
 export type WorldEdit = { x: number; y: number; z: number; id: BlockId };
@@ -84,7 +86,6 @@ export function getBaseVoxelID(x: number, y: number, z: number): BlockId {
   if (y < -10) return BLOCKS.BEDROCK;
 
   // 2. Base Height Calculation
-  // Combine sine waves for some variance
   const height = Math.floor(4 * Math.sin(x / 15) + 4 * Math.cos(z / 20));
 
   // 3. Trees (Deterministic "structures")
@@ -102,19 +103,9 @@ export function getBaseVoxelID(x: number, y: number, z: number): BlockId {
       }
 
       // Leaves (Simple blob around the top)
-      // Radius 2 blob around top of trunk
       const topY = treeBaseY + trunkHeight - 1;
       if (y >= topY - 1 && y <= topY + 2) {
-         // This is a simplified vertical check. 
-         // For a real voxel tree, we usually check neighbors.
-         // Since getBaseVoxelID is point-based (x,y,z), we simulate width 
-         // by checking if THIS x,z is the trunk.
-         // To make wide leaves, we'd need to check if neighbors have a tree root.
-         // For this simple version, we stick to a "tall thin" tree or just the trunk top.
-         // Let's just do a "lollipop" top at the exact trunk coord for simplicity in this function,
-         // or keep it just logs if neighbor checks are too expensive here.
-         
-         // Let's stick to just the trunk and a "crown" block for now to ensure 100% determinism without neighbor lookups.
+         // Simple vertical check for leaves (lollipop tree)
          if (y > topY) return BLOCKS.LEAVES;
       }
     }

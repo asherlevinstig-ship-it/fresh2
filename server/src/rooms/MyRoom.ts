@@ -1,5 +1,5 @@
 // ============================================================
-// rooms/MyRoom.ts  (FULL REWRITE - PERSISTENCE ENABLED)
+// rooms/MyRoom.ts  (FULL REWRITE - CRAFTING + PERSISTENCE)
 // ============================================================
 
 import { Room, Client, CloseCode } from "@colyseus/core";
@@ -8,6 +8,7 @@ import * as path from "path";
 
 import { WorldStore, BLOCKS, type BlockId } from "../world/WorldStore.js";
 import { MyRoomState, PlayerState, ItemState } from "./schema/MyRoomState.js";
+import { CraftingSystem } from "../crafting/CraftingSystem.js";
 
 // ------------------------------------------------------------
 // Message Types
@@ -33,6 +34,8 @@ type InvSplitMsg = { slot: string };
 
 type InvConsumeHotbarMsg = { qty?: number };
 type InvAddMsg = { kind: string; qty?: number };
+
+type CraftCommitMsg = { srcIndices: number[] }; // Array of 9 inventory slot indices
 
 type BlockBreakMsg = { x: number; y: number; z: number; src?: string };
 type BlockPlaceMsg = { x: number; y: number; z: number; kind: string; src?: string };
@@ -174,7 +177,6 @@ function syncEquipToolToHotbar(p: PlayerState) {
   const idx = normalizeHotbarIndex(p.hotbarIndex);
   const uid = String(p.inventory.slots[idx] || "");
   
-  // If slot empty or item missing, clear tool
   if (!uid) {
     p.equip.tool = "";
     return;
@@ -186,8 +188,6 @@ function syncEquipToolToHotbar(p: PlayerState) {
     return;
   }
 
-  // Only equip to "tool" slot if compatible, otherwise clear it
-  // (Prevents holding dirt blocks as a "weapon" in the equipment slot)
   if (!isEquipSlotCompatible("tool", String(it.kind || ""))) {
     p.equip.tool = "";
     return;
@@ -314,7 +314,11 @@ function consumeFromHotbar(p: PlayerState, qty: number) {
 function kindToBlockId(kind: string): BlockId {
   if (kind === "block:dirt") return BLOCKS.DIRT;
   if (kind === "block:grass") return BLOCKS.GRASS;
-  if (kind === "block:stone") return 3; // Example ID if you add stone later
+  if (kind === "block:stone") return 3;
+  if (kind === "block:bedrock") return 4;
+  if (kind === "block:log") return 5;
+  if (kind === "block:leaves") return 6;
+  if (kind === "block:plank") return 7;
   return BLOCKS.AIR;
 }
 
@@ -322,6 +326,10 @@ function blockIdToKind(id: BlockId): string {
   if (id === BLOCKS.DIRT) return "block:dirt";
   if (id === BLOCKS.GRASS) return "block:grass";
   if (id === 3) return "block:stone";
+  if (id === 4) return "block:bedrock";
+  if (id === 5) return "block:log";
+  if (id === 6) return "block:leaves";
+  if (id === 7) return "block:plank";
   return "";
 }
 
@@ -349,8 +357,6 @@ export class MyRoom extends Room {
   public state!: MyRoomState;
 
   // Shared world per server process
-  // In a real app with multiple rooms, you might want one WorldStore per room instance,
-  // but for this demo, static is fine (or instance property if room = world).
   private static WORLD = new WorldStore({ minCoord: -100000, maxCoord: 100000 });
 
   // Persistence path
@@ -383,7 +389,7 @@ export class MyRoom extends Room {
     // 2. Configure Autosave
     MyRoom.WORLD.configureAutosave({
       path: this.worldPath,
-      minIntervalMs: 30000, // Autosave every 30s if dirty
+      minIntervalMs: 30000,
     });
 
     // 3. Simulation Tick
@@ -425,11 +431,7 @@ export class MyRoom extends Room {
         syncEquipToolToHotbar(p);
       });
       
-      // Trigger autosave check (async inside WorldStore)
-      // Note: We don't need to call save explicitly here; WorldStore handles it on modification if configured.
-      // But we can force a check if we want:
-      // MyRoom.WORLD.maybeAutosave(); // Not exposed publicly in prev code, but internal logic handles it.
-
+      // Autosave triggered internally by WorldStore logic on dirty + time check
     }, TICK_MS);
 
     // --------------------------------------------------------
@@ -530,7 +532,7 @@ export class MyRoom extends Room {
         if (toItem && !isEquipSlotCompatible(to.key, String(toItem.kind || ""))) return;
       }
 
-      // Case 1: Swap if empty
+      // Swap
       if (!toUid) {
         setSlotUid(p, to, fromUid);
         setSlotUid(p, from, "");
@@ -544,7 +546,7 @@ export class MyRoom extends Room {
         return;
       }
 
-      // Case 2: Stack merge
+      // Stack merge
       if (fromItem && toItem && String(fromItem.kind) === String(toItem.kind)) {
         const maxStack = maxStackForKind(String(toItem.kind));
         if (maxStack > 1) {
@@ -567,7 +569,7 @@ export class MyRoom extends Room {
         }
       }
 
-      // Case 3: Direct Swap
+      // Direct Swap
       setSlotUid(p, to, fromUid);
       setSlotUid(p, from, toUid);
       syncEquipToolToHotbar(p);
@@ -578,7 +580,7 @@ export class MyRoom extends Room {
       if (!p) return;
 
       const slot = parseSlotRef(msg?.slot);
-      if (!slot || slot.kind !== "inv") return; // Only split in inventory for now
+      if (!slot || slot.kind !== "inv") return;
 
       ensureSlotsLength(p);
       const uid = getSlotUid(p, slot);
@@ -612,6 +614,78 @@ export class MyRoom extends Room {
       p.inventory.slots[emptyIdx] = newUid;
 
       syncEquipToolToHotbar(p);
+    });
+
+    // --------------------------------------------------------
+    // Crafting Handler
+    // --------------------------------------------------------
+
+    this.onMessage("craft:commit", (client: Client, msg: CraftCommitMsg) => {
+      const p = this.state.players.get(client.sessionId);
+      if (!p) return;
+
+      const indices = msg?.srcIndices;
+      if (!Array.isArray(indices) || indices.length !== 9) {
+          console.log(`[CRAFT] Invalid indices from ${client.sessionId}`);
+          return;
+      }
+
+      // 1. Resolve Items from 3x3 Grid
+      const kinds: string[] = [];
+      const validSlotIndices: number[] = [];
+
+      ensureSlotsLength(p);
+      
+      for (let i = 0; i < 9; i++) {
+          const slotIdx = indices[i];
+          if (slotIdx === -1) {
+              kinds.push("");
+              continue;
+          }
+          
+          if (slotIdx < 0 || slotIdx >= p.inventory.slots.length) {
+             console.log(`[CRAFT] Index out of bounds: ${slotIdx}`);
+             return;
+          }
+
+          const uid = p.inventory.slots[slotIdx];
+          const item = uid ? p.items.get(uid) : null;
+          
+          if (!uid || !item) {
+             console.log(`[CRAFT] Slot mismatch/empty: ${slotIdx}`);
+             return; 
+          }
+
+          kinds.push(item.kind);
+          validSlotIndices.push(slotIdx);
+      }
+
+      // 2. Check Match
+      const match = CraftingSystem.findMatch(kinds);
+      if (!match) {
+          console.log(`[CRAFT] No match for ${client.sessionId}`);
+          return;
+      }
+
+      // 3. Consume Ingredients
+      for (const slotIdx of validSlotIndices) {
+          const uid = p.inventory.slots[slotIdx];
+          const it = p.items.get(uid);
+          if (it) {
+              it.qty -= 1;
+              if (it.qty <= 0) {
+                  p.inventory.slots[slotIdx] = "";
+                  p.items.delete(uid);
+              }
+          }
+      }
+
+      // 4. Add Result
+      const added = addKindToInventory(p, match.result.kind, match.result.qty);
+      syncEquipToolToHotbar(p);
+      
+      console.log(`[CRAFT] ${client.sessionId} crafted ${match.result.kind} x${match.result.qty}`);
+      client.send("craft:success", { item: match.result.kind });
     });
 
     // --------------------------------------------------------
@@ -678,7 +752,6 @@ export class MyRoom extends Room {
         return;
       }
 
-      // Reach check
       const d = dist3(p.x, p.y + 1.6, p.z, x + 0.5, y + 0.5, z + 0.5);
       if (d > BLOCK_REACH) {
         reject(client, "too_far", { op: "break", src, d });
@@ -694,7 +767,7 @@ export class MyRoom extends Room {
       // Apply break
       const { newId } = MyRoom.WORLD.applyBreak(x, y, z);
 
-      // Add item to inventory
+      // Add item
       const kind = blockIdToKind(prevId);
       if (kind) addKindToInventory(p, kind, 1);
 
@@ -746,7 +819,7 @@ export class MyRoom extends Room {
         return;
       }
 
-      // Consume item
+      // Consume
       const took = consumeFromHotbar(p, 1);
       if (took <= 0) {
         reject(client, "no_blocks_in_hotbar", { op: "place", src });
