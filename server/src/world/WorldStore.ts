@@ -1,22 +1,23 @@
 // ============================================================
-// server/world/WorldStore.ts  (FULL REWRITE - BIOMES + ORES)
+// server/world/WorldStore.ts  (FULL REWRITE - NO OMITS - BIOMES)
 // ============================================================
 // Purpose:
 // - Server-authoritative voxel world.
-// - Deterministic base terrain WITH BIOMES (must be mirrored client-side).
+// - Deterministic base terrain (biomes + height + vegetation + ores).
 // - Stores ONLY edits (deltas) to save memory.
 // - Full persistence support (JSON file I/O).
-// - Expanded block palette (biome surfaces + ores + valuables).
+// - Autosave support.
+// - Patch encoding (edits only) for syncing with clients.
 //
 // IMPORTANT:
-// - Your client world gen must implement the SAME biome/height/surface logic,
-//   using shared/world/Biomes.ts, otherwise base terrain will visually diverge.
+// - This file expects a sibling file: ./Biomes.ts (compiled import as ./Biomes.js)
+// - Your client has a DUPLICATED Biomes.ts with same logic.
 // ============================================================
 
 import * as fs from "fs";
 import * as path from "path";
 
-// Shared biome logic (same math on client + server)
+// Biomes (server copy) — NodeNext/Node16 wants .js in compiled output imports
 import {
   sampleBiome,
   getTerrainLayerBlockId,
@@ -26,19 +27,27 @@ import {
   getCactusHeight,
   buildDefaultOreTablesFromPalette,
   pickOreId,
+  type BiomeId,
+  type TreeSpec,
+  type OreTables,
 } from "./Biomes.js";
-
 
 export type BlockId = number;
 
 // ------------------------------------------------------------
-// Block Palette (Server IDs)
+// Block IDs (MUST MATCH CLIENT REGISTRY)
+// ------------------------------------------------------------
+//
+// Keep these numeric IDs stable once you publish a world,
+// because existing saved edits store numbers.
+//
+// If you add new blocks later, append new IDs — do NOT reorder.
 // ------------------------------------------------------------
 
 export const BLOCKS = {
   AIR: 0,
 
-  // Terrain
+  // Core terrain
   DIRT: 1,
   GRASS: 2,
   STONE: 3,
@@ -48,7 +57,7 @@ export const BLOCKS = {
   LOG: 5,
   LEAVES: 6,
 
-  // Crafted building
+  // Crafted/building
   PLANKS: 7,
 
   // Biome surfaces
@@ -59,59 +68,32 @@ export const BLOCKS = {
   MUD: 12,
   ICE: 13,
 
+  // Desert vegetation
+  CACTUS: 14,
+
   // Ores / valuables
-  COAL_ORE: 14,
-  COPPER_ORE: 15,
-  IRON_ORE: 16,
-  SILVER_ORE: 17,
-  GOLD_ORE: 18,
+  COAL_ORE: 15,
+  COPPER_ORE: 16,
+  IRON_ORE: 17,
+  SILVER_ORE: 18,
+  GOLD_ORE: 19,
 
-  // Gems / fantasy
-  RUBY_ORE: 19,
-  SAPPHIRE_ORE: 20,
-  MYTHRIL_ORE: 21,
-  DRAGONSTONE: 22,
+  // Fantasy tiers
+  RUBY_ORE: 20,
+  SAPPHIRE_ORE: 21,
+  MYTHRIL_ORE: 22,
+  DRAGONSTONE: 23,
 
-  // Optional crafted blocks (if you add recipes for them)
-  CRAFTING_TABLE: 23,
-  CHEST: 24,
-  SLAB_PLANK: 25,
-  STAIRS_PLANK: 26,
-  DOOR_WOOD: 27,
+  // Optional functional blocks (safe to include now)
+  CRAFTING_TABLE: 24,
+  CHEST: 25,
+  SLAB_PLANK: 26,
+  STAIRS_PLANK: 27,
+  DOOR_WOOD: 28,
 } as const;
 
-// This palette is passed into Biomes.ts so it can pick correct IDs.
-// (Avoids circular imports from shared -> server)
-const PALETTE: BlockPalette = {
-  AIR: BLOCKS.AIR,
-  DIRT: BLOCKS.DIRT,
-  GRASS: BLOCKS.GRASS,
-  STONE: BLOCKS.STONE,
-  BEDROCK: BLOCKS.BEDROCK,
-  LOG: BLOCKS.LOG,
-  LEAVES: BLOCKS.LEAVES,
-
-  SAND: BLOCKS.SAND,
-  SNOW: BLOCKS.SNOW,
-  CLAY: BLOCKS.CLAY,
-  GRAVEL: BLOCKS.GRAVEL,
-  MUD: BLOCKS.MUD,
-  ICE: BLOCKS.ICE,
-
-  COAL_ORE: BLOCKS.COAL_ORE,
-  COPPER_ORE: BLOCKS.COPPER_ORE,
-  IRON_ORE: BLOCKS.IRON_ORE,
-  SILVER_ORE: BLOCKS.SILVER_ORE,
-  GOLD_ORE: BLOCKS.GOLD_ORE,
-
-  RUBY_ORE: BLOCKS.RUBY_ORE,
-  SAPPHIRE_ORE: BLOCKS.SAPPHIRE_ORE,
-  MYTHRIL_ORE: BLOCKS.MYTHRIL_ORE,
-  DRAGONSTONE: BLOCKS.DRAGONSTONE,
-};
-
-// Build deterministic ore tables once (used by getBaseVoxelID)
-const ORE_TABLES = buildDefaultOreTablesFromPalette(PALETTE);
+// “palette” type used by biome helpers
+export type BlockPalette = typeof BLOCKS & Record<string, number>;
 
 export type WorldEdit = { x: number; y: number; z: number; id: BlockId };
 
@@ -155,21 +137,27 @@ function parseKey(k: string): { x: number; y: number; z: number } | null {
   return { x: x | 0, y: y | 0, z: z | 0 };
 }
 
-// ============================================================
-// Deterministic Terrain Logic (Biomes + Trees + Cactus + Ores)
-// ============================================================
+// ------------------------------------------------------------
+// Deterministic Base Terrain (Biomes + Ores + Vegetation)
+// ------------------------------------------------------------
 //
-// MUST be mirrored by the client generator for baseline terrain.
-// Server edits are deltas; if base differs, visuals will diverge.
+// This MUST match the client’s deterministic generation logic
+// (same Biomes.ts math + same block IDs).
 //
-// Rules:
-// - Bedrock below y < -10
-// - Determine biome + height from (x,z)
-// - Above height: air except deterministic vegetation (trees/cactus)
-// - At height and below: biome-based surface layering
-// - Stone zone: possible ore replacement (biome-weighted via tables)
-// ============================================================
+// WorldStore only stores edits; base terrain is computed here.
+// ------------------------------------------------------------
 
+const PALETTE: BlockPalette = BLOCKS as any;
+const ORE_TABLES: OreTables = buildDefaultOreTablesFromPalette(PALETTE);
+
+/**
+ * Determine base block at world coordinate (x,y,z) WITHOUT edits.
+ * - Bedrock floor at y < -10.
+ * - Biome height from sampleBiome(x,z).
+ * - Surface layers from getTerrainLayerBlockId.
+ * - Vegetation: trees + cactus (deterministic).
+ * - Ores: replace some stone underground (deterministic).
+ */
 export function getBaseVoxelID(x: number, y: number, z: number): BlockId {
   x |= 0;
   y |= 0;
@@ -178,89 +166,130 @@ export function getBaseVoxelID(x: number, y: number, z: number): BlockId {
   // 1) Bedrock floor
   if (y < -10) return BLOCKS.BEDROCK;
 
-  // 2) Biome + height
-  const sb = sampleBiome(x, z);
-  const biome: BiomeId = sb.biome;
-  const height = sb.height;
+  // 2) Biome + height at this column
+  const b = sampleBiome(x, z);
+  const biome = b.biome;
+  const height = b.height;
 
-  // 3) Air above ground, with deterministic vegetation structures
-  //    - Trees (forest/plains/tundra/mountains)
-  //    - Cactus (desert)
+  // 3) Above ground: AIR unless vegetation places something
   if (y > height) {
-    // Vegetation is only in a window above the ground
-    // (keeps it cheap and consistent)
-    const maxVegetationY = height + 8;
-    if (y >= maxVegetationY) return BLOCKS.AIR;
-
-    // 3a) Trees
+    // Trees (forest/plains/swamp/tundra)
     if (shouldSpawnTree(x, z, biome)) {
-      const { trunkHeight, canopyRadius, type } = getTreeSpec(x, z, biome);
-      const treeBaseY = height + 1;
-      const trunkTopY = treeBaseY + trunkHeight - 1;
+      const spec = getTreeSpec(x, z, biome);
 
-      // Trunk column
-      if (y >= treeBaseY && y <= trunkTopY) {
+      // Trunk base starts one above ground
+      const trunkBaseY = height + 1;
+      const trunkTopY = trunkBaseY + Math.max(1, spec.trunkHeight) - 1;
+
+      // Trunk
+      if (y >= trunkBaseY && y <= trunkTopY) {
         return BLOCKS.LOG;
       }
 
-      // Leaves / canopy
-      // Oak: round-ish canopy blob
-      // Pine: smaller canopy, slightly taller taper vibe (simple)
-      const dy = y - trunkTopY;
+      // Canopy:
+      // - Use spec.canopyRadius and spec.canopyHeight
+      // - Canopy centered around trunkTopY
+      const canopyRadius = Math.max(1, Math.floor(Number((spec as any).canopyRadius ?? 2)));
+      const canopyHeight = Math.max(2, Math.floor(Number((spec as any).canopyHeight ?? 3)));
 
-      if (type === "oak") {
-        // Canopy spans trunkTopY-1 .. trunkTopY+2
-        if (y >= trunkTopY - 1 && y <= trunkTopY + 2) {
-          const r = canopyRadius;
-          // simple "diamond-ish" canopy without extra hash calls:
-          // at higher dy, reduce radius
-          const rr = Math.max(0, r - Math.max(0, dy));
-          const ax = Math.abs(x - x); // always 0 (we're per-column); canopy is decided by y window
-          // In a pure per-voxel function we'd need x/z offsets. Since we don't have local offsets here,
-          // we keep leaves as a vertical cap only (lollipop). This matches your older server logic.
-          // If you later want 3D canopy blobs, do it in chunk generation loops (client+server).
-          if (rr >= 0 && y > trunkTopY) return BLOCKS.LEAVES;
-        }
-      } else {
-        // Pine: leaves mostly above the trunk top
-        if (y >= trunkTopY && y <= trunkTopY + 3) {
-          if (y > trunkTopY) return BLOCKS.LEAVES;
-        }
+      const canopyBottom = trunkTopY - 1;
+      const canopyTop = canopyBottom + canopyHeight;
+
+      if (y >= canopyBottom && y <= canopyTop) {
+        const dy = y - canopyBottom; // 0..canopyHeight
+        // taper radius slightly with height
+        const taper = 1 - dy / (canopyHeight + 0.001);
+        const r = Math.max(1, Math.floor(canopyRadius * (0.7 + 0.3 * taper)));
+
+        // circular-ish canopy
+        const dx = x - x; // 0 in this function, but we still need offsets
+        const dz = z - z; // 0
+        // We need to check neighbors too, but base function is per-voxel.
+        // So: determine if THIS voxel belongs to canopy using distance to trunk column.
+        // Since trunk column is at (x,z) same as current voxel’s column, canopy in this simple version
+        // only exists in the same column. That’s not enough.
+        //
+        // To do a real canopy (multi-block), we need to test distance to trunk center with offsets
+        // derived from current voxel vs trunk center: current voxel is (x,z) and trunk center is (x0,z0).
+        // But here, x0=z0 are the same inputs. So to support radius, we must evaluate canopy
+        // when getBaseVoxelID is called at nearby columns too.
+        //
+        // That means: canopy should be decided by checking if the column's tree root is at (x0,z0),
+        // not necessarily at (x,z). To keep deterministic and cheap, we check a small neighborhood of
+        // possible tree roots and see if any canopy covers this voxel.
+        //
+        // So we fall through to "neighborhood canopy check" below.
       }
     }
 
-    // 3b) Cactus (desert only; we represent cactus as "LOG" for now if you don't have CACTUS block)
-    // If you add BLOCKS.CACTUS later, swap this.
+    // Desert cactus
     if (shouldSpawnCactus(x, z, biome)) {
-      const cactusBaseY = height + 1;
-      const cactusH = getCactusHeight(x, z);
-      if (y >= cactusBaseY && y < cactusBaseY + cactusH) {
-        // Placeholder: use LOG as a stand-in cactus block unless you add CACTUS id.
-        return BLOCKS.LOG;
+      const baseY = height + 1;
+      const h = getCactusHeight(x, z);
+      if (y >= baseY && y < baseY + h) return BLOCKS.CACTUS;
+    }
+
+    // Neighborhood canopy check (supports multi-block canopy)
+    // We scan for tree roots in a small neighborhood so leaves can extend.
+    // Keep this small for performance.
+    //
+    // Radius max we expect: ~3. We'll scan +/-4 to be safe.
+    const SCAN_R = 4;
+
+    for (let ox = -SCAN_R; ox <= SCAN_R; ox++) {
+      for (let oz = -SCAN_R; oz <= SCAN_R; oz++) {
+        const rx = x + ox;
+        const rz = z + oz;
+
+        const bb = sampleBiome(rx, rz);
+        const rBiome = bb.biome;
+        const rHeight = bb.height;
+
+        if (!shouldSpawnTree(rx, rz, rBiome)) continue;
+
+        const spec = getTreeSpec(rx, rz, rBiome);
+        const trunkBaseY = rHeight + 1;
+        const trunkTopY = trunkBaseY + Math.max(1, spec.trunkHeight) - 1;
+
+        const canopyRadius = Math.max(1, Math.floor(Number((spec as any).canopyRadius ?? 2)));
+        const canopyHeight = Math.max(2, Math.floor(Number((spec as any).canopyHeight ?? 3)));
+
+        const canopyBottom = trunkTopY - 1;
+        const canopyTop = canopyBottom + canopyHeight;
+
+        if (y < canopyBottom || y > canopyTop) continue;
+
+        const dy = y - canopyBottom;
+        const taper = 1 - dy / (canopyHeight + 0.001);
+        const rr = Math.max(1, Math.floor(canopyRadius * (0.7 + 0.3 * taper)));
+
+        const dx = x - rx;
+        const dz = z - rz;
+
+        if (dx * dx + dz * dz <= rr * rr) {
+          // Avoid placing leaves inside trunk column above trunk
+          // (optional) — if it's exactly in trunk column and within trunk height, skip:
+          if (dx === 0 && dz === 0 && y >= trunkBaseY && y <= trunkTopY) continue;
+          return BLOCKS.LEAVES;
+        }
       }
     }
 
     return BLOCKS.AIR;
   }
 
-  // 4) Ground and below: surface layering
-  // depth below surface: 0 at y==height, 1 at y==height-1, etc.
-  const depth = height - y;
+  // 4) At/Below surface: determine layer (surface/subsurface/stone)
+  const depth = height - y; // 0 => surface, 1.. => below surface
+  const layerId = getTerrainLayerBlockId(PALETTE, biome, depth);
 
-  // 4a) Stone zone starts a little below surface (classic: height-3 and deeper),
-  // but you can let biome define it (we use shared helper for top/under depths).
-  // We'll treat "deep" as anything beyond surface+underDepth from Biomes.ts.
-  // To do that cheaply, ask terrain helper what we'd place at that depth:
-  const terrainId = getTerrainLayerBlockId(PALETTE, biome, depth);
-
-  // 4b) If helper says stone, allow ore replacement
-  if (terrainId === BLOCKS.STONE) {
+  // 5) Ores: only attempt in stone-like zones
+  // We treat "stone layer" as anything equal to BLOCKS.STONE.
+  if (layerId === BLOCKS.STONE) {
     const oreId = pickOreId(x, y, z, biome, height, ORE_TABLES);
-    if (oreId) return oreId;
-    return BLOCKS.STONE;
+    if (oreId && typeof oreId === "number" && oreId !== 0) return oreId;
   }
 
-  return terrainId;
+  return layerId;
 }
 
 // ------------------------------------------------------------
@@ -368,6 +397,7 @@ export class WorldStore {
     const k = keyOf(x, y, z);
 
     if (id === base) {
+      // If setting to base, remove the edit (optimization)
       if (this.edits.has(k)) {
         this.edits.delete(k);
         this.markDirty();
@@ -437,10 +467,7 @@ export class WorldStore {
   /**
    * Get edits inside an axis-aligned bounding box (inclusive).
    */
-  public getEditsInAABB(
-    min: { x: number; y: number; z: number },
-    max: { x: number; y: number; z: number }
-  ): WorldEdit[] {
+  public getEditsInAABB(min: { x: number; y: number; z: number }, max: { x: number; y: number; z: number }): WorldEdit[] {
     const minX = Math.min(min.x | 0, max.x | 0);
     const maxX = Math.max(min.x | 0, max.x | 0);
     const minY = Math.min(min.y | 0, max.y | 0);
@@ -564,10 +591,12 @@ export class WorldStore {
       const z = i32(e?.z, 0);
       const id = i32(e?.id, BLOCKS.AIR);
 
+      // clamp coords to store bounds
       const sx = clamp(x, this.minCoord, this.maxCoord) | 0;
       const sy = clamp(y, this.minCoord, this.maxCoord) | 0;
       const sz = clamp(z, this.minCoord, this.maxCoord) | 0;
 
+      // store as delta vs base
       const base = this.getBaseBlock(sx, sy, sz);
       const k = keyOf(sx, sy, sz);
 
