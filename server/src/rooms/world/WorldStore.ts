@@ -1,49 +1,71 @@
 // ============================================================
-// rooms/world/WorldStore.ts  (FULL REWRITE - NO OMITS)
+// server/world/WorldStore.ts  (FULL REWRITE - NO OMITS)
 // ------------------------------------------------------------
 // Purpose:
-// - Server-authoritative voxel world storage for a Minecraft-like game
-// - Uses a procedural base terrain (deterministic) + sparse override map
-// - Only stores edited voxels (including air removals), not whole chunks
-//
-// Key ideas:
-// - get(x,y,z): returns override if present, else base terrain voxel id
-// - set(x,y,z,id): writes override, but drops it if it matches base terrain
-//   (keeps the sparse map small)
-// - Optional helpers for batching edits and chunk snapshots (lightweight)
+// - Server-authoritative voxel world for a NOA-style Minecraft clone.
+// - Provides deterministic base terrain generation (must match client).
+// - Stores ONLY edits (placed/broken blocks) in a compact Map.
+// - Supports chunk snapshots + patching for late joiners.
+// - Designed to be used from Colyseus rooms (MyRoom).
 //
 // IMPORTANT:
-// - Block IDs MUST match client registry.
-//   Your client registers:
-//     registerBlock(1) dirt
-//     registerBlock(2) grass
-//   So this store uses:
-//     0 = air, 1 = dirt, 2 = grass
+// - Block IDs MUST match the client registry:
+//     0 = air
+//     1 = dirt
+//     2 = grass
+// - Base terrain function MUST match client getVoxelID(x,y,z).
+//
+// API:
+//   - getBaseBlock(x,y,z) -> number
+//   - getBlock(x,y,z) -> number   (edits override base)
+//   - setBlock(x,y,z,id) -> number (stores delta vs base)
+//   - applyBreak(x,y,z) -> { prevId, newId }
+//   - applyPlace(x,y,z,id) -> { prevId, newId }
+//   - getEditsInAABB(min,max) -> array of {x,y,z,id}
+//   - getAllEdits() -> array of {x,y,z,id}
+//   - makeChunkSnapshot(chunkX,chunkY,chunkZ,chunkSize) -> Uint16Array
+//   - encodeEditsPatch(...) -> { edits: {x,y,z,id}[] } for client
+//
+// Notes:
+// - WorldStore does NOT do inventory, reach checks, or permission checks.
+//   That logic lives in the Room.
+// - Coordinates are assumed integer block coords.
 // ============================================================
 
-export type Vec3i = { x: number; y: number; z: number };
+export type BlockId = number;
 
-export const BLOCK = {
+export const BLOCKS = {
   AIR: 0,
   DIRT: 1,
   GRASS: 2,
 } as const;
 
-export type BlockId = (typeof BLOCK)[keyof typeof BLOCK];
+export type WorldEdit = { x: number; y: number; z: number; id: BlockId };
 
-export type BlockUpdate = { x: number; y: number; z: number; id: number };
-
-// ------------------------------------------------------------
-// utils
-// ------------------------------------------------------------
-
-function key3(x: number, y: number, z: number) {
-  return `${x | 0},${y | 0},${z | 0}`;
+function isFiniteNum(n: any): n is number {
+  return typeof n === "number" && Number.isFinite(n);
 }
 
-function parseKey(k: string): Vec3i | null {
-  // expects "x,y,z"
-  const parts = k.split(",");
+function clamp(n: number, a: number, b: number) {
+  return Math.max(a, Math.min(b, n));
+}
+
+function i32(n: any, fallback = 0) {
+  const v = Number(n);
+  if (!Number.isFinite(v)) return fallback;
+  return v | 0;
+}
+
+/** String key for Map storage */
+function keyOf(x: number, y: number, z: number) {
+  // Fast + stable + readable
+  return `${x}|${y}|${z}`;
+}
+
+/** Inverse for debugging or utilities (not used by default) */
+function parseKey(k: string): { x: number; y: number; z: number } | null {
+  if (typeof k !== "string") return null;
+  const parts = k.split("|");
   if (parts.length !== 3) return null;
   const x = Number(parts[0]);
   const y = Number(parts[1]);
@@ -52,352 +74,253 @@ function parseKey(k: string): Vec3i | null {
   return { x: x | 0, y: y | 0, z: z | 0 };
 }
 
-function i32(n: any, fallback = 0) {
-  const v = Number(n);
-  return Number.isFinite(v) ? (v | 0) : fallback;
-}
-
-function clampI32(n: number, a: number, b: number) {
-  return Math.max(a | 0, Math.min(b | 0, n | 0)) | 0;
-}
-
-// ------------------------------------------------------------
-// base terrain (matches your client getVoxelID)
-// ------------------------------------------------------------
-
-export function getBaseVoxelID(x: number, y: number, z: number): number {
-  // Mirror your client exactly:
-  // const height = 2 * Math.sin(x / 10) + 3 * Math.cos(z / 20);
-  // if (y < height - 1) return dirt;
-  // if (y < height) return grass;
-  // return 0;
+/**
+ * Deterministic base terrain function.
+ * MUST match the client:
+ *   height = 2*sin(x/10) + 3*cos(z/20)
+ *   if y < height - 1 => dirt
+ *   else if y < height => grass
+ *   else air
+ */
+export function getBaseVoxelID(x: number, y: number, z: number): BlockId {
+  // Use Math.sin/cos exactly as client does
   const height = 2 * Math.sin(x / 10) + 3 * Math.cos(z / 20);
-  if (y < height - 1) return BLOCK.DIRT;
-  if (y < height) return BLOCK.GRASS;
-  return BLOCK.AIR;
+
+  if (y < height - 1) return BLOCKS.DIRT;
+  if (y < height) return BLOCKS.GRASS;
+  return BLOCKS.AIR;
 }
 
-// ------------------------------------------------------------
-// WorldStore
-// ------------------------------------------------------------
-
+/**
+ * WorldStore keeps ONLY edits vs base terrain.
+ * If an edit matches the base, it is removed (keeps map small).
+ */
 export class WorldStore {
-  /**
-   * Sparse overrides: only stores voxels that differ from base terrain.
-   * Keyed by "x,y,z" -> blockId
-   */
-  private overrides = new Map<string, number>();
+  /** Map of coordinate key -> blockId */
+  private edits: Map<string, BlockId>;
 
-  /**
-   * Optional bounds guard (helps keep accidental spam from blowing memory).
-   * You can disable by setting min/max extremely wide.
-   */
-  public bounds = {
-    minX: -100000,
-    maxX: 100000,
-    minY: -100000,
-    maxY: 100000,
-    minZ: -100000,
-    maxZ: 100000,
-  };
+  /** Optional bounds guard */
+  public readonly minCoord: number;
+  public readonly maxCoord: number;
 
-  constructor(init?: { bounds?: Partial<WorldStore["bounds"]> }) {
-    if (init?.bounds) {
-      this.bounds = { ...this.bounds, ...init.bounds };
-    }
+  constructor(opts?: { minCoord?: number; maxCoord?: number; seed?: number }) {
+    this.edits = new Map();
+
+    // seed is unused for now (terrain is deterministic without seed),
+    // but kept so you can extend later to seeded noise.
+    this.minCoord = isFiniteNum(opts?.minCoord) ? (opts!.minCoord as number) : -100000;
+    this.maxCoord = isFiniteNum(opts?.maxCoord) ? (opts!.maxCoord as number) : 100000;
   }
 
-  // ----------------------------------------------------------
-  // validation
-  // ----------------------------------------------------------
-
-  public inBounds(x: number, y: number, z: number) {
-    const b = this.bounds;
-    return (
-      x >= b.minX &&
-      x <= b.maxX &&
-      y >= b.minY &&
-      y <= b.maxY &&
-      z >= b.minZ &&
-      z <= b.maxZ
-    );
+  /** Clamp coords into safe range for sanity */
+  public sanitizeCoord(n: any) {
+    const v = i32(n, 0);
+    return clamp(v, this.minCoord, this.maxCoord) | 0;
   }
 
-  public normalizeCoord(x: any, y: any, z: any): Vec3i | null {
-    const ix = i32(x, NaN as any);
-    const iy = i32(y, NaN as any);
-    const iz = i32(z, NaN as any);
-    if (!Number.isFinite(ix) || !Number.isFinite(iy) || !Number.isFinite(iz)) return null;
-
-    // clamp to bounds so callers can safely trust it
-    const cx = clampI32(ix, this.bounds.minX, this.bounds.maxX);
-    const cy = clampI32(iy, this.bounds.minY, this.bounds.maxY);
-    const cz = clampI32(iz, this.bounds.minZ, this.bounds.maxZ);
-
-    return { x: cx, y: cy, z: cz };
+  /** Sanitize a full position */
+  public sanitizePos(x: any, y: any, z: any) {
+    return {
+      x: this.sanitizeCoord(x),
+      y: this.sanitizeCoord(y),
+      z: this.sanitizeCoord(z),
+    };
   }
 
-  // ----------------------------------------------------------
-  // core API
-  // ----------------------------------------------------------
-
-  /** Get block id at world coordinate */
-  public get(x: number, y: number, z: number): number {
-    if (!this.inBounds(x, y, z)) return BLOCK.AIR;
-
-    const k = key3(x, y, z);
-    if (this.overrides.has(k)) return this.overrides.get(k)!;
-
+  /** Base block at coordinate (no edits considered) */
+  public getBaseBlock(x: number, y: number, z: number): BlockId {
     return getBaseVoxelID(x | 0, y | 0, z | 0);
   }
 
+  /** Final block at coordinate (edits override base) */
+  public getBlock(x: number, y: number, z: number): BlockId {
+    x |= 0;
+    y |= 0;
+    z |= 0;
+    const k = keyOf(x, y, z);
+    const e = this.edits.get(k);
+    if (typeof e === "number") return e;
+    return this.getBaseBlock(x, y, z);
+  }
+
   /**
-   * Set block id at world coordinate.
-   * Stores only if it differs from base terrain at that coordinate.
+   * Set a block at coordinate.
+   * Stores only delta vs base terrain.
+   * Returns the new final block id.
    */
-  public set(x: number, y: number, z: number, id: number): void {
-    if (!this.inBounds(x, y, z)) return;
+  public setBlock(x: number, y: number, z: number, id: BlockId): BlockId {
+    x |= 0;
+    y |= 0;
+    z |= 0;
+    id = i32(id, BLOCKS.AIR);
 
-    const ix = x | 0;
-    const iy = y | 0;
-    const iz = z | 0;
+    // If id matches base, remove edit.
+    const base = this.getBaseBlock(x, y, z);
+    const k = keyOf(x, y, z);
 
-    const k = key3(ix, iy, iz);
-    const base = getBaseVoxelID(ix, iy, iz);
-    const nid = id | 0;
-
-    if (nid === base) {
-      this.overrides.delete(k);
-    } else {
-      this.overrides.set(k, nid);
+    if (id === base) {
+      this.edits.delete(k);
+      return base;
     }
-  }
 
-  /** Remove any override at a coordinate (reverts to base terrain) */
-  public clearOverride(x: number, y: number, z: number): void {
-    if (!this.inBounds(x, y, z)) return;
-    this.overrides.delete(key3(x | 0, y | 0, z | 0));
+    this.edits.set(k, id);
+    return id;
   }
-
-  /** Check if a coordinate has an override stored */
-  public hasOverride(x: number, y: number, z: number): boolean {
-    if (!this.inBounds(x, y, z)) return false;
-    return this.overrides.has(key3(x | 0, y | 0, z | 0));
-  }
-
-  /** Number of overrides stored (useful for debugging/memory tracking) */
-  public overrideCount(): number {
-    return this.overrides.size;
-  }
-
-  /** Clear ALL overrides (resets world back to base terrain) */
-  public resetAllOverrides(): void {
-    this.overrides.clear();
-  }
-
-  // ----------------------------------------------------------
-  // batch helpers
-  // ----------------------------------------------------------
 
   /**
-   * Apply a list of updates. Returns number applied.
-   * (Does not validate block ids - do that outside if needed.)
+   * Break a block (set to AIR).
+   * Returns previous and new ids.
    */
-  public applyUpdates(updates: BlockUpdate[]): number {
-    if (!Array.isArray(updates)) return 0;
-    let n = 0;
-    for (const u of updates) {
-      if (!u) continue;
-      const x = u.x | 0;
-      const y = u.y | 0;
-      const z = u.z | 0;
-      const id = u.id | 0;
-      if (!this.inBounds(x, y, z)) continue;
-      this.set(x, y, z, id);
-      n++;
+  public applyBreak(x: number, y: number, z: number): { prevId: BlockId; newId: BlockId } {
+    x |= 0;
+    y |= 0;
+    z |= 0;
+    const prevId = this.getBlock(x, y, z);
+    const newId = this.setBlock(x, y, z, BLOCKS.AIR);
+    return { prevId, newId };
+  }
+
+  /**
+   * Place a block (set to given id).
+   * Returns previous and new ids.
+   */
+  public applyPlace(x: number, y: number, z: number, id: BlockId): { prevId: BlockId; newId: BlockId } {
+    x |= 0;
+    y |= 0;
+    z |= 0;
+    id = i32(id, BLOCKS.AIR);
+    const prevId = this.getBlock(x, y, z);
+    const newId = this.setBlock(x, y, z, id);
+    return { prevId, newId };
+  }
+
+  /** Returns a shallow copy of the internal edits Map size */
+  public editsCount() {
+    return this.edits.size;
+  }
+
+  /** Remove all edits (world reset) */
+  public clearAllEdits() {
+    this.edits.clear();
+  }
+
+  /** Get all edits as an array (careful: can be big) */
+  public getAllEdits(): WorldEdit[] {
+    const out: WorldEdit[] = [];
+    for (const [k, id] of this.edits.entries()) {
+      const p = parseKey(k);
+      if (!p) continue;
+      out.push({ x: p.x, y: p.y, z: p.z, id });
     }
-    return n;
+    return out;
   }
 
   /**
-   * Enumerate overrides within an AABB region (inclusive).
-   * Useful for debugging or generating partial snapshots.
+   * Get edits inside an axis-aligned bounding box (inclusive).
+   * Useful for world:patch around the player or within loaded chunk radius.
    */
-  public getOverridesInRegion(
-    minX: number,
-    minY: number,
-    minZ: number,
-    maxX: number,
-    maxY: number,
-    maxZ: number
-  ): BlockUpdate[] {
-    const out: BlockUpdate[] = [];
+  public getEditsInAABB(
+    min: { x: number; y: number; z: number },
+    max: { x: number; y: number; z: number }
+  ): WorldEdit[] {
+    const minX = Math.min(min.x | 0, max.x | 0);
+    const maxX = Math.max(min.x | 0, max.x | 0);
+    const minY = Math.min(min.y | 0, max.y | 0);
+    const maxY = Math.max(min.y | 0, max.y | 0);
+    const minZ = Math.min(min.z | 0, max.z | 0);
+    const maxZ = Math.max(min.z | 0, max.z | 0);
 
-    const a = {
-      minX: clampI32(minX | 0, this.bounds.minX, this.bounds.maxX),
-      minY: clampI32(minY | 0, this.bounds.minY, this.bounds.maxY),
-      minZ: clampI32(minZ | 0, this.bounds.minZ, this.bounds.maxZ),
-      maxX: clampI32(maxX | 0, this.bounds.minX, this.bounds.maxX),
-      maxY: clampI32(maxY | 0, this.bounds.minY, this.bounds.maxY),
-      maxZ: clampI32(maxZ | 0, this.bounds.minZ, this.bounds.maxZ),
-    };
+    const out: WorldEdit[] = [];
 
-    // swap if needed
-    if (a.maxX < a.minX) [a.minX, a.maxX] = [a.maxX, a.minX];
-    if (a.maxY < a.minY) [a.minY, a.maxY] = [a.maxY, a.minY];
-    if (a.maxZ < a.minZ) [a.minZ, a.maxZ] = [a.maxZ, a.minZ];
-
-    for (const [k, id] of this.overrides.entries()) {
-      const v = parseKey(k);
-      if (!v) continue;
-
-      if (
-        v.x >= a.minX &&
-        v.x <= a.maxX &&
-        v.y >= a.minY &&
-        v.y <= a.maxY &&
-        v.z >= a.minZ &&
-        v.z <= a.maxZ
-      ) {
-        out.push({ x: v.x, y: v.y, z: v.z, id: id | 0 });
-      }
+    // NOTE: This is O(edits). Fine for small maps.
+    // If you grow big, index by chunk key.
+    for (const [k, id] of this.edits.entries()) {
+      const p = parseKey(k);
+      if (!p) continue;
+      if (p.x < minX || p.x > maxX) continue;
+      if (p.y < minY || p.y > maxY) continue;
+      if (p.z < minZ || p.z > maxZ) continue;
+      out.push({ x: p.x, y: p.y, z: p.z, id });
     }
 
     return out;
   }
 
-  // ----------------------------------------------------------
-  // chunk snapshot helpers (optional, simple)
-  // ----------------------------------------------------------
-  //
-  // This creates an uncompressed Uint8Array snapshot for a chunk region.
-  // You can send this via Colyseus as ArrayBuffer.
-  //
-  // Layout: X-major, then Y, then Z:
-  // idx = ((x * sy) + y) * sz + z
-  //
-  // This is "good enough" to start; later you can:
-  // - compress (RLE, LZ4, etc)
-  // - store palettes (small block ids)
-  // - use chunk deltas
-  //
-
+  /**
+   * Builds a chunk snapshot (base + edits merged) for a given chunk origin.
+   * Returns Uint16Array of size chunkSize^3 in X-major order (x -> y -> z)
+   * so you can stream it if you ever want server-side chunk sending.
+   */
   public makeChunkSnapshot(
     chunkX: number,
     chunkY: number,
     chunkZ: number,
-    sizeX = 32,
-    sizeY = 32,
-    sizeZ = 32
-  ): Uint8Array {
-    const sx = Math.max(1, sizeX | 0);
-    const sy = Math.max(1, sizeY | 0);
-    const sz = Math.max(1, sizeZ | 0);
+    chunkSize: number
+  ): Uint16Array {
+    chunkX |= 0;
+    chunkY |= 0;
+    chunkZ |= 0;
+    chunkSize = Math.max(1, chunkSize | 0);
 
-    const out = new Uint8Array(sx * sy * sz);
+    const ox = chunkX * chunkSize;
+    const oy = chunkY * chunkSize;
+    const oz = chunkZ * chunkSize;
 
-    const baseX = (chunkX | 0) * sx;
-    const baseY = (chunkY | 0) * sy;
-    const baseZ = (chunkZ | 0) * sz;
+    const total = chunkSize * chunkSize * chunkSize;
+    const arr = new Uint16Array(total);
 
-    let idx = 0;
-    for (let x = 0; x < sx; x++) {
-      for (let y = 0; y < sy; y++) {
-        for (let z = 0; z < sz; z++) {
-          const wx = baseX + x;
-          const wy = baseY + y;
-          const wz = baseZ + z;
-          out[idx++] = this.get(wx, wy, wz) & 0xff;
+    let ptr = 0;
+    for (let x = 0; x < chunkSize; x++) {
+      for (let y = 0; y < chunkSize; y++) {
+        for (let z = 0; z < chunkSize; z++) {
+          const wx = ox + x;
+          const wy = oy + y;
+          const wz = oz + z;
+          arr[ptr++] = this.getBlock(wx, wy, wz) & 0xffff;
         }
       }
     }
 
-    return out;
+    return arr;
   }
 
   /**
-   * Convert a snapshot back into world edits (writes into overrides).
-   * This is mostly useful for loading/saving or debugging tools.
+   * Encode a patch payload for the client. Keeps it plain JSON.
+   * Provide an area; you get back only edits in that area.
+   *
+   * Typical usage:
+   *  - onJoin: send edits in (playerPos +/- viewDistanceBlocks)
+   *  - or send edits for all currently loaded chunks radius
    */
-  public applyChunkSnapshot(
-    chunkX: number,
-    chunkY: number,
-    chunkZ: number,
-    data: Uint8Array,
-    sizeX = 32,
-    sizeY = 32,
-    sizeZ = 32
-  ): number {
-    const sx = Math.max(1, sizeX | 0);
-    const sy = Math.max(1, sizeY | 0);
-    const sz = Math.max(1, sizeZ | 0);
+  public encodeEditsPatch(
+    min: { x: number; y: number; z: number },
+    max: { x: number; y: number; z: number },
+    opts?: { limit?: number }
+  ): { edits: WorldEdit[]; truncated: boolean } {
+    const edits = this.getEditsInAABB(min, max);
 
-    if (!data || data.length !== sx * sy * sz) return 0;
+    const limit = isFiniteNum(opts?.limit) ? Math.max(1, (opts!.limit as number) | 0) : 5000;
 
-    const baseX = (chunkX | 0) * sx;
-    const baseY = (chunkY | 0) * sy;
-    const baseZ = (chunkZ | 0) * sz;
-
-    let idx = 0;
-    let applied = 0;
-
-    for (let x = 0; x < sx; x++) {
-      for (let y = 0; y < sy; y++) {
-        for (let z = 0; z < sz; z++) {
-          const wx = baseX + x;
-          const wy = baseY + y;
-          const wz = baseZ + z;
-          const id = data[idx++] | 0;
-
-          if (!this.inBounds(wx, wy, wz)) continue;
-          this.set(wx, wy, wz, id);
-          applied++;
-        }
-      }
+    if (edits.length > limit) {
+      // deterministic trim (closest to center would be nicer, but no center provided)
+      edits.length = limit;
+      return { edits, truncated: true };
     }
 
-    return applied;
+    return { edits, truncated: false };
   }
 
-  // ----------------------------------------------------------
-  // simple persistence (optional)
-  // ----------------------------------------------------------
-  //
-  // This serializes ONLY overrides, not the whole world.
-  // Great for saving "player-built world" on top of procedural terrain.
-  //
-
-  public serializeOverrides(): string {
-    // JSON: { "x,y,z": id, ... }
-    const obj: Record<string, number> = {};
-    for (const [k, v] of this.overrides.entries()) obj[k] = v | 0;
-    return JSON.stringify(obj);
-  }
-
-  public loadOverrides(serialized: string): number {
-    if (typeof serialized !== "string" || !serialized.trim()) return 0;
-
-    let parsed: any;
-    try {
-      parsed = JSON.parse(serialized);
-    } catch {
-      return 0;
-    }
-    if (!parsed || typeof parsed !== "object") return 0;
-
-    let n = 0;
-    for (const k of Object.keys(parsed)) {
-      const v = parsed[k];
-      const xyz = parseKey(k);
-      if (!xyz) continue;
-      const id = i32(v, NaN as any);
-      if (!Number.isFinite(id)) continue;
-      if (!this.inBounds(xyz.x, xyz.y, xyz.z)) continue;
-
-      // store as override (set() will drop if equals base)
-      this.set(xyz.x, xyz.y, xyz.z, id);
-      n++;
-    }
-    return n;
+  /**
+   * Convenience: encode a patch around a point with radius (block units).
+   */
+  public encodePatchAround(
+    center: { x: number; y: number; z: number },
+    radius: number,
+    opts?: { limit?: number }
+  ): { edits: WorldEdit[]; truncated: boolean } {
+    const r = Math.max(1, Math.floor(Number(radius) || 0));
+    const min = { x: (center.x | 0) - r, y: (center.y | 0) - r, z: (center.z | 0) - r };
+    const max = { x: (center.x | 0) + r, y: (center.y | 0) + r, z: (center.z | 0) + r };
+    return this.encodeEditsPatch(min, max, opts);
   }
 }
