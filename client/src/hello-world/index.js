@@ -1,13 +1,13 @@
 // @ts-nocheck
 /*
- * fresh2 - client main/index (NOA main entry) - FULL REWRITE (NO OMITS)
+ * fresh2 - client main/index (NOA main entry) - FULL REWRITE (MATCHES SERVER TERRAIN)
  * -------------------------------------------------------------------
  * Includes:
  * - In-game UI Debug Console overlay (NO DevTools needed)
- *   - F4 toggle, F6 clear, F7 toggle console mirroring
+ * - F4 toggle, F6 clear, F7 toggle console mirroring
  * - F2 toggles browser context menu (for inspector if you still want it)
  * - F3 toggles build/debug logs
- * - World generation: base terrain (client-side) + SERVER PATCH OVERRIDES
+ * - World generation: Synced with Server (Bedrock, Stone, Trees)
  * - First/Third person view mode enforcement EVERY FRAME
  * - FPS rig + 3rd-person avatar rigs (local + remote)
  * - Crosshair overlay
@@ -15,12 +15,12 @@
  * - Inventory overlay (I) with drag/drop and split (right-click inside UI)
  * - Colyseus (@colyseus/sdk) state sync + remote interpolation
  * - Server-authoritative blocks:
- *    - Mine: send "block:break" (NO local setBlock)
- *    - Build: send "block:place" (NO local setBlock)
- *    - Apply world edits ONLY from:
- *        - "world:patch" (on join / later)
- *        - "block:update" (authoritative updates)
- *    - Show "block:reject" reasons in UI console
+ * - Mine: send "block:break" (NO local setBlock)
+ * - Build: send "block:place" (NO local setBlock)
+ * - Apply world edits ONLY from:
+ * - "world:patch" (on join / later)
+ * - "block:update" (authoritative updates)
+ * - Show "block:reject" reasons in UI console
  */
 
 import { Engine } from "noa-engine";
@@ -1033,23 +1033,74 @@ const inventoryUI = createInventoryOverlay();
 /* ============================================================
  * WORLD GENERATION (CLIENT BASE TERRAIN)
  * ============================================================
- * IMPORTANT: This is base terrain only.
- * Server will patch edits via world:patch + block:update.
+ * UPDATED: Matches Server logic (Stone, Bedrock, Trees)
  */
 
-const brownish = [0.45, 0.36, 0.22];
-const greenish = [0.1, 0.8, 0.2];
+// 1. Register Colors (Simple solid mats for now)
+const colors = {
+    dirt: [0.45, 0.36, 0.22],
+    grass: [0.1, 0.8, 0.2],
+    stone: [0.5, 0.5, 0.5],
+    bedrock: [0.2, 0.2, 0.2],
+    log: [0.4, 0.3, 0.1],
+    leaves: [0.2, 0.6, 0.2],
+};
 
-noa.registry.registerMaterial("dirt", { color: brownish });
-noa.registry.registerMaterial("grass", { color: greenish });
+noa.registry.registerMaterial("dirt", { color: colors.dirt });
+noa.registry.registerMaterial("grass", { color: colors.grass });
+noa.registry.registerMaterial("stone", { color: colors.stone });
+noa.registry.registerMaterial("bedrock", { color: colors.bedrock });
+noa.registry.registerMaterial("log", { color: colors.log });
+noa.registry.registerMaterial("leaves", { color: colors.leaves });
 
+// 2. Register Block IDs (Must match Server)
 const dirtID = noa.registry.registerBlock(1, { material: "dirt" });
 const grassID = noa.registry.registerBlock(2, { material: "grass" });
+const stoneID = noa.registry.registerBlock(3, { material: "stone" });
+const bedrockID = noa.registry.registerBlock(4, { material: "bedrock" });
+const logID = noa.registry.registerBlock(5, { material: "log" });
+const leavesID = noa.registry.registerBlock(6, { material: "leaves" });
 
+// 3. Deterministic Utils
+function hash2(x, z) {
+  let n = Math.sin(x * 12.9898 + z * 78.233) * 43758.5453;
+  return n - Math.floor(n);
+}
+
+// 4. Client-side terrain function (identical logic to Server)
 function getVoxelID(x, y, z) {
-  const height = 2 * Math.sin(x / 10) + 3 * Math.cos(z / 20);
-  if (y < height - 1) return dirtID;
-  if (y < height) return grassID;
+  // Bedrock floor
+  if (y < -10) return bedrockID;
+
+  // Base height
+  const height = Math.floor(4 * Math.sin(x / 15) + 4 * Math.cos(z / 20));
+
+  // Trees (Deterministic "structures")
+  // Check the air space above ground
+  if (y > height && y < height + 8) {
+     if (hash2(x, z) > 0.98) {
+        const treeBaseY = height + 1;
+        const trunkHeight = 4;
+        
+        // Trunk
+        if (y >= treeBaseY && y < treeBaseY + trunkHeight) {
+           return logID;
+        }
+        
+        // Leaves (Lollipop top)
+        const topY = treeBaseY + trunkHeight - 1;
+        // Simple blob check for this column
+        if (y > topY && y <= topY + 2) {
+           return leavesID;
+        }
+     }
+  }
+
+  // Terrain layers
+  if (y < height - 3) return stoneID;
+  if (y < height) return dirtID;
+  if (y === height) return grassID;
+
   return 0;
 }
 
@@ -1515,12 +1566,20 @@ function getSelectedHotbarItem() {
 function kindToBlockId(kind) {
   if (kind === "block:dirt") return dirtID;
   if (kind === "block:grass") return grassID;
+  if (kind === "block:stone") return stoneID;
+  if (kind === "block:bedrock") return bedrockID;
+  if (kind === "block:log") return logID;
+  if (kind === "block:leaves") return leavesID;
   return 0;
 }
 
 function blockIdToKind(blockId) {
   if (blockId === dirtID) return "block:dirt";
   if (blockId === grassID) return "block:grass";
+  if (blockId === stoneID) return "block:stone";
+  if (blockId === bedrockID) return "block:bedrock";
+  if (blockId === logID) return "block:log";
+  if (blockId === leavesID) return "block:leaves";
   return "";
 }
 

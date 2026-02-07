@@ -1,44 +1,15 @@
 // ============================================================
-// server/world/WorldStore.ts  (FULL REWRITE - NO OMITS, ALL LOGIC INCLUDED)
-// ------------------------------------------------------------
+// server/world/WorldStore.ts  (FULL REWRITE - ADVANCED TERRAIN)
+// ============================================================
 // Purpose:
-// - Server-authoritative voxel world for a NOA-style Minecraft clone.
-// - Deterministic base terrain generation (must match client).
-// - Stores ONLY edits (placed/broken blocks) in a compact Map.
-// - Supports chunk snapshots + patching for late joiners.
-// - OPTIONAL persistence helpers:
-//     - saveToFile/loadFromFile (great for local dev / self-host)
-//     - serialize/deserialize for plugging into Redis/DB later
-//
-// IMPORTANT:
-// - Block IDs MUST match the client registry:
-//     0 = air
-//     1 = dirt
-//     2 = grass
-// - Base terrain function MUST match client getVoxelID(x,y,z):
-//     height = 2*sin(x/10) + 3*cos(z/20)
-//     if y < height - 1 => dirt
-//     else if y < height => grass
-//     else air
-//
-// API:
-//   - getBaseBlock(x,y,z) -> number
-//   - getBlock(x,y,z) -> number   (edits override base)
-//   - setBlock(x,y,z,id) -> number (stores delta vs base)
-//   - applyBreak(x,y,z) -> { prevId, newId }
-//   - applyPlace(x,y,z,id) -> { prevId, newId }
-//   - getEditsInAABB(min,max) -> array of {x,y,z,id}
-//   - getAllEdits() -> array of {x,y,z,id}
-//   - makeChunkSnapshot(chunkX,chunkY,chunkZ,chunkSize) -> Uint16Array
-//   - encodeEditsPatch(min,max,{limit}) -> { edits, truncated }
-//   - encodePatchAround(center,radius,{limit}) -> { edits, truncated }
-//   - serialize() -> { version, edits:[...] }
-//   - applySerialized(data, {replace}) -> void
-//   - saveToFile(path) / loadFromFile(path, {replace})
+// - Server-authoritative voxel world.
+// - Deterministic base terrain (Bedrock, Stone, Dirt, Grass, Trees).
+// - Stores ONLY edits (deltas) to save memory.
+// - Full persistence support (JSON file I/O).
 // ============================================================
 
-import * as fs from "node:fs";
-import * as path from "node:path";
+import * as fs from "fs";
+import * as path from "path";
 
 export type BlockId = number;
 
@@ -46,6 +17,10 @@ export const BLOCKS = {
   AIR: 0,
   DIRT: 1,
   GRASS: 2,
+  STONE: 3,
+  BEDROCK: 4,
+  LOG: 5,
+  LEAVES: 6,
 } as const;
 
 export type WorldEdit = { x: number; y: number; z: number; id: BlockId };
@@ -54,6 +29,10 @@ type SerializedWorld = {
   version: number;
   edits: WorldEdit[];
 };
+
+// ------------------------------------------------------------
+// Utils
+// ------------------------------------------------------------
 
 function isFiniteNum(n: any): n is number {
   return typeof n === "number" && Number.isFinite(n);
@@ -69,12 +48,12 @@ function i32(n: any, fallback = 0) {
   return v | 0;
 }
 
-/** String key for Map storage */
+/** String key for Map storage "x|y|z" */
 function keyOf(x: number, y: number, z: number) {
   return `${x}|${y}|${z}`;
 }
 
-/** Inverse for utilities / persistence parsing */
+/** Inverse key parser */
 function parseKey(k: string): { x: number; y: number; z: number } | null {
   if (typeof k !== "string") return null;
   const parts = k.split("|");
@@ -86,29 +65,80 @@ function parseKey(k: string): { x: number; y: number; z: number } | null {
   return { x: x | 0, y: y | 0, z: z | 0 };
 }
 
-/**
- * Deterministic base terrain function.
- * MUST match the client.
- */
-export function getBaseVoxelID(x: number, y: number, z: number): BlockId {
-  const height = 2 * Math.sin(x / 10) + 3 * Math.cos(z / 20);
+// ------------------------------------------------------------
+// Deterministic Terrain Logic
+// ------------------------------------------------------------
 
-  if (y < height - 1) return BLOCKS.DIRT;
-  if (y < height) return BLOCKS.GRASS;
-  return BLOCKS.AIR;
+/** Simple pseudo-random hash for deterministic features (trees) */
+function hash2(x: number, z: number) {
+  let n = Math.sin(x * 12.9898 + z * 78.233) * 43758.5453;
+  return n - Math.floor(n);
 }
 
 /**
- * WorldStore keeps ONLY edits vs base terrain.
- * If an edit matches the base, it is removed (keeps map small).
+ * Deterministic base terrain function.
+ * MUST match the Client's terrain generation logic exactly.
  */
+export function getBaseVoxelID(x: number, y: number, z: number): BlockId {
+  // 1. Bedrock Floor (at y = -10 and below)
+  if (y < -10) return BLOCKS.BEDROCK;
+
+  // 2. Base Height Calculation
+  // Combine sine waves for some variance
+  const height = Math.floor(4 * Math.sin(x / 15) + 4 * Math.cos(z / 20));
+
+  // 3. Trees (Deterministic "structures")
+  // We check if we are in the "air" space just above the ground
+  if (y > height && y < height + 8) {
+    // Check if a tree root exists at (x, z)
+    // 2% chance per column to have a tree
+    if (hash2(x, z) > 0.98) {
+      const treeBaseY = height + 1;
+      const trunkHeight = 4;
+
+      // Trunk (Log)
+      if (y >= treeBaseY && y < treeBaseY + trunkHeight) {
+        return BLOCKS.LOG;
+      }
+
+      // Leaves (Simple blob around the top)
+      // Radius 2 blob around top of trunk
+      const topY = treeBaseY + trunkHeight - 1;
+      if (y >= topY - 1 && y <= topY + 2) {
+         // This is a simplified vertical check. 
+         // For a real voxel tree, we usually check neighbors.
+         // Since getBaseVoxelID is point-based (x,y,z), we simulate width 
+         // by checking if THIS x,z is the trunk.
+         // To make wide leaves, we'd need to check if neighbors have a tree root.
+         // For this simple version, we stick to a "tall thin" tree or just the trunk top.
+         // Let's just do a "lollipop" top at the exact trunk coord for simplicity in this function,
+         // or keep it just logs if neighbor checks are too expensive here.
+         
+         // Let's stick to just the trunk and a "crown" block for now to ensure 100% determinism without neighbor lookups.
+         if (y > topY) return BLOCKS.LEAVES;
+      }
+    }
+  }
+
+  // 4. Standard Terrain Layers
+  if (y < height - 3) return BLOCKS.STONE; // Stone deep down
+  if (y < height) return BLOCKS.DIRT;      // Dirt layer
+  if (y === height) return BLOCKS.GRASS;   // Grass top
+
+  return BLOCKS.AIR;
+}
+
+// ------------------------------------------------------------
+// WorldStore Class
+// ------------------------------------------------------------
+
 export class WorldStore {
   private edits: Map<string, BlockId>;
 
   public readonly minCoord: number;
   public readonly maxCoord: number;
 
-  // Simple dirty flag + throttled autosave support
+  // Persistence State
   private _dirty: boolean = false;
   private _lastSaveAt: number = 0;
   private _autosavePath: string | null = null;
@@ -145,7 +175,7 @@ export class WorldStore {
   }
 
   /** Autosave if enabled and throttled interval passed. */
-  private maybeAutosave() {
+  public maybeAutosave() {
     if (!this._autosavePath) return;
     const now = Date.now();
     if (!this._dirty) return;
@@ -155,8 +185,8 @@ export class WorldStore {
       this.saveToFileSync(this._autosavePath);
       this._lastSaveAt = now;
       this._dirty = false;
-    } catch {
-      // keep dirty; next attempt may succeed
+    } catch (e) {
+      console.error("[WORLD] Autosave failed:", e);
     }
   }
 
@@ -164,15 +194,6 @@ export class WorldStore {
   public sanitizeCoord(n: any) {
     const v = i32(n, 0);
     return clamp(v, this.minCoord, this.maxCoord) | 0;
-  }
-
-  /** Sanitize a full position */
-  public sanitizePos(x: any, y: any, z: any) {
-    return {
-      x: this.sanitizeCoord(x),
-      y: this.sanitizeCoord(y),
-      z: this.sanitizeCoord(z),
-    };
   }
 
   /** Base block at coordinate (no edits considered) */
@@ -206,6 +227,7 @@ export class WorldStore {
     const k = keyOf(x, y, z);
 
     if (id === base) {
+      // If setting to base, remove the edit (optimization)
       if (this.edits.has(k)) {
         this.edits.delete(k);
         this.markDirty();
