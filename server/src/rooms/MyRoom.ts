@@ -1,6 +1,9 @@
 // ============================================================
 // rooms/MyRoom.ts  (FULL REWRITE - NO OMITS, ALL LOGIC INCLUDED)
 // ------------------------------------------------------------
+// FIXES TS2559 on Colyseus Cloud by NOT using Room<T> generic.
+// We still keep the room.state strongly typed via `public state!: MyRoomState`.
+//
 // Includes:
 // - Typed room state (MyRoomState)
 // - Player join/leave
@@ -9,27 +12,28 @@
 // - Swing (stamina cost + timed swinging flag)
 // - Hotbar selection (0..8) (server authoritative)
 // - Inventory + equipment slot moves (drag/drop), stacking, split
-// - WorldStore authoritative voxels (base terrain + edits)
+// - WorldStore authoritative voxels (base terrain + edits) (shared/static per process)
 // - Server-authoritative block break/place:
 //    - Reach checks
 //    - Rate limiting
 //    - Inventory consume/add for block kinds
 //    - Broadcast "block:update" for ALL clients
-//    - Send "world:patch" on join (edits around spawn) + on demand
+//    - Send "world:patch" on join + on request
+// - Debug logging for world patch + block ops
 //
 // IMPORTANT NOTES:
-// - This file assumes you created server/world/WorldStore.ts as posted.
-// - Block IDs MUST match client registry:
+// - Assumes server/world/WorldStore.ts exists (your full rewrite).
+// - Block IDs must match client registry:
 //     0 = air, 1 = dirt, 2 = grass
-// - Client should:
-//    - generate base terrain locally
-//    - apply "world:patch" edits
-//    - apply "block:update" edits
+// - Client should generate base terrain locally, then apply edits from:
+//     - "world:patch" (bulk edits on join / request)
+//     - "block:update" (live edits)
 // ============================================================
 
-import { Room, Client, CloseCode } from "@colyseus/core";
+import { Room, Client } from "colyseus";
+import { CloseCode } from "@colyseus/core"; // Cloud templates often still provide this
 import { MyRoomState, PlayerState, ItemState } from "./schema/MyRoomState.js";
-import { WorldStore, BLOCKS, type BlockId } from "./world/WorldStore.js";
+import { WorldStore, BLOCKS, type BlockId } from "../world/WorldStore.js";
 
 type JoinOptions = { name?: string };
 
@@ -49,15 +53,12 @@ type HotbarSetMsg = { index: number };
 type InvMoveMsg = { from: string; to: string };
 type InvSplitMsg = { slot: string };
 
-// world block ops (authoritative)
-type BlockBreakMsg = { x: number; y: number; z: number; src?: string };
-type BlockPlaceMsg = { x: number; y: number; z: number; kind: string; src?: string };
-
-// building/mining inventory logic
 type InvConsumeHotbarMsg = { qty?: number };
 type InvAddMsg = { kind: string; qty?: number };
 
-// optional: client request patch around them
+type BlockBreakMsg = { x: number; y: number; z: number; src?: string };
+type BlockPlaceMsg = { x: number; y: number; z: number; kind: string; src?: string };
+
 type WorldPatchReqMsg = { x: number; y: number; z: number; r?: number; limit?: number };
 
 // ------------------------------------------------------------
@@ -190,7 +191,6 @@ function normalizeHotbarIndex(i: any) {
 }
 
 function syncEquipToolToHotbar(p: PlayerState) {
-  // Minecraft-like: selected hotbar slot becomes equipped tool if compatible.
   ensureSlotsLength(p);
 
   const idx = normalizeHotbarIndex(p.hotbarIndex);
@@ -342,13 +342,13 @@ function blockIdToKind(id: BlockId): string {
 }
 
 // ------------------------------------------------------------
-// World op checks
+// coordinate sanity
 // ------------------------------------------------------------
 
 function sanitizeInt(n: any, fallback = 0) {
   const v = Number(n);
   if (!Number.isFinite(v)) return fallback;
-  return (v | 0) as number;
+  return v | 0;
 }
 
 function isValidBlockCoord(n: any) {
@@ -357,18 +357,17 @@ function isValidBlockCoord(n: any) {
 }
 
 // ------------------------------------------------------------
-// room
+// Room
 // ------------------------------------------------------------
 
-export class MyRoom extends Room<MyRoomState> {
+export class MyRoom extends Room {
   public maxClients = 16;
   public state!: MyRoomState;
 
-  // IMPORTANT: static/shared world per server process
-  // This is what makes edits survive "new roomId" as long as the process stays alive.
+  // Shared world per server process (survives new roomId as long as process is alive).
   private static WORLD = new WorldStore({ minCoord: -100000, maxCoord: 100000 });
 
-  // rate limit maps
+  // rate limiting
   private lastBlockOpAt = new Map<string, number>();
 
   public onCreate(options: any) {
@@ -419,7 +418,7 @@ export class MyRoom extends Room<MyRoomState> {
     }, TICK_MS);
 
     // --------------------------------------------------------
-    // Messages: movement + stats
+    // Movement
     // --------------------------------------------------------
 
     this.onMessage("move", (client: Client, msg: MoveMsg) => {
@@ -468,10 +467,9 @@ export class MyRoom extends Room<MyRoomState> {
     });
 
     // --------------------------------------------------------
-    // Messages: inventory
+    // Inventory
     // --------------------------------------------------------
 
-    // ---- CONSUME from selected hotbar slot (blocks only)
     this.onMessage("inv:consumeHotbar", (client: Client, msg: InvConsumeHotbarMsg) => {
       const p = this.state.players.get(client.sessionId);
       if (!p) return;
@@ -482,7 +480,6 @@ export class MyRoom extends Room<MyRoomState> {
       if (took > 0) syncEquipToolToHotbar(p);
     });
 
-    // ---- ADD items to inventory (blocks only; stacking)
     this.onMessage("inv:add", (client: Client, msg: InvAddMsg) => {
       const p = this.state.players.get(client.sessionId);
       if (!p) return;
@@ -496,7 +493,6 @@ export class MyRoom extends Room<MyRoomState> {
       syncEquipToolToHotbar(p);
     });
 
-    // ---- Inventory slot moves / stacking / swapping
     this.onMessage("inv:move", (client: Client, msg: InvMoveMsg) => {
       const p = this.state.players.get(client.sessionId);
       if (!p) return;
@@ -575,7 +571,6 @@ export class MyRoom extends Room<MyRoomState> {
       syncEquipToolToHotbar(p);
     });
 
-    // ---- Split stack in half into first empty slot
     this.onMessage("inv:split", (client: Client, msg: InvSplitMsg) => {
       const p = this.state.players.get(client.sessionId);
       if (!p) return;
@@ -596,7 +591,6 @@ export class MyRoom extends Room<MyRoomState> {
       const qty = isFiniteNum(it.qty) ? it.qty : 0;
       if (qty <= 1) return;
 
-      // find empty slot
       const emptyIdx = firstEmptyInvIndex(p);
       if (emptyIdx === -1) return;
 
@@ -622,7 +616,7 @@ export class MyRoom extends Room<MyRoomState> {
     });
 
     // --------------------------------------------------------
-    // Messages: world patches
+    // World patches
     // --------------------------------------------------------
 
     this.onMessage("world:patch:req", (client: Client, msg: WorldPatchReqMsg) => {
@@ -639,19 +633,18 @@ export class MyRoom extends Room<MyRoomState> {
       const patch = MyRoom.WORLD.encodePatchAround({ x: cx, y: cy, z: cz }, r, { limit });
 
       client.send("world:patch", patch);
+      console.log(
+        `[WORLD] world:patch:req to=${client.sessionId} center=${cx},${cy},${cz} r=${r} edits=${patch.edits.length} truncated=${patch.truncated} totalEdits=${MyRoom.WORLD.editsCount()}`
+      );
     });
 
     // --------------------------------------------------------
-    // Messages: authoritative block break/place
+    // Authoritative block ops
     // --------------------------------------------------------
 
     const BLOCK_REACH = 7.5;
-    const BLOCK_OP_COOLDOWN_MS = 90; // ~11/sec
+    const BLOCK_OP_COOLDOWN_MS = 90;
     const MAX_COORD = 100000;
-
-    const reject = (client: Client, reason: string, extra?: any) => {
-      client.send("block:reject", { reason, ...(extra || {}) });
-    };
 
     const canOpNow = (sid: string) => {
       const t = nowMs();
@@ -670,6 +663,10 @@ export class MyRoom extends Room<MyRoomState> {
         z >= -MAX_COORD &&
         z <= MAX_COORD
       );
+    };
+
+    const reject = (client: Client, reason: string, extra?: any) => {
+      client.send("block:reject", { reason, ...(extra || {}) });
     };
 
     this.onMessage("block:break", (client: Client, msg: BlockBreakMsg) => {
@@ -697,16 +694,11 @@ export class MyRoom extends Room<MyRoomState> {
         return;
       }
 
-      // reach check (player eye approx)
       const eyeX = p.x;
       const eyeY = p.y + 1.6;
       const eyeZ = p.z;
 
-      const blockCenterX = x + 0.5;
-      const blockCenterY = y + 0.5;
-      const blockCenterZ = z + 0.5;
-
-      const d = dist3(eyeX, eyeY, eyeZ, blockCenterX, blockCenterY, blockCenterZ);
+      const d = dist3(eyeX, eyeY, eyeZ, x + 0.5, y + 0.5, z + 0.5);
       if (d > BLOCK_REACH) {
         reject(client, "too_far", { op: "break", src, d: Number(d.toFixed(2)) });
         return;
@@ -720,15 +712,11 @@ export class MyRoom extends Room<MyRoomState> {
 
       const { newId } = MyRoom.WORLD.applyBreak(x, y, z);
 
-      // inventory add for known blocks
       const kind = blockIdToKind(prevId);
       if (kind) addKindToInventory(p, kind, 1);
 
-      // Broadcast authoritative update
       this.broadcast("block:update", { x, y, z, id: newId });
 
-      // server debug
-      // eslint-disable-next-line no-console
       console.log(
         `[WORLD] break by=${client.sessionId} src=${src} at=${x},${y},${z} prev=${prevId} edits=${MyRoom.WORLD.editsCount()}`
       );
@@ -765,22 +753,16 @@ export class MyRoom extends Room<MyRoomState> {
         return;
       }
 
-      // reach check (player eye approx)
       const eyeX = p.x;
       const eyeY = p.y + 1.6;
       const eyeZ = p.z;
 
-      const blockCenterX = x + 0.5;
-      const blockCenterY = y + 0.5;
-      const blockCenterZ = z + 0.5;
-
-      const d = dist3(eyeX, eyeY, eyeZ, blockCenterX, blockCenterY, blockCenterZ);
+      const d = dist3(eyeX, eyeY, eyeZ, x + 0.5, y + 0.5, z + 0.5);
       if (d > BLOCK_REACH) {
         reject(client, "too_far", { op: "place", src, d: Number(d.toFixed(2)) });
         return;
       }
 
-      // must be empty
       const existing = MyRoom.WORLD.getBlock(x, y, z);
       if (existing !== BLOCKS.AIR) {
         reject(client, "occupied", { op: "place", src, existing });
@@ -793,21 +775,16 @@ export class MyRoom extends Room<MyRoomState> {
         return;
       }
 
-      // consume from hotbar
       const took = consumeFromHotbar(p, 1);
       if (took <= 0) {
         reject(client, "no_blocks_in_hotbar", { op: "place", src });
         return;
       }
 
-      // place into world
       const { newId } = MyRoom.WORLD.applyPlace(x, y, z, blockId);
 
-      // Broadcast authoritative update
       this.broadcast("block:update", { x, y, z, id: newId });
 
-      // server debug
-      // eslint-disable-next-line no-console
       console.log(
         `[WORLD] place by=${client.sessionId} src=${src} kind=${kind} at=${x},${y},${z} edits=${MyRoom.WORLD.editsCount()}`
       );
@@ -881,23 +858,21 @@ export class MyRoom extends Room<MyRoomState> {
     p.items.set(grassUid, grass);
     p.items.set(toolUid, tool);
 
-    // place into hotbar slots 0,1,2
+    // hotbar slots 0,1,2
     p.inventory.slots[0] = dirtUid;
     p.inventory.slots[1] = grassUid;
     p.inventory.slots[2] = toolUid;
 
-    // sync equip.tool based on hotbar selection
     syncEquipToolToHotbar(p);
 
     this.state.players.set(client.sessionId, p);
 
-    // Send welcome + world patch around spawn
     client.send("welcome", {
       roomId: this.roomId,
       sessionId: client.sessionId,
     });
 
-    // Patch radius around spawn (enough for initial view)
+    // initial patch around spawn
     const patch = MyRoom.WORLD.encodePatchAround({ x: 0, y: 10, z: 0 }, 96, { limit: 8000 });
     client.send("world:patch", patch);
 
