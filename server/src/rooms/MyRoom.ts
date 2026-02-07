@@ -9,27 +9,43 @@
 // - Swing (stamina cost + timed swinging flag)
 // - Hotbar selection (0..8) (server authoritative)
 // - Inventory + equipment slot moves (drag/drop), stacking, split
-// - Build/mining inventory logic (server authoritative):
-//    - block:break  -> validates + breaks block in WorldStore + awards item
-//    - block:place  -> validates + consumes hotbar + places block in WorldStore
-// - World replication:
-//    - onJoin: sends world:patch around spawn
-//    - on edits: broadcasts block:update {x,y,z,id}
-// - Uses a SINGLETON world store (shared across rooms) so edits persist
-//   across client refreshes (as long as server process stays alive).
 //
-// NOTE:
-// - This assumes you have:
-//     server/world/world.ts  exporting:  export const WORLD = new WorldStore(...)
-//     server/world/WorldStore.ts exporting: BLOCKS + WorldStore + BlockId
+// - SERVER-AUTHORITATIVE WORLD (WorldStore persistence)
+//   - Base terrain deterministic (client matches)
+//   - Stores edits only (placed/broken blocks) and persists them
+//   - On join: send world:patch around spawn/player
+//   - On change: send block:update {x,y,z,id} to subscribed clients
 //
-// If you don’t have world.ts, create it (see import below).
+// - Secure server break/place (reach + rate limit + inventory checks)
+//   - block:break {x,y,z}
+//   - block:place {x,y,z,kind}
+//   - server validates reach + target conditions + inventory
+//   - server applies to WorldStore then sends block:update
+//   - server sends block:reject with reason (for UI console)
+//
+// - Chunk subscriptions (performance/scaling)
+//   - chunk:sub {cx,cz}   (chunk coord in XZ)
+//   - chunk:unsub {cx,cz}
+//   - server tracks per-client subscriptions
+//   - server sends world:patch for that chunk when subscribing
+//   - server only sends block:update to clients subscribed to that chunk
+//
+// - Mining progress + tool durability (game feel)
+//   - mine:start {x,y,z}  (client holds mouse down)
+//   - mine:stop {}
+//   - server advances mining progress in simulation tick
+//   - break occurs when progress >= 1 and still valid
+//   - tool durability decreases on successful break
+//   - mine:progress {x,y,z,p} sent to miner client (optional UI)
+//
+// Notes:
+// - Requires WorldStore at: server/world/WorldStore.ts (your rewritten one)
+// - Block IDs MUST match client registry: 0 air, 1 dirt, 2 grass
 // ============================================================
 
 import { Room, Client, CloseCode } from "colyseus";
 import { MyRoomState, PlayerState, ItemState } from "./schema/MyRoomState.js";
-import { WORLD } from "../world/world.js";
-import { BLOCKS, type BlockId } from "./world/WorldStore.js";
+import { WorldStore, BLOCKS } from "./world/WorldStore.js";
 
 type JoinOptions = { name?: string };
 
@@ -49,9 +65,11 @@ type HotbarSetMsg = { index: number };
 type InvMoveMsg = { from: string; to: string };
 type InvSplitMsg = { slot: string };
 
-// building/mining inventory logic
+type ChunkSubMsg = { cx: number; cz: number };
 type BlockBreakMsg = { x: number; y: number; z: number };
 type BlockPlaceMsg = { x: number; y: number; z: number; kind: string };
+type MineStartMsg = { x: number; y: number; z: number };
+type MineStopMsg = {};
 
 // ------------------------------------------------------------
 // utils
@@ -67,6 +85,38 @@ function clamp(n: number, a: number, b: number) {
 
 function nowMs() {
   return Date.now();
+}
+
+function i32(n: any, fallback = 0) {
+  const v = Number(n);
+  if (!Number.isFinite(v)) return fallback;
+  return v | 0;
+}
+
+function distSq(ax: number, ay: number, az: number, bx: number, by: number, bz: number) {
+  const dx = ax - bx;
+  const dy = ay - by;
+  const dz = az - bz;
+  return dx * dx + dy * dy + dz * dz;
+}
+
+function chunkKey(cx: number, cz: number) {
+  return `${cx | 0}|${cz | 0}`;
+}
+
+function chunkOfWorldXZ(x: number, z: number, chunkSize: number) {
+  const cx = Math.floor((x | 0) / chunkSize);
+  const cz = Math.floor((z | 0) / chunkSize);
+  return { cx, cz };
+}
+
+function aabbForChunkXZ(cx: number, cz: number, chunkSize: number) {
+  const ox = (cx | 0) * chunkSize;
+  const oz = (cz | 0) * chunkSize;
+  return {
+    min: { x: ox, y: -100000, z: oz },
+    max: { x: ox + chunkSize - 1, y: 100000, z: oz + chunkSize - 1 },
+  };
 }
 
 // ------------------------------------------------------------
@@ -165,6 +215,23 @@ function isBlockKind(kind: string) {
   return typeof kind === "string" && kind.startsWith("block:");
 }
 
+function kindToBlockId(kind: string) {
+  if (kind === "block:dirt") return BLOCKS.DIRT;
+  if (kind === "block:grass") return BLOCKS.GRASS;
+  return BLOCKS.AIR;
+}
+
+function blockIdToKind(id: number) {
+  if (id === BLOCKS.DIRT) return "block:dirt";
+  if (id === BLOCKS.GRASS) return "block:grass";
+  return "";
+}
+
+function isToolKind(kind: string) {
+  const k = (kind || "").toLowerCase();
+  return k.startsWith("tool:") || k.includes("pickaxe") || k.includes("axe") || k.includes("sword");
+}
+
 // ------------------------------------------------------------
 // hotbar + equip sync
 // ------------------------------------------------------------
@@ -176,7 +243,6 @@ function normalizeHotbarIndex(i: any) {
 }
 
 function syncEquipToolToHotbar(p: PlayerState) {
-  // Minecraft-like: selected hotbar slot becomes equipped tool if compatible.
   ensureSlotsLength(p);
 
   const idx = normalizeHotbarIndex(p.hotbarIndex);
@@ -240,7 +306,6 @@ function findStackableUid(p: PlayerState, kind: string) {
 
 function addKindToInventory(p: PlayerState, kind: string, qty: number) {
   ensureSlotsLength(p);
-
   if (!kind || qty <= 0) return 0;
 
   const maxStack = maxStackForKind(kind);
@@ -284,77 +349,132 @@ function addKindToInventory(p: PlayerState, kind: string, qty: number) {
   return qty - remaining;
 }
 
-function consumeFromHotbarBlocks(p: PlayerState, qty: number) {
+function consumeSelectedHotbarBlock(p: PlayerState, expectedKind?: string) {
   ensureSlotsLength(p);
 
   const idx = normalizeHotbarIndex(p.hotbarIndex);
   const uid = String(p.inventory.slots[idx] || "");
-  if (!uid) return { took: 0, kind: "" };
+  if (!uid) return { ok: false, reason: "empty_hotbar", idx, uid: "", kind: "" };
 
   const it = p.items.get(uid);
-  if (!it) return { took: 0, kind: "" };
+  if (!it) return { ok: false, reason: "missing_item", idx, uid, kind: "" };
 
   const kind = String(it.kind || "");
-  if (!isBlockKind(kind)) return { took: 0, kind: "" };
+  if (!isBlockKind(kind)) return { ok: false, reason: "not_a_block", idx, uid, kind };
 
-  const cur = isFiniteNum(it.qty) ? it.qty : 0;
-  if (cur <= 0) return { took: 0, kind: "" };
+  if (expectedKind && kind !== expectedKind) {
+    return { ok: false, reason: "hotbar_kind_mismatch", idx, uid, kind };
+  }
 
-  const take = Math.min(cur, qty);
-  it.qty = cur - take;
+  const qty = isFiniteNum(it.qty) ? it.qty : 0;
+  if (qty <= 0) return { ok: false, reason: "no_qty", idx, uid, kind };
 
+  it.qty = qty - 1;
   if (it.qty <= 0) {
     p.inventory.slots[idx] = "";
     p.items.delete(uid);
   }
 
-  return { took: take, kind };
+  return { ok: true, idx, uid, kind };
+}
+
+function damageEquippedToolOnBreak(p: PlayerState, amount = 1) {
+  const uid = String(p.equip?.tool || "");
+  if (!uid) return;
+
+  const it = p.items.get(uid);
+  if (!it) return;
+
+  const kind = String(it.kind || "");
+  if (!isToolKind(kind)) return;
+
+  const maxD = isFiniteNum(it.maxDurability) ? it.maxDurability : 0;
+  if (maxD <= 0) return;
+
+  const cur = isFiniteNum(it.durability) ? it.durability : maxD;
+  const next = cur - Math.max(1, amount | 0);
+
+  it.durability = clamp(next, 0, maxD);
+
+  if (it.durability <= 0) {
+    const total = getTotalSlots(p);
+    for (let i = 0; i < total; i++) {
+      if (String(p.inventory.slots[i] || "") === uid) p.inventory.slots[i] = "";
+    }
+    for (const k of ["head", "chest", "legs", "feet", "tool", "offhand"] as EquipKey[]) {
+      if (String((p.equip as any)[k] || "") === uid) (p.equip as any)[k] = "";
+    }
+    p.items.delete(uid);
+  }
 }
 
 // ------------------------------------------------------------
-// kind <-> blockId mapping (MUST MATCH CLIENT REGISTRY)
+// server security: rate limit + reach checks
 // ------------------------------------------------------------
 
-function kindToBlockId(kind: string): BlockId {
-  if (kind === "block:dirt") return BLOCKS.DIRT;
-  if (kind === "block:grass") return BLOCKS.GRASS;
-  return BLOCKS.AIR;
+class RateLimiter {
+  private lastAt = new Map<string, number>();
+  private minIntervalMs: number;
+
+  constructor(minIntervalMs: number) {
+    this.minIntervalMs = Math.max(1, minIntervalMs | 0);
+  }
+
+  public allow(key: string) {
+    const t = nowMs();
+    const prev = this.lastAt.get(key) || 0;
+    if (t - prev < this.minIntervalMs) return false;
+    this.lastAt.set(key, t);
+    return true;
+  }
 }
 
-function blockIdToKind(id: BlockId): string {
-  if (id === BLOCKS.DIRT) return "block:dirt";
-  if (id === BLOCKS.GRASS) return "block:grass";
-  return "";
+function playerEyePos(p: PlayerState) {
+  return { x: p.x, y: p.y + 0.9, z: p.z };
+}
+
+function withinReach(p: PlayerState, bx: number, by: number, bz: number, maxDist: number) {
+  const eye = playerEyePos(p);
+  const cx = bx + 0.5;
+  const cy = by + 0.5;
+  const cz = bz + 0.5;
+  return distSq(eye.x, eye.y, eye.z, cx, cy, cz) <= maxDist * maxDist;
 }
 
 // ------------------------------------------------------------
-// validation helpers (server authoritative)
+// mining progress (server tick driven)
 // ------------------------------------------------------------
 
-function sanitizeWorldXYZ(x: any, y: any, z: any) {
-  // Use WorldStore's sanitizer so constraints are centralized
-  const p = WORLD.sanitizePos(x, y, z);
-  return p;
+type MiningSession = {
+  active: boolean;
+  x: number;
+  y: number;
+  z: number;
+  progress: number; // 0..1
+};
+
+function hardnessForBlockId(id: number) {
+  if (id === BLOCKS.DIRT) return 0.45; // seconds (baseline)
+  if (id === BLOCKS.GRASS) return 0.55;
+  return 0.6;
 }
 
-function isInReach(player: PlayerState, x: number, y: number, z: number, maxDist = 8) {
-  const dx = x + 0.5 - (player.x || 0);
-  const dy = y + 0.5 - ((player.y || 0) + 0.9);
-  const dz = z + 0.5 - (player.z || 0);
-  const d = Math.sqrt(dx * dx + dy * dy + dz * dz);
-  return d <= maxDist;
-}
+function toolSpeedMultiplier(p: PlayerState) {
+  const uid = String(p.equip?.tool || "");
+  if (!uid) return 1.0;
 
-function wouldIntersectPlayer(player: PlayerState, x: number, y: number, z: number) {
-  const px = player.x || 0;
-  const py = player.y || 0;
-  const pz = player.z || 0;
+  const it = p.items.get(uid);
+  if (!it) return 1.0;
 
-  const dx = Math.abs(x + 0.5 - px);
-  const dz = Math.abs(z + 0.5 - pz);
-  const dy = Math.abs(y + 0.5 - (py + 0.9));
+  const k = String(it.kind || "").toLowerCase();
+  if (!k) return 1.0;
 
-  return dx < 0.45 && dz < 0.45 && dy < 1.0;
+  if (k.includes("pickaxe")) return 2.3;
+  if (k.includes("axe")) return 1.6;
+  if (k.includes("shovel")) return 2.0;
+  if (k.startsWith("tool:")) return 1.35;
+
+  return 1.0;
 }
 
 // ------------------------------------------------------------
@@ -362,13 +482,31 @@ function wouldIntersectPlayer(player: PlayerState, x: number, y: number, z: numb
 // ------------------------------------------------------------
 
 export class MyRoom extends Room {
-
   public maxClients = 16;
   public state!: MyRoomState;
+
+  // world persistence
+  private world!: WorldStore;
+
+  // chunk subscriptions
+  private readonly CHUNK_SIZE = 32; // align with noa chunkSize
+  private subsByClient = new Map<string, Set<string>>();
+
+  // server security
+  private rlBreak = new RateLimiter(90);
+  private rlPlace = new RateLimiter(90);
+  private rlSub = new RateLimiter(80);
+
+  // mining sessions
+  private miningByClient = new Map<string, MiningSession>();
 
   public onCreate(options: any) {
     this.setState(new MyRoomState());
     console.log("room", this.roomId, "created with options:", options);
+
+    this.world = new WorldStore({
+      savePath: `./world_${this.roomId}.json`,
+    });
 
     // ---- Simulation tick
     const TICK_MS = 50; // 20 Hz
@@ -410,6 +548,55 @@ export class MyRoom extends Room {
         // hotbar + equip sync
         p.hotbarIndex = normalizeHotbarIndex(p.hotbarIndex);
         syncEquipToolToHotbar(p);
+
+        // mining progress
+        const ms = this.miningByClient.get(sid);
+        if (ms && ms.active) {
+          const stillReach = withinReach(p, ms.x, ms.y, ms.z, 8.0);
+          if (!stillReach) {
+            ms.active = false;
+            ms.progress = 0;
+            const c = clientBySession(this, sid);
+            c?.send("mine:progress", { x: ms.x, y: ms.y, z: ms.z, p: 0 });
+            return;
+          }
+
+          const curId = this.world.getBlock(ms.x, ms.y, ms.z);
+          if (curId === BLOCKS.AIR) {
+            ms.active = false;
+            ms.progress = 0;
+            const c = clientBySession(this, sid);
+            c?.send("mine:progress", { x: ms.x, y: ms.y, z: ms.z, p: 0 });
+            return;
+          }
+
+          const hard = Math.max(0.05, hardnessForBlockId(curId));
+          const mult = toolSpeedMultiplier(p);
+          const rate = (1 / hard) * mult; // progress per second
+
+          ms.progress = clamp(ms.progress + rate * dt, 0, 1);
+
+          const c = clientBySession(this, sid);
+          c?.send("mine:progress", { x: ms.x, y: ms.y, z: ms.z, p: ms.progress });
+
+          if (ms.progress >= 1) {
+            const prevId = curId;
+
+            this.world.applyBreak(ms.x, ms.y, ms.z);
+
+            const kind = blockIdToKind(prevId);
+            if (kind) addKindToInventory(p, kind, 1);
+
+            damageEquippedToolOnBreak(p, 1);
+            syncEquipToolToHotbar(p);
+
+            this.broadcastBlockUpdate(ms.x, ms.y, ms.z, BLOCKS.AIR);
+
+            ms.active = false;
+            ms.progress = 0;
+            c?.send("mine:progress", { x: ms.x, y: ms.y, z: ms.z, p: 0 });
+          }
+        }
       });
     }, TICK_MS);
 
@@ -460,6 +647,155 @@ export class MyRoom extends Room {
 
       p.hotbarIndex = normalizeHotbarIndex(msg?.index);
       syncEquipToolToHotbar(p);
+    });
+
+    // ---- Chunk subscriptions
+    this.onMessage("chunk:sub", (client: Client, msg: ChunkSubMsg) => {
+      if (!this.rlSub.allow(client.sessionId + ":sub")) return;
+
+      const cx = i32(msg?.cx, 0);
+      const cz = i32(msg?.cz, 0);
+
+      let set = this.subsByClient.get(client.sessionId);
+      if (!set) {
+        set = new Set<string>();
+        this.subsByClient.set(client.sessionId, set);
+      }
+
+      const k = chunkKey(cx, cz);
+      if (set.has(k)) return;
+      set.add(k);
+
+      const aabb = aabbForChunkXZ(cx, cz, this.CHUNK_SIZE);
+      const patch = this.world.encodeEditsPatch(aabb.min, aabb.max, { limit: 5000 });
+      client.send("world:patch", patch);
+    });
+
+    this.onMessage("chunk:unsub", (client: Client, msg: ChunkSubMsg) => {
+      const cx = i32(msg?.cx, 0);
+      const cz = i32(msg?.cz, 0);
+
+      const set = this.subsByClient.get(client.sessionId);
+      if (!set) return;
+
+      set.delete(chunkKey(cx, cz));
+    });
+
+    // ---- Secure break/place (instant)
+    this.onMessage("block:break", (client: Client, msg: BlockBreakMsg) => {
+      const p = this.state.players.get(client.sessionId);
+      if (!p) return;
+
+      if (!this.rlBreak.allow(client.sessionId + ":break")) {
+        client.send("block:reject", { op: "break", reason: "rate_limit" });
+        return;
+      }
+
+      const x = this.world.sanitizeCoord(msg?.x);
+      const y = this.world.sanitizeCoord(msg?.y);
+      const z = this.world.sanitizeCoord(msg?.z);
+
+      if (!withinReach(p, x, y, z, 8.0)) {
+        client.send("block:reject", { op: "break", reason: "out_of_reach", x, y, z });
+        return;
+      }
+
+      const curId = this.world.getBlock(x, y, z);
+      if (curId === BLOCKS.AIR) {
+        client.send("block:reject", { op: "break", reason: "already_air", x, y, z });
+        return;
+      }
+
+      this.world.applyBreak(x, y, z);
+
+      const kind = blockIdToKind(curId);
+      if (kind) addKindToInventory(p, kind, 1);
+
+      damageEquippedToolOnBreak(p, 1);
+      syncEquipToolToHotbar(p);
+
+      this.broadcastBlockUpdate(x, y, z, BLOCKS.AIR);
+    });
+
+    this.onMessage("block:place", (client: Client, msg: BlockPlaceMsg) => {
+      const p = this.state.players.get(client.sessionId);
+      if (!p) return;
+
+      if (!this.rlPlace.allow(client.sessionId + ":place")) {
+        client.send("block:reject", { op: "place", reason: "rate_limit" });
+        return;
+      }
+
+      const kind = String(msg?.kind || "");
+      if (!isBlockKind(kind)) {
+        client.send("block:reject", { op: "place", reason: "not_a_block_kind", kind });
+        return;
+      }
+
+      const id = kindToBlockId(kind);
+      if (!id) {
+        client.send("block:reject", { op: "place", reason: "unknown_block_kind", kind });
+        return;
+      }
+
+      const x = this.world.sanitizeCoord(msg?.x);
+      const y = this.world.sanitizeCoord(msg?.y);
+      const z = this.world.sanitizeCoord(msg?.z);
+
+      if (!withinReach(p, x, y, z, 8.0)) {
+        client.send("block:reject", { op: "place", reason: "out_of_reach", x, y, z });
+        return;
+      }
+
+      const curId = this.world.getBlock(x, y, z);
+      if (curId !== BLOCKS.AIR) {
+        client.send("block:reject", { op: "place", reason: "occupied", x, y, z });
+        return;
+      }
+
+      const consumed = consumeSelectedHotbarBlock(p, kind);
+      if (!consumed.ok) {
+        client.send("block:reject", { op: "place", reason: consumed.reason, ...consumed });
+        return;
+      }
+
+      syncEquipToolToHotbar(p);
+
+      this.world.applyPlace(x, y, z, id);
+
+      this.broadcastBlockUpdate(x, y, z, id);
+    });
+
+    // ---- Mining progress
+    this.onMessage("mine:start", (client: Client, msg: MineStartMsg) => {
+      const p = this.state.players.get(client.sessionId);
+      if (!p) return;
+
+      const x = this.world.sanitizeCoord(msg?.x);
+      const y = this.world.sanitizeCoord(msg?.y);
+      const z = this.world.sanitizeCoord(msg?.z);
+
+      if (!withinReach(p, x, y, z, 8.0)) {
+        client.send("block:reject", { op: "mine", reason: "out_of_reach", x, y, z });
+        return;
+      }
+
+      const curId = this.world.getBlock(x, y, z);
+      if (curId === BLOCKS.AIR) {
+        client.send("block:reject", { op: "mine", reason: "already_air", x, y, z });
+        return;
+      }
+
+      this.miningByClient.set(client.sessionId, { active: true, x, y, z, progress: 0 });
+      client.send("mine:progress", { x, y, z, p: 0 });
+    });
+
+    this.onMessage("mine:stop", (client: Client, _msg: MineStopMsg) => {
+      const ms = this.miningByClient.get(client.sessionId);
+      if (!ms) return;
+      ms.active = false;
+      ms.progress = 0;
+      client.send("mine:progress", { x: ms.x, y: ms.y, z: ms.z, p: 0 });
     });
 
     // ---- Inventory slot moves / stacking / swapping
@@ -562,7 +898,6 @@ export class MyRoom extends Room {
       const qty = isFiniteNum(it.qty) ? it.qty : 0;
       if (qty <= 1) return;
 
-      // find empty slot
       const emptyIdx = firstEmptyInvIndex(p);
       if (emptyIdx === -1) return;
 
@@ -587,83 +922,6 @@ export class MyRoom extends Room {
       syncEquipToolToHotbar(p);
     });
 
-    // ---- SERVER AUTH: BREAK BLOCK
-    this.onMessage("block:break", (client: Client, msg: BlockBreakMsg) => {
-      const p = this.state.players.get(client.sessionId);
-      if (!p) return;
-
-      if (!isFiniteNum(msg?.x) || !isFiniteNum(msg?.y) || !isFiniteNum(msg?.z)) return;
-
-      const s = sanitizeWorldXYZ(msg.x, msg.y, msg.z);
-      const x = s.x,
-        y = s.y,
-        z = s.z;
-
-      if (!isInReach(p, x, y, z, 8)) return;
-
-      const prevId = WORLD.getBlock(x, y, z);
-      if (prevId === BLOCKS.AIR) return;
-
-      // break in world
-      const res = WORLD.applyBreak(x, y, z);
-
-      // award item if known
-      const kind = blockIdToKind(prevId);
-      if (kind) addKindToInventory(p, kind, 1);
-
-      syncEquipToolToHotbar(p);
-
-      // broadcast to all clients
-      this.broadcast("block:update", { x, y, z, id: res.newId });
-    });
-
-    // ---- SERVER AUTH: PLACE BLOCK (consumes hotbar)
-    this.onMessage("block:place", (client: Client, msg: BlockPlaceMsg) => {
-      const p = this.state.players.get(client.sessionId);
-      if (!p) return;
-
-      if (!isFiniteNum(msg?.x) || !isFiniteNum(msg?.y) || !isFiniteNum(msg?.z)) return;
-      const kind = String(msg?.kind || "");
-      if (!isBlockKind(kind)) return;
-
-      const s = sanitizeWorldXYZ(msg.x, msg.y, msg.z);
-      const x = s.x,
-        y = s.y,
-        z = s.z;
-
-      if (!isInReach(p, x, y, z, 8)) return;
-      if (wouldIntersectPlayer(p, x, y, z)) return;
-
-      // must be empty
-      if (WORLD.getBlock(x, y, z) !== BLOCKS.AIR) return;
-
-      // consume 1 from hotbar - must match kind
-      const got = consumeFromHotbarBlocks(p, 1);
-      if (got.took <= 0) return;
-      if (got.kind !== kind) {
-        // put it back (best-effort)
-        addKindToInventory(p, got.kind, got.took);
-        syncEquipToolToHotbar(p);
-        return;
-      }
-
-      const id = kindToBlockId(kind);
-      if (!id || id === BLOCKS.AIR) {
-        // invalid mapping -> refund
-        addKindToInventory(p, kind, 1);
-        syncEquipToolToHotbar(p);
-        return;
-      }
-
-      // place in world
-      const res = WORLD.applyPlace(x, y, z, id);
-
-      syncEquipToolToHotbar(p);
-
-      // broadcast to all clients
-      this.broadcast("block:update", { x, y, z, id: res.newId });
-    });
-
     // debug
     this.onMessage("hello", (client: Client, message: any) => {
       console.log(client.sessionId, "said hello:", message);
@@ -674,14 +932,13 @@ export class MyRoom extends Room {
   public onJoin(client: Client, options: JoinOptions) {
     console.log(client.sessionId, "joined!", "options:", options);
 
+    if (!this.subsByClient.get(client.sessionId)) this.subsByClient.set(client.sessionId, new Set());
+
     const p = new PlayerState();
     p.id = client.sessionId;
 
-    if (options && typeof options.name === "string" && options.name.trim()) {
-      p.name = options.name.trim();
-    } else {
-      p.name = "Steve";
-    }
+    if (options && typeof options.name === "string" && options.name.trim()) p.name = options.name.trim();
+    else p.name = "Steve";
 
     // spawn
     p.x = 0;
@@ -732,32 +989,70 @@ export class MyRoom extends Room {
     p.items.set(grassUid, grass);
     p.items.set(toolUid, tool);
 
-    // place into hotbar slots 0,1,2
+    // hotbar slots 0,1,2
     p.inventory.slots[0] = dirtUid;
     p.inventory.slots[1] = grassUid;
     p.inventory.slots[2] = toolUid;
 
-    // sync equip.tool based on hotbar selection
     syncEquipToolToHotbar(p);
 
     this.state.players.set(client.sessionId, p);
-
-    // ---- Send world patch around spawn (or player)
-    const patch = WORLD.encodePatchAround({ x: p.x | 0, y: p.y | 0, z: p.z | 0 }, 96, { limit: 8000 });
-    client.send("world:patch", patch);
 
     client.send("welcome", {
       roomId: this.roomId,
       sessionId: client.sessionId,
     });
+
+    // initial patch around player
+    const patch = this.world.encodePatchAround({ x: p.x | 0, y: p.y | 0, z: p.z | 0 }, 160, { limit: 5000 });
+    client.send("world:patch", patch);
+
+    // auto-subscribe a small chunk radius so block updates route immediately
+    const baseCx = Math.floor((p.x | 0) / this.CHUNK_SIZE);
+    const baseCz = Math.floor((p.z | 0) / this.CHUNK_SIZE);
+    const r = 2;
+    const set = this.subsByClient.get(client.sessionId)!;
+    for (let dx = -r; dx <= r; dx++) {
+      for (let dz = -r; dz <= r; dz++) {
+        set.add(chunkKey(baseCx + dx, baseCz + dz));
+      }
+    }
   }
 
   public onLeave(client: Client, code: CloseCode) {
     console.log(client.sessionId, "left!", code);
+
     this.state.players.delete(client.sessionId);
+    this.subsByClient.delete(client.sessionId);
+    this.miningByClient.delete(client.sessionId);
   }
 
   public onDispose() {
     console.log("room", this.roomId, "disposing...");
   }
+
+  // ----------------------------------------------------------
+  // Helpers
+  // ----------------------------------------------------------
+
+  private broadcastBlockUpdate(x: number, y: number, z: number, id: number) {
+    const { cx, cz } = chunkOfWorldXZ(x, z, this.CHUNK_SIZE);
+    const ck = chunkKey(cx, cz);
+
+    this.clients.forEach((c) => {
+      const set = this.subsByClient.get(c.sessionId);
+      if (!set) return;
+      if (!set.has(ck)) return;
+      c.send("block:update", { x, y, z, id });
+    });
+  }
+}
+
+// ------------------------------------------------------------
+// helper: find client by session id
+// ------------------------------------------------------------
+
+function clientBySession(room: Room, sessionId: string) {
+  const c = room.clients.find((cc) => cc.sessionId === sessionId);
+  return c || null;
 }

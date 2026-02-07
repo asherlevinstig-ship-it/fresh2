@@ -2,29 +2,36 @@
 /*
  * fresh2 - client main/index (NOA main entry) - FULL REWRITE (NO OMITS)
  * -------------------------------------------------------------------
- * Includes:
+ * This version is SERVER-DRIVEN for blocks:
+ * - Client generates ONLY base terrain locally (deterministic function)
+ * - Server sends edits via:
+ *     - "world:patch"   { edits:[{x,y,z,id}], truncated:boolean }
+ *     - "block:update"  { x,y,z,id }
+ * - Client NEVER permanently changes blocks locally (no local mining/building authority)
+ *
+ * Also includes:
  * - In-game UI Debug Console overlay (NO DevTools needed)
  *   - F4 toggle, F6 clear, F7 toggle console mirroring
  * - F2 toggles browser context menu (for inspector if you still want it)
  * - F3 toggles build debug logs
- * - World generation: grass top layer, dirt below (CLIENT BASE TERRAIN)
+ * - World generation: grass top layer, dirt below (must match server)
  * - First/Third person view mode enforcement EVERY FRAME
  * - FPS rig + 3rd-person avatar rigs (local + remote)
  * - Crosshair overlay
  * - Hotbar overlay (inv:0..8), server-authoritative hotbarIndex
  * - Inventory overlay (I) with drag/drop and split (right-click inside UI)
  * - Colyseus (@colyseus/sdk) state sync + remote interpolation
- * - Mining/Building: 100% SERVER-DRIVEN BLOCKS
- *    - Client sends intents:
- *       - block:break {x,y,z}
- *       - block:place {x,y,z,kind}
- *    - Server broadcasts:
- *       - block:update {x,y,z,id}   (client applies noa.setBlock)
- *    - Server sends on join:
- *       - world:patch {edits:[{x,y,z,id}], truncated:boolean}
- * - Right-click places ONLY when context menu is disabled
- * - Always build via KeyB / KeyE (even when context menu is enabled)
- * - Logs reasons to UI console so you can debug in-game
+ *
+ * Server-driven interactions:
+ * - Mining: hold LMB to mine (mine:start/mine:stop) + mine progress UI hook
+ * - Building:
+ *    - Right-click places ONLY when context menu is disabled
+ *    - Always available via KeyB / KeyE (even when context menu is enabled)
+ *    - Sends block:place {x,y,z,kind} to server (server validates + consumes inventory)
+ * - Optional instant break (not used by default; mining uses progress)
+ *
+ * Chunk subscriptions:
+ * - Client sends chunk:sub / chunk:unsub based on player position and chunkAddDistance
  */
 
 import { Engine } from "noa-engine";
@@ -71,6 +78,31 @@ let DEBUG_BUILD = false; // F3 toggles this
 let colyRoom = null;
 const remotePlayers = {}; // { [sessionId]: { mesh, parts, targetPos, targetRot, lastPos } }
 let lastPlayersKeys = new Set();
+
+// Chunk subscriptions (server-side routing)
+const CHUNK = {
+  size: opts.chunkSize | 0,
+  // We'll subscribe based on chunkAddDistance (in chunks) + a small padding
+  // so updates route reliably.
+  radius: Math.max(1, Math.ceil(Number(opts.chunkAddDistance || 2.5)) + 1),
+  subscribed: new Set(), // "cx|cz"
+  lastSentAt: 0,
+  intervalMs: 300, // send updates at most ~3/sec
+};
+
+// Server-driven world edits
+const WORLD = {
+  patchesApplied: 0,
+  lastPatchAt: 0,
+  pendingEdits: [], // queue to apply safely
+  mine: {
+    active: false,
+    x: 0,
+    y: 0,
+    z: 0,
+    p: 0,
+  },
+};
 
 const STATE = {
   scene: null,
@@ -480,6 +512,29 @@ function forceRigBounds(parts) {
       if (m._updateSubMeshesBoundingInfo) m._updateSubMeshesBoundingInfo();
     } catch (e) {}
   }
+}
+
+function cxczFromWorld(x, z) {
+  const cs = CHUNK.size | 0;
+  return { cx: Math.floor(x / cs), cz: Math.floor(z / cs) };
+}
+
+function chunkKey(cx, cz) {
+  return `${cx | 0}|${cz | 0}`;
+}
+
+function sendChunkSub(cx, cz) {
+  if (!colyRoom) return;
+  try {
+    colyRoom.send("chunk:sub", { cx: cx | 0, cz: cz | 0 });
+  } catch {}
+}
+
+function sendChunkUnsub(cx, cz) {
+  if (!colyRoom) return;
+  try {
+    colyRoom.send("chunk:unsub", { cx: cx | 0, cz: cz | 0 });
+  } catch {}
 }
 
 /* ============================================================
@@ -1027,7 +1082,7 @@ function createInventoryOverlay() {
 const inventoryUI = createInventoryOverlay();
 
 /* ============================================================
- * WORLD GENERATION (CLIENT BASE TERRAIN ONLY)
+ * WORLD GENERATION (BASE TERRAIN - MUST MATCH SERVER)
  * ============================================================
  */
 
@@ -1041,6 +1096,7 @@ const dirtID = noa.registry.registerBlock(1, { material: "dirt" });
 const grassID = noa.registry.registerBlock(2, { material: "grass" });
 
 function getVoxelID(x, y, z) {
+  // MUST match server WorldStore.getBaseVoxelID
   const height = 2 * Math.sin(x / 10) + 3 * Math.cos(z / 20);
   if (y < height - 1) return dirtID;
   if (y < height) return grassID;
@@ -1441,7 +1497,7 @@ function getLocalPhysics(dt) {
 }
 
 /* ============================================================
- * ITEM <-> BLOCK HELPERS
+ * INVENTORY HELPERS (for building requests)
  * ============================================================
  */
 
@@ -1452,14 +1508,8 @@ function getSelectedHotbarItem() {
   return { idx, uid, it };
 }
 
-function kindToBlockId(kind) {
-  if (kind === "block:dirt") return dirtID;
-  if (kind === "block:grass") return grassID;
-  return 0;
-}
-
 /* ============================================================
- * MULTIPLAYER SYNC
+ * MULTIPLAYER SYNC (Colyseus state)
  * ============================================================
  */
 
@@ -1661,37 +1711,75 @@ function sendSwing() {
   } catch (e) {}
 }
 
+function sendMineStart(x, y, z) {
+  if (!colyRoom) return;
+  try {
+    colyRoom.send("mine:start", { x: x | 0, y: y | 0, z: z | 0 });
+  } catch (e) {}
+}
+
+function sendMineStop() {
+  if (!colyRoom) return;
+  try {
+    colyRoom.send("mine:stop", {});
+  } catch (e) {}
+}
+
+function sendBlockPlace(x, y, z, kind, source = "unknown") {
+  if (!colyRoom) return;
+  try {
+    colyRoom.send("block:place", { x: x | 0, y: y | 0, z: z | 0, kind: String(kind || "") });
+    if (DEBUG_BUILD) uiLog("[BUILD] request place", kind, "at", x, y, z, "src=", source);
+  } catch (e) {}
+}
+
 /* ============================================================
- * BUILDING (SERVER-DRIVEN)
+ * SERVER-DRIVEN WORLD APPLY
  * ============================================================
  */
 
-function canPlaceAt(x, y, z) {
-  // prevent placing inside player
-  const p = getSafePlayerPos();
-  const px = p[0],
-    py = p[1],
-    pz = p[2];
-
-  const dx = Math.abs(x + 0.5 - px);
-  const dz = Math.abs(z + 0.5 - pz);
-  const dy = Math.abs(y + 0.5 - (py + 0.9));
-
-  const insidePlayer = dx < 0.45 && dz < 0.45 && dy < 1.0;
-  if (insidePlayer) return false;
-
-  // must be empty (client hint only; server is authority)
-  return noa.getBlock(x, y, z) === 0;
+function applyEdit(x, y, z, id) {
+  // apply server edit to NOA
+  try {
+    noa.setBlock(id | 0, x | 0, y | 0, z | 0);
+  } catch (e) {
+    uiWarn("[WORLD] applyEdit failed:", e, { x, y, z, id });
+  }
 }
 
-function placeSelectedBlock(source = "unknown") {
+function applyWorldPatch(patch) {
+  const edits = patch?.edits || [];
+  if (!Array.isArray(edits)) return;
+
+  const t0 = performance.now();
+  for (let i = 0; i < edits.length; i++) {
+    const e = edits[i];
+    if (!e) continue;
+    applyEdit(e.x, e.y, e.z, e.id);
+  }
+  const dt = performance.now() - t0;
+
+  WORLD.patchesApplied++;
+  WORLD.lastPatchAt = performance.now();
+
+  if (patch?.truncated) uiWarn("[WORLD] patch truncated; consider smaller radius / chunk subs");
+  uiLog("[WORLD] patch applied edits=", edits.length, "ms=", dt.toFixed(1));
+}
+
+/* ============================================================
+ * BUILDING (SERVER-AUTHORITATIVE REQUEST)
+ * ============================================================
+ */
+
+function requestPlaceSelectedBlock(source = "unknown") {
   if (inventoryOpen) {
     if (DEBUG_BUILD) uiWarn("[BUILD] blocked: inventory open");
     return;
   }
+  if (!colyRoom) return;
 
-  STATE.swingT = 0;
   sendSwing();
+  STATE.swingT = 0;
 
   if (!noa.targetedBlock) {
     if (DEBUG_BUILD) uiWarn("[BUILD] no targetedBlock (aim at a block face)", "src=", source);
@@ -1705,51 +1793,19 @@ function placeSelectedBlock(source = "unknown") {
     return;
   }
 
-  const kind = it?.kind || "";
+  const kind = String(it?.kind || "");
   if (!kind.startsWith("block:")) {
     if (DEBUG_BUILD) uiWarn("[BUILD] selected item is not a block:", kind, "src=", source);
     return;
   }
 
-  const blockId = kindToBlockId(kind);
-  if (!blockId) {
-    if (DEBUG_BUILD) uiWarn("[BUILD] no blockId mapping for:", kind, "src=", source);
-    return;
-  }
-
   const pos = noa.targetedBlock.adjacent;
-  const x = pos[0] | 0,
-    y = pos[1] | 0,
-    z = pos[2] | 0;
+  const x = pos[0],
+    y = pos[1],
+    z = pos[2];
 
-  const camPos = STATE.scene?.activeCamera?.position;
-  if (camPos) {
-    const dx = x + 0.5 - camPos.x;
-    const dy = y + 0.5 - camPos.y;
-    const dz = z + 0.5 - camPos.z;
-    const dist = Math.sqrt(dx * dx + dy * dy + dz * dz);
-    if (dist > 8.0) {
-      if (DEBUG_BUILD) uiWarn("[BUILD] out of reach:", dist.toFixed(2), "src=", source);
-      return;
-    }
-  }
-
-  if (!canPlaceAt(x, y, z)) {
-    if (DEBUG_BUILD) uiWarn("[BUILD] blocked (occupied or inside player) at:", x, y, z, "src=", source);
-    return;
-  }
-
-  if (!colyRoom) {
-    if (DEBUG_BUILD) uiWarn("[BUILD] no colyRoom (not connected)", "src=", source);
-    return;
-  }
-
-  // SERVER-DRIVEN: request placement; server consumes hotbar + broadcasts block:update
-  try {
-    colyRoom.send("block:place", { x, y, z, kind });
-  } catch (e) {}
-
-  if (DEBUG_BUILD) uiLog("[BUILD] requested place", kind, "at", x, y, z, "src=", source);
+  // NOTE: no local canPlaceAt / reach checks here; server validates.
+  sendBlockPlace(x, y, z, kind, source);
 }
 
 /* ============================================================
@@ -1806,11 +1862,16 @@ window.addEventListener(
         inventoryOpen = false;
         inventoryUI.setVisible(false);
       }
+      // stop mining if holding
+      if (WORLD.mine.active) {
+        WORLD.mine.active = false;
+        sendMineStop();
+      }
     }
 
     // building via keyboard ALWAYS works (even when context menu is enabled)
     if (!inventoryOpen && (e.code === "KeyB" || e.code === "KeyE")) {
-      placeSelectedBlock(e.code);
+      requestPlaceSelectedBlock(e.code);
     }
 
     if (!inventoryOpen) {
@@ -1884,7 +1945,7 @@ window.addEventListener(
   true
 );
 
-// Mine (left click default "fire") - SERVER-DRIVEN
+// Mining: HOLD left click to mine (server-driven)
 noa.inputs.down.on("fire", function () {
   if (inventoryOpen) return;
 
@@ -1894,25 +1955,78 @@ noa.inputs.down.on("fire", function () {
   if (!noa.targetedBlock) return;
 
   const tgt = noa.targetedBlock.position;
-  const x = tgt[0] | 0;
-  const y = tgt[1] | 0;
-  const z = tgt[2] | 0;
+  const x = tgt[0] | 0,
+    y = tgt[1] | 0,
+    z = tgt[2] | 0;
 
-  if (!colyRoom) return;
+  WORLD.mine.active = true;
+  WORLD.mine.x = x;
+  WORLD.mine.y = y;
+  WORLD.mine.z = z;
+  WORLD.mine.p = 0;
 
-  try {
-    colyRoom.send("block:break", { x, y, z });
-  } catch (e) {}
+  sendMineStart(x, y, z);
+
+  if (DEBUG_BUILD) uiLog("[MINE] start", x, y, z);
+});
+
+// Stop mining on mouse up
+noa.inputs.up.on("fire", function () {
+  if (!WORLD.mine.active) return;
+  WORLD.mine.active = false;
+  sendMineStop();
+  if (DEBUG_BUILD) uiLog("[MINE] stop");
 });
 
 // Build (right click) only when browser context menu is disabled
 noa.inputs.down.on("alt-fire", function () {
   if (ALLOW_BROWSER_CONTEXT_MENU) return;
-  placeSelectedBlock("mouse2");
+  requestPlaceSelectedBlock("mouse2");
 });
 
 // Ensure right mouse triggers alt-fire
 noa.inputs.bind("alt-fire", "mouse2");
+
+/* ============================================================
+ * CHUNK SUBSCRIPTION UPDATER
+ * ============================================================
+ */
+
+function updateChunkSubscriptions() {
+  if (!colyRoom) return;
+
+  const now = performance.now();
+  if (now - CHUNK.lastSentAt < CHUNK.intervalMs) return;
+  CHUNK.lastSentAt = now;
+
+  const p = getSafePlayerPos();
+  const { cx, cz } = cxczFromWorld(p[0], p[2]);
+
+  const want = new Set();
+  const r = CHUNK.radius | 0;
+
+  for (let dx = -r; dx <= r; dx++) {
+    for (let dz = -r; dz <= r; dz++) {
+      const k = chunkKey(cx + dx, cz + dz);
+      want.add(k);
+      if (!CHUNK.subscribed.has(k)) {
+        CHUNK.subscribed.add(k);
+        sendChunkSub(cx + dx, cz + dz);
+      }
+    }
+  }
+
+  // remove any not wanted
+  for (const k of Array.from(CHUNK.subscribed)) {
+    if (!want.has(k)) {
+      CHUNK.subscribed.delete(k);
+      const parts = k.split("|");
+      const ucx = (Number(parts[0]) | 0);
+      const ucz = (Number(parts[1]) | 0);
+      sendChunkUnsub(ucx, ucz);
+    }
+  }
+}
 
 /* ============================================================
  * MAIN RENDER LOOP
@@ -1958,7 +2072,7 @@ noa.on("beforeRender", function () {
 
     rp.mesh.position.x = lerp(rp.mesh.position.x, rp.targetPos.x, t);
     rp.mesh.position.y = lerp(rp.mesh.position.y, rp.targetPos.y + 0.075, t);
-    rp.mesh.position.z = lerp(rp.mesh.position.z, rp.targetPos.z, t);
+    rp.mesh.position.z = lerp(rp.mesh.position.z, rp.targetPos.z + 0.075 * 0 + 0, t);
 
     rp.mesh.rotation.y = lerp(rp.mesh.rotation.y, rp.targetRot, t);
 
@@ -1982,6 +2096,9 @@ noa.on("beforeRender", function () {
     const fwd = cam.getForwardRay(3).direction;
     MESH.frontCube.position.copyFrom(cam.position).addInPlace(fwd.scale(3));
   }
+
+  // keep chunk subs updated
+  updateChunkSubscriptions();
 
   // send move at ~10Hz
   if (colyRoom) {
@@ -2024,28 +2141,33 @@ async function connectColyseus() {
     room.onMessage("welcome", (msg) => uiLog("[server] welcome:", msg));
     room.onMessage("hello_ack", (msg) => uiLog("[server] hello_ack:", msg));
 
-    // ---- WORLD SYNC (server-driven blocks)
+    // Server-driven world
     room.onMessage("world:patch", (patch) => {
-      try {
-        const edits = patch?.edits || [];
-        uiLog("[WORLD] patch edits:", edits.length, "truncated:", !!patch?.truncated);
-        for (const e of edits) {
-          noa.setBlock((e.id | 0) || 0, e.x | 0, e.y | 0, e.z | 0);
-        }
-      } catch (err) {
-        uiWarn("[WORLD] patch apply failed:", err);
-      }
+      applyWorldPatch(patch);
     });
 
-    room.onMessage("block:update", (u) => {
-      try {
-        const x = u?.x | 0;
-        const y = u?.y | 0;
-        const z = u?.z | 0;
-        const id = u?.id | 0;
-        noa.setBlock(id, x, y, z);
-      } catch (err) {
-        uiWarn("[WORLD] block:update failed:", err);
+    room.onMessage("block:update", (m) => {
+      if (!m) return;
+      applyEdit(m.x, m.y, m.z, m.id);
+    });
+
+    room.onMessage("block:reject", (m) => {
+      // extremely useful for debugging server validation
+      uiWarn("[server] block:reject", m);
+    });
+
+    room.onMessage("mine:progress", (m) => {
+      // optional UI hook; server sends p 0..1
+      if (!m) return;
+      WORLD.mine.x = m.x | 0;
+      WORLD.mine.y = m.y | 0;
+      WORLD.mine.z = m.z | 0;
+      WORLD.mine.p = safeNum(m.p, 0);
+      // You can draw progress UI here later (ring/bar).
+      // For now, just occasionally log when DEBUG_BUILD is enabled:
+      if (DEBUG_BUILD && WORLD.mine.p > 0 && WORLD.mine.p < 1) {
+        // throttle spam
+        if ((performance.now() | 0) % 10 === 0) uiLog("[MINE] progress", WORLD.mine.p.toFixed(2));
       }
     });
 
@@ -2074,6 +2196,6 @@ const bootInterval = setInterval(() => {
     applyViewModeOnce();
     uiLog("[BOOT] scene ready");
     uiLog("[HELP] F4 debug console • F3 build logs • B/E build • 1..9 hotbar • I inventory");
-    uiLog("[HELP] Server-driven blocks: mine=block:break • place=block:place • apply via block:update/world:patch");
+    uiLog("[HELP] Hold LMB to mine (server) • RMB to place (server) • V toggle view");
   }
 }, 100);
