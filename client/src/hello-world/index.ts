@@ -1,22 +1,20 @@
 // @ts-nocheck
 /*
- * fresh2 - client main/index (FINAL PRODUCTION VERSION - OPTION B)
+ * fresh2 - client main/index (FINAL PRODUCTION VERSION - MINECRAFT CURSOR)
  * -------------------------------------------------------------------
  * INCLUDES:
- * - 3x3 Crafting Grid (REAL CONTAINER - Minecraft-style)
- * - Inventory UI (Drag & Drop, Logic, Splitting)
+ * - 3x3 Crafting Grid (REAL CONTAINER - server authoritative)
+ * - Minecraft-style Cursor (server authoritative)
+ *   - Left click: pickup/place/merge/swap
+ *   - Right click: pickup half / place 1
+ *   - Double click: collect matching stacks into cursor
+ * - Inventory UI (Click interactions + Equipment + Crafting)
  * - Server-Authoritative Logic (Colyseus) with Persistent ID
  * - World Generation (Synced Bedrock/Trees)
  * - 3D Rigs (FPS Hands + 3rd Person Avatars)
  * - Network Interpolation (Smooth movement)
  * - Debug Console (F4)
  * - Dynamic Environment Switching (Localhost vs Prod)
- *
- * CHANGES FOR OPTION B:
- * - Removed virtual mapping craft indices -> inventory
- * - Craft slots are REAL: me.craft.slots[0..8] are uid strings like inventory
- * - Craft preview/result is server-derived: me.craft.resultKind/resultQty/recipeId
- * - Clicking result sends "craft:take" (server consumes from craft container)
  */
 
 import { Engine } from "noa-engine";
@@ -24,11 +22,8 @@ import * as BABYLON from "babylonjs";
 import * as Colyseus from "colyseus.js";
 
 /* ============================================================
- * 1. RECIPE DATA (Client-Side Optional Reference)
+ * 1. RECIPE DATA (optional local reference)
  * ============================================================
- * NOTE:
- * - With Option B, crafting result is server authoritative.
- * - We keep recipes here only for debugging/UI hints if desired.
  */
 
 const RECIPES = [
@@ -98,16 +93,23 @@ const LOCAL_INV = {
   cols: 9,
   rows: 4,
   slots: [], // uid strings (length 36)
-  items: {}, // uid -> { kind, qty, ... }
+  items: {}, // uid -> { kind, qty, durability, maxDurability, meta }
   equip: { head: "", chest: "", legs: "", feet: "", tool: "", offhand: "" },
 };
 
-// Crafting State (Option B: real container)
+// Crafting State (Option B: real craft container)
 const LOCAL_CRAFT = {
   slots: new Array(9).fill(""), // uid strings (length 9)
   resultKind: "",
   resultQty: 0,
   recipeId: "",
+};
+
+// Minecraft cursor (server authoritative)
+const LOCAL_CURSOR = {
+  kind: "",
+  qty: 0,
+  meta: "",
 };
 
 const LOCAL_HOTBAR = { index: 0 };
@@ -117,7 +119,7 @@ const MESH = {
   weaponRoot: null,
   armR: null,
   tool: null, // FPS
-  avatarRoot: null, // TPS (Local) (not used in original, kept for compatibility)
+  avatarRoot: null, // TPS (Local - optional)
 };
 
 const STATE = {
@@ -186,7 +188,88 @@ const UI_CONSOLE = (() => {
 const uiLog = UI_CONSOLE.log;
 
 /* ============================================================
- * 5. UI: INVENTORY & CRAFTING (The Logic Core)
+ * 5. UI: CURSOR GHOST (Minecraft held stack)
+ * ============================================================
+ */
+
+const CURSOR_GHOST = (() => {
+  const el = document.createElement("div");
+  el.id = "cursor-ghost";
+  Object.assign(el.style, {
+    position: "fixed",
+    left: "0px",
+    top: "0px",
+    transform: "translate(12px, 12px)",
+    zIndex: "10020",
+    pointerEvents: "none",
+    display: "none",
+    fontFamily: "system-ui, sans-serif",
+    fontSize: "12px",
+    color: "#fff",
+    textShadow: "1px 1px 0 #000",
+  });
+
+  const box = document.createElement("div");
+  Object.assign(box.style, {
+    background: "rgba(20,20,24,0.95)",
+    border: "1px solid rgba(255,255,255,0.6)",
+    borderRadius: "6px",
+    padding: "6px 8px",
+    minWidth: "40px",
+    textAlign: "center",
+    lineHeight: "1.05",
+  });
+
+  const label = document.createElement("div");
+  label.textContent = "";
+
+  const qty = document.createElement("div");
+  Object.assign(qty.style, { fontWeight: "bold", marginTop: "2px", fontSize: "11px" });
+  qty.textContent = "";
+
+  box.appendChild(label);
+  box.appendChild(qty);
+  el.appendChild(box);
+  document.body.appendChild(el);
+
+  function shortKind(kind) {
+    return kind ? (kind.split(":")[1] || kind) : "";
+  }
+
+  function setVisible(v) {
+    el.style.display = v ? "block" : "none";
+  }
+
+  function update() {
+    const has = !!LOCAL_CURSOR.kind && (LOCAL_CURSOR.qty || 0) > 0;
+    if (!inventoryOpen) {
+      setVisible(false);
+      return;
+    }
+    if (!has) {
+      setVisible(false);
+      return;
+    }
+
+    label.textContent = shortKind(LOCAL_CURSOR.kind);
+    qty.textContent = (LOCAL_CURSOR.qty || 0) > 1 ? String(LOCAL_CURSOR.qty) : "";
+    setVisible(true);
+  }
+
+  function move(e) {
+    el.style.left = e.clientX + "px";
+    el.style.top = e.clientY + "px";
+  }
+
+  window.addEventListener("mousemove", (e) => {
+    if (inventoryOpen) move(e);
+  });
+
+  return { update, setVisible };
+})();
+
+/* ============================================================
+ * 6. UI: INVENTORY & CRAFTING (Minecraft click semantics)
  * ============================================================
  */
 
@@ -207,14 +290,14 @@ function createInventoryOverlay() {
     left: "50%",
     top: "50%",
     transform: "translate(-50%, -50%)",
-    width: "min(800px, 95vw)",
+    width: "min(860px, 96vw)",
     background: "rgba(30,30,35,0.95)",
     borderRadius: "12px",
     border: "1px solid #444",
     boxShadow: "0 10px 40px rgba(0,0,0,0.5)",
     padding: "20px",
     display: "grid",
-    gridTemplateColumns: "240px 1fr",
+    gridTemplateColumns: "260px 1fr",
     gap: "20px",
     fontFamily: "system-ui, sans-serif",
     color: "#eee",
@@ -235,13 +318,14 @@ function createInventoryOverlay() {
     border: "1px solid #333",
   });
 
-  // 3x3 Craft Grid (REAL craft slots: craft:0..8)
+  // 3x3 Grid (REAL craft slots)
   const craftGrid = document.createElement("div");
   Object.assign(craftGrid.style, {
     display: "grid",
     gridTemplateColumns: "repeat(3, 48px)",
     gap: "4px",
   });
+
   const craftCells = [];
   for (let i = 0; i < 9; i++) {
     const { cell, icon, qty } = makeSlot(`craft:${i}`);
@@ -251,7 +335,7 @@ function createInventoryOverlay() {
     craftCells.push({ cell, icon, qty });
   }
 
-  // Result slot (server-derived preview)
+  // Result slot (preview; click crafts into cursor)
   const resWrap = document.createElement("div");
   const { cell: resCell, icon: resIcon, qty: resQty } = makeSlot("craft:result");
   resCell.style.border = "1px solid #6c6";
@@ -266,12 +350,15 @@ function createInventoryOverlay() {
 
   // Equipment
   leftCol.appendChild(document.createElement("hr"));
+  leftCol.appendChild(document.createElement("div")).textContent = "Equipment";
   const eqGrid = document.createElement("div");
   Object.assign(eqGrid.style, {
     display: "grid",
     gridTemplateColumns: "repeat(3, 48px)",
     gap: "4px",
+    marginTop: "6px",
   });
+
   const eqKeys = ["head", "chest", "legs", "feet", "tool", "offhand"];
   const eqCells = {};
   eqKeys.forEach((k) => {
@@ -283,6 +370,23 @@ function createInventoryOverlay() {
   });
   leftCol.appendChild(eqGrid);
 
+  // Cursor hint (optional info)
+  const cursorHint = document.createElement("div");
+  Object.assign(cursorHint.style, {
+    marginTop: "10px",
+    fontSize: "12px",
+    opacity: "0.9",
+    lineHeight: "1.35",
+  });
+  cursorHint.innerHTML = `
+    <div style="opacity:0.85">
+      <b>Mouse</b>: Left = pickup/place/merge/swap<br/>
+      <b>Right</b>: pickup half / place 1<br/>
+      <b>Double</b>: collect same items
+    </div>
+  `;
+  leftCol.appendChild(cursorHint);
+
   // --- Right: Inventory ---
   const rightCol = document.createElement("div");
   rightCol.innerHTML = `<div style="font-weight:bold; margin-bottom:8px">Inventory</div>`;
@@ -293,6 +397,7 @@ function createInventoryOverlay() {
     gridTemplateColumns: "repeat(9, 48px)",
     gap: "4px",
   });
+
   const invCells = [];
   for (let i = 0; i < 36; i++) {
     const { cell, icon, qty } = makeSlot(`inv:${i}`);
@@ -322,6 +427,7 @@ function createInventoryOverlay() {
       cursor: "pointer",
       userSelect: "none",
     });
+
     const icon = document.createElement("div");
     Object.assign(icon.style, {
       position: "absolute",
@@ -336,6 +442,7 @@ function createInventoryOverlay() {
       padding: "2px",
       wordBreak: "break-word",
     });
+
     const qty = document.createElement("div");
     Object.assign(qty.style, {
       position: "absolute",
@@ -345,6 +452,10 @@ function createInventoryOverlay() {
       fontWeight: "bold",
       pointerEvents: "none",
     });
+
+    // prevent browser menu on right click
+    cell.addEventListener("contextmenu", (e) => e.preventDefault());
+
     return { cell, icon, qty };
   }
 
@@ -352,35 +463,9 @@ function createInventoryOverlay() {
     return kind ? kind.split(":")[1] || kind : "";
   }
 
-  function getItemByUid(uid) {
+  function uidToItem(uid) {
     if (!uid) return null;
     return LOCAL_INV.items[uid] || null;
-  }
-
-  function getUidForSlotId(slotId) {
-    if (!slotId || typeof slotId !== "string") return "";
-    if (slotId.startsWith("inv:")) {
-      const idx = parseInt(slotId.split(":")[1]);
-      if (!Number.isFinite(idx)) return "";
-      return LOCAL_INV.slots[idx] || "";
-    }
-    if (slotId.startsWith("craft:")) {
-      const s = slotId.split(":")[1];
-      if (s === "result") return ""; // result is not a uid slot
-      const idx = parseInt(s);
-      if (!Number.isFinite(idx)) return "";
-      return LOCAL_CRAFT.slots[idx] || "";
-    }
-    if (slotId.startsWith("eq:")) {
-      const key = slotId.split(":")[1];
-      return (LOCAL_INV.equip && LOCAL_INV.equip[key]) || "";
-    }
-    return "";
-  }
-
-  function getItemForSlotId(slotId) {
-    const uid = getUidForSlotId(slotId);
-    return uid ? getItemByUid(uid) : null;
   }
 
   // --- Render Loop ---
@@ -388,130 +473,102 @@ function createInventoryOverlay() {
     // Inventory
     for (let i = 0; i < 36; i++) {
       const uid = LOCAL_INV.slots[i] || "";
-      const it = uid ? LOCAL_INV.items[uid] : null;
+      const it = uid ? uidToItem(uid) : null;
       invCells[i].icon.textContent = it ? getItemShort(it.kind) : "";
-      invCells[i].qty.textContent = it && it.qty > 1 ? it.qty : "";
+      invCells[i].qty.textContent = it && it.qty > 1 ? String(it.qty) : "";
       invCells[i].cell.style.opacity = "1";
     }
 
-    // Crafting grid (REAL slots)
+    // Crafting
     for (let i = 0; i < 9; i++) {
       const uid = LOCAL_CRAFT.slots[i] || "";
-      const it = uid ? LOCAL_INV.items[uid] : null;
+      const it = uid ? uidToItem(uid) : null;
       craftCells[i].icon.textContent = it ? getItemShort(it.kind) : "";
-      craftCells[i].qty.textContent = it && it.qty > 1 ? it.qty : "";
+      craftCells[i].qty.textContent = it && it.qty > 1 ? String(it.qty) : "";
     }
 
-    // Result (server-derived preview)
+    // Result preview
     const rk = LOCAL_CRAFT.resultKind || "";
     const rq = LOCAL_CRAFT.resultQty || 0;
     resIcon.textContent = rk ? getItemShort(rk) : "";
-    resQty.textContent = rk && rq > 1 ? String(rq) : rk && rq === 1 ? "1" : "";
+    resQty.textContent = rk ? (rq > 1 ? String(rq) : "1") : "";
 
     // Equip
     eqKeys.forEach((k) => {
       const uid = LOCAL_INV.equip[k];
-      const it = uid ? LOCAL_INV.items[uid] : null;
+      const it = uid ? uidToItem(uid) : null;
       eqCells[k].icon.textContent = it ? getItemShort(it.kind) : "";
       eqCells[k].qty.textContent = "";
     });
+
+    // Cursor ghost
+    CURSOR_GHOST.update();
   }
 
-  // --- Drag & Drop Logic ---
-  const drag = { active: false, srcId: null, srcUid: "", ghost: null };
-
-  function startDrag(e, slotId) {
-    if (!slotId) return;
-
-    // Cannot drag result slot
-    if (slotId === "craft:result") return;
-
-    const uid = getUidForSlotId(slotId);
-    const it = uid ? getItemByUid(uid) : null;
-    if (!it) return;
-
-    drag.active = true;
-    drag.srcId = slotId;
-    drag.srcUid = uid;
-
-    const g = document.createElement("div");
-    g.textContent = getItemShort(it.kind);
-    Object.assign(g.style, {
-      position: "fixed",
-      background: "#222",
-      border: "1px solid white",
-      padding: "4px",
-      pointerEvents: "none",
-      zIndex: "10001",
-      borderRadius: "4px",
-      color: "#fff",
-      maxWidth: "120px",
-      fontSize: "12px",
-      lineHeight: "1.1",
-      wordBreak: "break-word",
-    });
-    document.body.appendChild(g);
-    drag.ghost = g;
-    moveGhost(e);
+  // --- Slot Interaction ---
+  function sendLeft(slotId) {
+    if (!colyRoom) return;
+    colyRoom.send("slot:click", { slot: slotId });
   }
 
-  function moveGhost(e) {
-    if (drag.ghost) {
-      drag.ghost.style.left = e.clientX + 10 + "px";
-      drag.ghost.style.top = e.clientY + 10 + "px";
+  function sendRight(slotId) {
+    if (!colyRoom) return;
+    colyRoom.send("slot:rclick", { slot: slotId });
+  }
+
+  function sendDouble() {
+    if (!colyRoom) return;
+    colyRoom.send("slot:dblclick", {});
+  }
+
+  // Double-click detection (simple)
+  let lastClickAt = 0;
+  let lastClickSlot = "";
+
+  function onSlotMouseDown(e, slotId) {
+    // Craft result crafts into cursor
+    if (slotId === "craft:result") {
+      if (colyRoom) colyRoom.send("craft:take", {});
+      return;
     }
-  }
 
-  function endDrag(e) {
-    if (!drag.active) return;
+    // Detect dblclick (left button only)
+    const now = performance.now();
+    if (e.button === 0) {
+      const dt = now - lastClickAt;
+      const same = lastClickSlot === slotId;
+      lastClickAt = now;
+      lastClickSlot = slotId;
 
-    if (drag.ghost) {
-      try {
-        drag.ghost.remove();
-      } catch (_) {}
-    }
-    drag.ghost = null;
-
-    const srcId = drag.srcId;
-    drag.active = false;
-    drag.srcId = null;
-
-    const el = document.elementFromPoint(e.clientX, e.clientY);
-    const dropSlot = el ? el.closest("[data-id]") : null;
-
-    // If dropped nowhere, cancel (no local edits; server is authoritative)
-    if (!dropSlot) return;
-
-    const destId = dropSlot.dataset.id;
-    if (!destId || destId === srcId) return;
-
-    // Block moving into result slot
-    if (destId === "craft:result") return;
-
-    // Send server move (handles swap / merge / equip rules)
-    if (colyRoom) {
-      colyRoom.send("inv:move", { from: srcId, to: destId });
-    }
-  }
-
-  // Bind Events
-  window.addEventListener("mousemove", (e) => {
-    if (drag.active) moveGhost(e);
-  });
-  window.addEventListener("mouseup", endDrag);
-
-  // Slot Clicks
-  [...invCells, ...craftCells, ...Object.values(eqCells), { cell: resCell }].forEach((o) => {
-    o.cell.addEventListener("mousedown", (e) => {
-      const id = o.cell.dataset.id;
-
-      if (id === "craft:result") {
-        // Clicking result crafts (server authoritative)
-        if (colyRoom) colyRoom.send("craft:take", {});
+      if (dt < 260 && same) {
+        sendDouble();
         return;
       }
 
-      startDrag(e, id);
+      sendLeft(slotId);
+      return;
+    }
+
+    // Right click
+    if (e.button === 2) {
+      sendRight(slotId);
+      return;
+    }
+  }
+
+  // Bind Events to all cells
+  const allCells = [
+    ...invCells.map((o) => o.cell),
+    ...craftCells.map((o) => o.cell),
+    ...Object.values(eqCells).map((o) => o.cell),
+    resCell,
+  ];
+
+  allCells.forEach((cell) => {
+    cell.addEventListener("mousedown", (e) => {
+      e.preventDefault();
+      const id = cell.dataset.id;
+      onSlotMouseDown(e, id);
     });
   });
 
@@ -526,6 +583,7 @@ function createInventoryOverlay() {
         noa.container.canvas.requestPointerLock();
       }
       inventoryOpen = open;
+      CURSOR_GHOST.update();
     },
     refresh,
     isOpen: () => overlay.style.display !== "none",
@@ -535,7 +593,7 @@ function createInventoryOverlay() {
 const inventoryUI = createInventoryOverlay();
 
 /* ============================================================
- * 6. UI: HOTBAR (DOM Overlay)
+ * 7. UI: HOTBAR (DOM Overlay)
  * ============================================================
  */
 
@@ -565,6 +623,7 @@ function createHotbarUI() {
       position: "relative",
       background: "rgba(0,0,0,0.3)",
     });
+
     const icon = document.createElement("div");
     Object.assign(icon.style, {
       position: "absolute",
@@ -579,6 +638,7 @@ function createHotbarUI() {
       padding: "4px",
       wordBreak: "break-word",
     });
+
     const qty = document.createElement("div");
     Object.assign(qty.style, {
       position: "absolute",
@@ -588,6 +648,7 @@ function createHotbarUI() {
       fontWeight: "bold",
       color: "#fff",
     });
+
     s.appendChild(icon);
     s.appendChild(qty);
     div.appendChild(s);
@@ -601,8 +662,8 @@ function createHotbarUI() {
         const uid = LOCAL_INV.slots[i];
         const it = uid ? LOCAL_INV.items[uid] : null;
         slots[i].s.style.borderColor = i === LOCAL_HOTBAR.index ? "white" : "#555";
-        slots[i].icon.textContent = it ? it.kind.split(":")[1] : "";
-        slots[i].qty.textContent = it && it.qty > 1 ? it.qty : "";
+        slots[i].icon.textContent = it ? (it.kind.split(":")[1] || it.kind) : "";
+        slots[i].qty.textContent = it && it.qty > 1 ? String(it.qty) : "";
       }
     },
   };
@@ -611,7 +672,7 @@ function createHotbarUI() {
 const hotbarUI = createHotbarUI();
 
 /* ============================================================
- * 7. WORLD GENERATION (Synced with Server)
+ * 8. WORLD GENERATION (Synced with Server)
  * ============================================================
  */
 
@@ -673,7 +734,7 @@ noa.world.on("worldDataNeeded", (id, data, x, y, z) => {
 });
 
 /* ============================================================
- * 8. VISUALS: RIGS & ANIMATION
+ * 9. VISUALS: RIGS & ANIMATION
  * ============================================================
  */
 
@@ -692,11 +753,7 @@ function initFpsRig(scene) {
   const armMat = createSolidMat(scene, "armMat", [0.2, 0.8, 0.2]);
   const toolMat = createSolidMat(scene, "toolMat", [0.8, 0.8, 0.8]);
 
-  const armR = BABYLON.MeshBuilder.CreateBox(
-    "armR",
-    { width: 0.3, height: 0.8, depth: 0.3 },
-    scene
-  );
+  const armR = BABYLON.MeshBuilder.CreateBox("armR", { width: 0.3, height: 0.8, depth: 0.3 }, scene);
   armR.material = armMat;
   armR.parent = root;
   armR.position.set(0.5, -0.5, 1);
@@ -732,18 +789,17 @@ function createAvatar(scene) {
   body.parent = root;
   body.position.y = 0.9;
 
-  const parts = { root, head, body };
   [head, body].forEach((m) => {
     noa.rendering.addMeshToScene(m, false);
     m.isPickable = false;
   });
-  return parts;
+
+  return { root, head, body };
 }
 
 function updateRigAnim(dt) {
   // Bobbing
   if (viewMode === 0 && MESH.weaponRoot) {
-    // Only bob if moving
     const vel = noa.entities.getPhysicsBody(noa.playerEntity).velocity;
     const moving = Math.abs(vel[0]) > 0.1 || Math.abs(vel[2]) > 0.1;
 
@@ -764,7 +820,7 @@ function updateRigAnim(dt) {
 }
 
 /* ============================================================
- * 9. NETWORKING & SYNC
+ * 10. NETWORKING & SYNC
  * ============================================================
  */
 
@@ -809,34 +865,38 @@ function snapshotState(me) {
   LOCAL_CRAFT.resultQty = Number(me.craft?.resultQty || 0) || 0;
   LOCAL_CRAFT.recipeId = String(me.craft?.recipeId || "");
 
+  // Cursor (minecraft)
+  LOCAL_CURSOR.kind = String(me.cursor?.kind || "");
+  LOCAL_CURSOR.qty = Number(me.cursor?.qty || 0) || 0;
+  LOCAL_CURSOR.meta = String(me.cursor?.meta || "");
+
   if (inventoryUI.isOpen()) inventoryUI.refresh();
   hotbarUI.refresh();
+  CURSOR_GHOST.update();
 }
 
-// DYNAMIC ENDPOINT SWITCH (Vercel Frontend -> Colyseus Cloud Backend)
+// DYNAMIC ENDPOINT SWITCH
 const ENDPOINT = window.location.hostname.includes("localhost")
   ? "ws://localhost:2567"
   : "wss://us-mia-ea26ba04.colyseus.cloud";
 
 const client = new Colyseus.Client(ENDPOINT);
 
-// --- NEW: Persistent ID Logic ---
+// Persistent ID
 function getDistinctId() {
   const key = "fresh2_player_id";
   let id = localStorage.getItem(key);
   if (!id) {
-    // Generate a random ID if none exists
     id = "user_" + Math.random().toString(36).substr(2, 9);
     localStorage.setItem(key, id);
   }
   return id;
 }
-// --------------------------------
 
 client
   .joinOrCreate("my_room", {
     name: "Steve",
-    distinctId: getDistinctId(), // <--- Send the persistent ID
+    distinctId: getDistinctId(),
   })
   .then((room) => {
     colyRoom = room;
@@ -847,7 +907,7 @@ client
       const me = state.players.get(room.sessionId);
       if (me) snapshotState(me);
 
-      // 2) Sync Remotes (spawn/update)
+      // 2) Sync Remotes
       state.players.forEach((p, sid) => {
         if (sid === room.sessionId) return;
 
@@ -861,7 +921,7 @@ client
         if (remotePlayers[sid].mesh) remotePlayers[sid].mesh.rotation.y = p.yaw;
       });
 
-      // 3) Cleanup Remotes Not Present
+      // 3) Cleanup
       for (const sid in remotePlayers) {
         if (!state.players.has(sid)) {
           const rp = remotePlayers[sid];
@@ -884,7 +944,7 @@ client
 
     room.onMessage("block:reject", (msg) => {
       UI_CONSOLE.warn(`Block rejected: ${msg.reason || "unknown"}`);
-      // Reconcile by requesting a patch around player
+      // reconcile
       try {
         const p = noa.entities.getPosition(noa.playerEntity);
         room.send("world:patch:req", {
@@ -899,9 +959,9 @@ client
 
     room.onMessage("craft:success", (msg) => {
       uiLog(`Crafted: ${msg.item}${msg.qty ? " x" + msg.qty : ""}`);
-      // No client-side clearing. Server owns craft grid.
       if (inventoryUI.isOpen()) inventoryUI.refresh();
       hotbarUI.refresh();
+      CURSOR_GHOST.update();
     });
 
     room.onMessage("craft:reject", (msg) => {
@@ -911,7 +971,7 @@ client
   .catch((e) => uiLog(`Connect Error: ${e}`, "red"));
 
 /* ============================================================
- * 10. INPUTS & GAME LOOP
+ * 11. INPUTS & GAME LOOP
  * ============================================================
  */
 
@@ -926,7 +986,6 @@ function setView(mode) {
 // Mouse
 noa.inputs.down.on("fire", () => {
   if (inventoryOpen) return;
-
   STATE.swingT = 0;
   if (colyRoom) colyRoom.send("swing");
 
@@ -983,9 +1042,9 @@ window.addEventListener("keydown", (e) => {
   }
 });
 
-// --- RENDER LOOP (FIXED DT CALCULATION) ---
+// Render loop
 noa.on("beforeRender", () => {
-  // 1) Ensure Scene Initialized
+  // Ensure scene initialized
   if (!STATE.scene) {
     const scene = noa.rendering.getScene();
     if (scene) {
@@ -996,33 +1055,30 @@ noa.on("beforeRender", () => {
     }
   }
 
-  // 2) Robust Delta Time Calculation
+  // dt
   const now = performance.now();
-  const dt = (now - STATE.lastTime) / 1000; // seconds
+  const dt = (now - STATE.lastTime) / 1000;
   STATE.lastTime = now;
+  if (dt > 0.1) return;
 
-  if (dt > 0.1) return; // Skip giant lag spikes
-
-  // 3) Update Animations
+  // anims
   updateRigAnim(dt);
 
-  // 4) Network Interpolation
+  // interpolate remotes
   for (const sid in remotePlayers) {
     const rp = remotePlayers[sid];
     if (rp && rp.mesh) {
       const cur = rp.mesh.position;
       const tgt = rp.targetPos;
-      // Simple lerp
       cur.x += (tgt[0] - cur.x) * 0.1;
       cur.y += (tgt[1] - cur.y) * 0.1;
       cur.z += (tgt[2] - cur.z) * 0.1;
     }
   }
 
-  // 5) Send Move (Throttle)
+  // send move (throttle)
   STATE.moveAccum += dt;
   if (colyRoom && !inventoryOpen && STATE.moveAccum > 0.05) {
-    // 20hz
     STATE.moveAccum = 0;
     try {
       const p = noa.entities.getPosition(noa.playerEntity);

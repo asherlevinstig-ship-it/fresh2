@@ -1,10 +1,14 @@
 // ============================================================
 // rooms/schema/MyRoomState.ts  (FULL REWRITE - NO OMITS)
 // ------------------------------------------------------------
-// Minecraft-style crafting container (Option B):
+// Option B + Minecraft Cursor Stack:
 // - Each player has a REAL 3x3 craft grid: craft.slots[0..8] (uid strings)
-// - Craft result is server-derived fields on craft: resultKind/resultQty (optional recipeId)
-// - Inventory remains 9x4 (36) uid slots + items Map(uid->ItemState) like before
+// - Craft preview/result is server-derived on craft: resultKind/resultQty/recipeId
+// - Each player also has a REAL cursor stack (Minecraft-style):
+//     cursor.kind / cursor.qty
+//   This is server-authoritative and supports right/left/double click logic.
+// - Inventory remains 9x4 (36) uid slots + items Map(uid->ItemState)
+// - Equipment remains uid refs into items map
 // ============================================================
 
 import { Schema, type, MapSchema, ArraySchema } from "@colyseus/schema";
@@ -74,6 +78,21 @@ export class CraftingState extends Schema {
 }
 
 // ------------------------------------------------------------
+// Cursor State (Minecraft-style "held stack")
+// ------------------------------------------------------------
+
+export class CursorState extends Schema {
+  // Kind + qty represent a stack "held by the mouse cursor".
+  // This is server-authoritative and is NOT stored in items map by uid.
+  // (Minecraft cursor is a stack, not a unique item instance.)
+  @type("string") kind: string = "";
+  @type("number") qty: number = 0;
+
+  // Optional metadata for cursor stack if you add it later (kept now for extensibility)
+  @type("string") meta: string = "";
+}
+
+// ------------------------------------------------------------
 // Player State
 // ------------------------------------------------------------
 
@@ -108,6 +127,9 @@ export class PlayerState extends Schema {
   @type(EquipmentState) equip: EquipmentState = new EquipmentState();
   @type(CraftingState) craft: CraftingState = new CraftingState();
 
+  // Minecraft-style cursor (held stack)
+  @type(CursorState) cursor: CursorState = new CursorState();
+
   // Items: uid -> ItemState
   @type({ map: ItemState }) items: MapSchema<ItemState> = new MapSchema<ItemState>();
 
@@ -115,7 +137,7 @@ export class PlayerState extends Schema {
     super();
 
     // Initialize inventory slots (default 9x4 = 36)
-    // Your server already has ensureSlotsLength(), but having a baseline helps clients.
+    // Server still enforces exact length with ensureSlotsLength(), but this provides a stable baseline.
     const total = Math.max(1, (this.inventory.cols || 9) * (this.inventory.rows || 4));
     for (let i = 0; i < total; i++) this.inventory.slots.push("");
   }
