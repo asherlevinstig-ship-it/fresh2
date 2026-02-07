@@ -1,12 +1,19 @@
 // ============================================================
-// server/world/WorldStore.ts  (FULL REWRITE - CRAFTING SUPPORT)
+// server/world/WorldStore.ts  (FULL REWRITE - EXPANDED BLOCKS)
 // ============================================================
 // Purpose:
 // - Server-authoritative voxel world.
 // - Deterministic base terrain (Bedrock, Stone, Dirt, Grass, Trees).
 // - Stores ONLY edits (deltas) to save memory.
 // - Full persistence support (JSON file I/O).
-// - Includes PLANKS block ID for crafting.
+// - Expanded block palette for rarity/value progression (ores + gems).
+//
+// Notes:
+// - This file ONLY defines IDs + world storage/patch/persistence.
+// - Rarity/value is typically defined in a separate defs table,
+//   but we include an optional helper map here (BLOCK_META) so you
+//   can start using it immediately without new files.
+// - Client must register matching IDs and colors for new blocks.
 // ============================================================
 
 import * as fs from "fs";
@@ -14,15 +21,45 @@ import * as path from "path";
 
 export type BlockId = number;
 
+// ------------------------------------------------------------
+// Block Palette
+// ------------------------------------------------------------
+
 export const BLOCKS = {
   AIR: 0,
+
+  // Terrain
   DIRT: 1,
   GRASS: 2,
   STONE: 3,
   BEDROCK: 4,
+
+  // Trees
   LOG: 5,
   LEAVES: 6,
-  PLANKS: 7, // Added for crafting
+
+  // Crafted building
+  PLANKS: 7,
+
+  // Ores / valuables (progression)
+  COAL_ORE: 8,
+  COPPER_ORE: 9,
+  IRON_ORE: 10,
+  SILVER_ORE: 11,
+  GOLD_ORE: 12,
+
+  // Gems / fantasy
+  RUBY_ORE: 13,
+  SAPPHIRE_ORE: 14,
+  MYTHRIL_ORE: 15,
+  DRAGONSTONE: 16,
+
+  // Convenience crafted blocks (optional; recipe can create these)
+  CRAFTING_TABLE: 17,
+  CHEST: 18,
+  SLAB_PLANK: 19,
+  STAIRS_PLANK: 20,
+  DOOR_WOOD: 21,
 } as const;
 
 export type WorldEdit = { x: number; y: number; z: number; id: BlockId };
@@ -30,6 +67,43 @@ export type WorldEdit = { x: number; y: number; z: number; id: BlockId };
 type SerializedWorld = {
   version: number;
   edits: WorldEdit[];
+};
+
+// ------------------------------------------------------------
+// Optional: Simple Metadata (rarity/value) - server-side helpers
+// ------------------------------------------------------------
+
+export type Rarity = "common" | "uncommon" | "rare" | "epic" | "legendary";
+
+export const BLOCK_META: Record<number, { kind: string; rarity: Rarity; value: number }> = {
+  [BLOCKS.DIRT]: { kind: "block:dirt", rarity: "common", value: 1 },
+  [BLOCKS.GRASS]: { kind: "block:grass", rarity: "common", value: 1 },
+  [BLOCKS.STONE]: { kind: "block:stone", rarity: "common", value: 2 },
+  [BLOCKS.BEDROCK]: { kind: "block:bedrock", rarity: "common", value: 0 },
+
+  [BLOCKS.LOG]: { kind: "block:log", rarity: "common", value: 3 },
+  [BLOCKS.LEAVES]: { kind: "block:leaves", rarity: "common", value: 1 },
+  [BLOCKS.PLANKS]: { kind: "block:plank", rarity: "common", value: 2 },
+
+  [BLOCKS.COAL_ORE]: { kind: "block:coal_ore", rarity: "common", value: 6 },
+  [BLOCKS.COPPER_ORE]: { kind: "block:copper_ore", rarity: "common", value: 9 },
+
+  [BLOCKS.IRON_ORE]: { kind: "block:iron_ore", rarity: "uncommon", value: 16 },
+  [BLOCKS.SILVER_ORE]: { kind: "block:silver_ore", rarity: "uncommon", value: 22 },
+
+  [BLOCKS.GOLD_ORE]: { kind: "block:gold_ore", rarity: "rare", value: 40 },
+
+  [BLOCKS.RUBY_ORE]: { kind: "block:ruby_ore", rarity: "rare", value: 70 },
+  [BLOCKS.SAPPHIRE_ORE]: { kind: "block:sapphire_ore", rarity: "rare", value: 70 },
+
+  [BLOCKS.MYTHRIL_ORE]: { kind: "block:mythril_ore", rarity: "epic", value: 140 },
+  [BLOCKS.DRAGONSTONE]: { kind: "block:dragonstone", rarity: "legendary", value: 300 },
+
+  [BLOCKS.CRAFTING_TABLE]: { kind: "block:crafting_table", rarity: "common", value: 10 },
+  [BLOCKS.CHEST]: { kind: "block:chest", rarity: "common", value: 12 },
+  [BLOCKS.SLAB_PLANK]: { kind: "block:slab_plank", rarity: "common", value: 1 },
+  [BLOCKS.STAIRS_PLANK]: { kind: "block:stairs_plank", rarity: "common", value: 2 },
+  [BLOCKS.DOOR_WOOD]: { kind: "block:door_wood", rarity: "common", value: 3 },
 };
 
 // ------------------------------------------------------------
@@ -71,50 +145,116 @@ function parseKey(k: string): { x: number; y: number; z: number } | null {
 // Deterministic Terrain Logic
 // ------------------------------------------------------------
 
-/** Simple pseudo-random hash for deterministic features (trees) */
+/** Simple pseudo-random hash for deterministic features (trees, ore clusters) */
 function hash2(x: number, z: number) {
   let n = Math.sin(x * 12.9898 + z * 78.233) * 43758.5453;
   return n - Math.floor(n);
 }
 
+/** Another small hash including y for ore choice */
+function hash3(x: number, y: number, z: number) {
+  let n = Math.sin(x * 12.9898 + y * 0.123 + z * 78.233) * 43758.5453;
+  return n - Math.floor(n);
+}
+
 /**
  * Deterministic base terrain function.
- * MUST match the Client's terrain generation logic exactly.
+ * MUST match the Client's terrain generation logic for baseline terrain.
+ *
+ * IMPORTANT:
+ * - We only add new ore/gem blocks in areas where base is STONE.
+ * - If your client still generates only plain stone, that's okay:
+ *   server sends edits for placed/broken blocks, but base mismatch can
+ *   look different if you ALSO want ores in base terrain. If you want
+ *   ores to exist naturally, you MUST mirror this logic client-side too.
  */
 export function getBaseVoxelID(x: number, y: number, z: number): BlockId {
-  // 1. Bedrock Floor (at y = -10 and below)
+  // 1) Bedrock Floor
   if (y < -10) return BLOCKS.BEDROCK;
 
-  // 2. Base Height Calculation
+  // 2) Base Height
   const height = Math.floor(4 * Math.sin(x / 15) + 4 * Math.cos(z / 20));
 
-  // 3. Trees (Deterministic "structures")
-  // We check if we are in the "air" space just above the ground
+  // 3) Trees (Deterministic)
   if (y > height && y < height + 8) {
-    // Check if a tree root exists at (x, z)
-    // 2% chance per column to have a tree
     if (hash2(x, z) > 0.98) {
       const treeBaseY = height + 1;
       const trunkHeight = 4;
 
-      // Trunk (Log)
+      // Trunk
       if (y >= treeBaseY && y < treeBaseY + trunkHeight) {
         return BLOCKS.LOG;
       }
 
-      // Leaves (Simple blob around the top)
+      // Leaves (simple)
       const topY = treeBaseY + trunkHeight - 1;
       if (y >= topY - 1 && y <= topY + 2) {
-         // Simple vertical check for leaves (lollipop tree)
-         if (y > topY) return BLOCKS.LEAVES;
+        if (y > topY) return BLOCKS.LEAVES;
       }
     }
   }
 
-  // 4. Standard Terrain Layers
-  if (y < height - 3) return BLOCKS.STONE; // Stone deep down
-  if (y < height) return BLOCKS.DIRT;      // Dirt layer
-  if (y === height) return BLOCKS.GRASS;   // Grass top
+  // 4) Standard Layers
+  const deepStone = y < height - 3;
+  const dirtLayer = y < height;
+  const grassTop = y === height;
+
+  if (deepStone) {
+    // --- Ore / gem injection into stone (deterministic) ---
+    // Keep it sparse and depth-weighted.
+
+    // Coal: common, near surface down to deep
+    const hCoal = hash3(x, y, z);
+    if (hCoal > 0.995) return BLOCKS.COAL_ORE;
+
+    // Copper: common-ish
+    const hCopper = hash3(x + 11, y - 7, z + 3);
+    if (hCopper > 0.996) return BLOCKS.COPPER_ORE;
+
+    // Iron: uncommon, deeper bias
+    if (y < height - 6) {
+      const hIron = hash3(x - 17, y + 5, z + 19);
+      if (hIron > 0.9972) return BLOCKS.IRON_ORE;
+    }
+
+    // Silver: uncommon, deeper
+    if (y < height - 10) {
+      const hSilver = hash3(x + 33, y - 9, z - 21);
+      if (hSilver > 0.9978) return BLOCKS.SILVER_ORE;
+    }
+
+    // Gold: rare, deep
+    if (y < height - 14) {
+      const hGold = hash3(x - 41, y + 13, z + 7);
+      if (hGold > 0.9983) return BLOCKS.GOLD_ORE;
+    }
+
+    // Ruby/Sapphire: rare, deep pockets
+    if (y < height - 18) {
+      const hGem = hash3(x + 77, y - 23, z + 55);
+      if (hGem > 0.99875) return BLOCKS.RUBY_ORE;
+
+      const hGem2 = hash3(x - 91, y + 29, z - 61);
+      if (hGem2 > 0.99875) return BLOCKS.SAPPHIRE_ORE;
+    }
+
+    // Mythril: epic, very deep
+    if (y < height - 26) {
+      const hMythril = hash3(x + 123, y - 51, z - 99);
+      if (hMythril > 0.9992) return BLOCKS.MYTHRIL_ORE;
+    }
+
+    // Dragonstone: legendary, extremely rare, deepest
+    if (y < -2) {
+      const hDragon = hash3(x - 211, y - 101, z + 177);
+      if (hDragon > 0.9996) return BLOCKS.DRAGONSTONE;
+    }
+
+    return BLOCKS.STONE;
+  }
+
+  if (dirtLayer) return BLOCKS.DIRT;
+  if (grassTop) return BLOCKS.GRASS;
 
   return BLOCKS.AIR;
 }
@@ -135,7 +275,13 @@ export class WorldStore {
   private _autosavePath: string | null = null;
   private _autosaveMinIntervalMs: number = 2500;
 
-  constructor(opts?: { minCoord?: number; maxCoord?: number; seed?: number; autosavePath?: string; autosaveMinIntervalMs?: number }) {
+  constructor(opts?: {
+    minCoord?: number;
+    maxCoord?: number;
+    seed?: number;
+    autosavePath?: string;
+    autosaveMinIntervalMs?: number;
+  }) {
     this.edits = new Map();
 
     this.minCoord = isFiniteNum(opts?.minCoord) ? (opts!.minCoord as number) : -100000;
@@ -218,7 +364,6 @@ export class WorldStore {
     const k = keyOf(x, y, z);
 
     if (id === base) {
-      // If setting to base, remove the edit (optimization)
       if (this.edits.has(k)) {
         this.edits.delete(k);
         this.markDirty();
@@ -317,12 +462,7 @@ export class WorldStore {
    * Builds a chunk snapshot (base + edits merged) for a given chunk origin.
    * Returns Uint16Array of size chunkSize^3 in X-major order (x -> y -> z).
    */
-  public makeChunkSnapshot(
-    chunkX: number,
-    chunkY: number,
-    chunkZ: number,
-    chunkSize: number
-  ): Uint16Array {
+  public makeChunkSnapshot(chunkX: number, chunkY: number, chunkZ: number, chunkSize: number): Uint16Array {
     chunkX |= 0;
     chunkY |= 0;
     chunkZ |= 0;
@@ -420,12 +560,10 @@ export class WorldStore {
       const z = i32(e?.z, 0);
       const id = i32(e?.id, BLOCKS.AIR);
 
-      // clamp coords to store bounds
       const sx = clamp(x, this.minCoord, this.maxCoord) | 0;
       const sy = clamp(y, this.minCoord, this.maxCoord) | 0;
       const sz = clamp(z, this.minCoord, this.maxCoord) | 0;
 
-      // store as delta vs base
       const base = this.getBaseBlock(sx, sy, sz);
       const k = keyOf(sx, sy, sz);
 
