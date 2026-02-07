@@ -1,10 +1,39 @@
-import { Room, Client } from "@colyseus/core";
+// ============================================================
+// rooms/MyRoom.ts  (FULL REWRITE - NO OMITS - BIOMES BLOCKS SUPPORT)
+// ------------------------------------------------------------
+// Notes:
+// - Colyseus v0.17+ Room generic is NOT "Room<State>".
+// - To avoid TS2559 (MyRoomState vs RoomOptions mismatch), we:
+//   1) import Room/Client from "colyseus" (matches app.config.ts)
+//   2) extend `Room` without generics
+//   3) `declare state: MyRoomState` for strong typing
+//
+// - This version keeps ALL original logic: movement, sprint/stamina,
+//   swing, hotbar/equip sync, inventory move/split/add/consume,
+//   world patching, break/place with reach + rate limit,
+//   persistence, autosave, etc.
+//
+// - Updated block mapping to include biome blocks + ores and crafted blocks
+//   matching server/world/WorldStore.ts BLOCKS IDs.
+// ============================================================
+
+import { Room, Client } from "colyseus";
 import * as fs from "fs";
 import * as path from "path";
 
 // Imports with .js extensions for Node16/NodeNext resolution
 import { WorldStore, BLOCKS, type BlockId } from "../world/WorldStore.js";
-import { MyRoomState, PlayerState, ItemState, InventoryState, EquipmentState } from "./schema/MyRoomState.js";
+import {
+  MyRoomState,
+  PlayerState,
+  ItemState,
+  InventoryState,
+  EquipmentState,
+} from "./schema/MyRoomState.js";
+
+// If your crafting system still exists for item crafting,
+// you can keep it imported; this file doesn't call it directly
+// unless you still use craft:commit.
 import { CraftingSystem } from "../crafting/CraftingSystem.js";
 
 // ------------------------------------------------------------
@@ -68,9 +97,7 @@ function dist3(ax: number, ay: number, az: number, bx: number, by: number, bz: n
 
 type EquipKey = "head" | "chest" | "legs" | "feet" | "tool" | "offhand";
 
-type SlotRef =
-  | { kind: "inv"; index: number }
-  | { kind: "eq"; key: EquipKey };
+type SlotRef = { kind: "inv"; index: number } | { kind: "eq"; key: EquipKey };
 
 function parseSlotRef(s: any): SlotRef | null {
   if (typeof s !== "string") return null;
@@ -135,7 +162,15 @@ function isEquipSlotCompatible(slotKey: EquipKey, itemKind: string) {
   const k = itemKind.toLowerCase();
 
   if (slotKey === "tool") {
-    return k.startsWith("tool:") || k.includes("pickaxe") || k.includes("axe") || k.includes("sword");
+    return (
+      k.startsWith("tool:") ||
+      k.includes("pickaxe") ||
+      k.includes("axe") ||
+      k.includes("sword") ||
+      k.includes("shovel") ||
+      k.includes("wand") ||
+      k.includes("club")
+    );
   }
   if (slotKey === "offhand") return true;
 
@@ -150,7 +185,16 @@ function isEquipSlotCompatible(slotKey: EquipKey, itemKind: string) {
 function maxStackForKind(kind: string) {
   const k = (kind || "").toLowerCase();
   if (!k) return 64;
-  if (k.startsWith("tool:") || k.includes("pickaxe") || k.includes("axe") || k.includes("sword")) return 1;
+  if (
+    k.startsWith("tool:") ||
+    k.includes("pickaxe") ||
+    k.includes("axe") ||
+    k.includes("sword") ||
+    k.includes("shovel") ||
+    k.includes("wand") ||
+    k.includes("club")
+  )
+    return 1;
   return 64;
 }
 
@@ -173,7 +217,7 @@ function syncEquipToolToHotbar(p: PlayerState) {
 
   const idx = normalizeHotbarIndex(p.hotbarIndex);
   const uid = String(p.inventory.slots[idx] || "");
-  
+
   if (!uid) {
     p.equip.tool = "";
     return;
@@ -270,6 +314,12 @@ function addKindToInventory(p: PlayerState, kind: string, qty: number) {
     it2.kind = kind;
     it2.qty = add;
 
+    // Tool durability defaults
+    if (String(kind).startsWith("tool:")) {
+      it2.durability = 100;
+      it2.maxDurability = 100;
+    }
+
     p.items.set(uid, it2);
     p.inventory.slots[idx] = uid;
   }
@@ -305,28 +355,94 @@ function consumeFromHotbar(p: PlayerState, qty: number) {
 }
 
 // ------------------------------------------------------------
-// Block Mapping
+// Block Mapping (UPDATED: Biomes + Ores + Crafted Blocks)
 // ------------------------------------------------------------
 
 function kindToBlockId(kind: string): BlockId {
+  // Core terrain
   if (kind === "block:dirt") return BLOCKS.DIRT;
   if (kind === "block:grass") return BLOCKS.GRASS;
-  if (kind === "block:stone") return 3;
-  if (kind === "block:bedrock") return 4;
-  if (kind === "block:log") return 5;
-  if (kind === "block:leaves") return 6;
-  if (kind === "block:plank") return 7;
+  if (kind === "block:stone") return BLOCKS.STONE;
+  if (kind === "block:bedrock") return BLOCKS.BEDROCK;
+
+  // Trees
+  if (kind === "block:log") return BLOCKS.LOG;
+  if (kind === "block:leaves") return BLOCKS.LEAVES;
+
+  // Crafted building
+  if (kind === "block:plank") return BLOCKS.PLANKS;
+
+  // Biome surfaces
+  if (kind === "block:sand") return BLOCKS.SAND;
+  if (kind === "block:snow") return BLOCKS.SNOW;
+  if (kind === "block:clay") return BLOCKS.CLAY;
+  if (kind === "block:gravel") return BLOCKS.GRAVEL;
+  if (kind === "block:mud") return BLOCKS.MUD;
+  if (kind === "block:ice") return BLOCKS.ICE;
+
+  // Ores / valuables
+  if (kind === "block:coal_ore") return (BLOCKS as any).COAL_ORE ?? BLOCKS.STONE;
+  if (kind === "block:copper_ore") return (BLOCKS as any).COPPER_ORE ?? BLOCKS.STONE;
+  if (kind === "block:iron_ore") return (BLOCKS as any).IRON_ORE ?? BLOCKS.STONE;
+  if (kind === "block:silver_ore") return (BLOCKS as any).SILVER_ORE ?? BLOCKS.STONE;
+  if (kind === "block:gold_ore") return (BLOCKS as any).GOLD_ORE ?? BLOCKS.STONE;
+
+  if (kind === "block:ruby_ore") return (BLOCKS as any).RUBY_ORE ?? BLOCKS.STONE;
+  if (kind === "block:sapphire_ore") return (BLOCKS as any).SAPPHIRE_ORE ?? BLOCKS.STONE;
+  if (kind === "block:mythril_ore") return (BLOCKS as any).MYTHRIL_ORE ?? BLOCKS.STONE;
+  if (kind === "block:dragonstone") return (BLOCKS as any).DRAGONSTONE ?? BLOCKS.STONE;
+
+  // Crafted functional blocks
+  if (kind === "block:crafting_table") return (BLOCKS as any).CRAFTING_TABLE ?? BLOCKS.PLANKS;
+  if (kind === "block:chest") return (BLOCKS as any).CHEST ?? BLOCKS.PLANKS;
+  if (kind === "block:slab_plank") return (BLOCKS as any).SLAB_PLANK ?? BLOCKS.PLANKS;
+  if (kind === "block:stairs_plank") return (BLOCKS as any).STAIRS_PLANK ?? BLOCKS.PLANKS;
+  if (kind === "block:door_wood") return (BLOCKS as any).DOOR_WOOD ?? BLOCKS.PLANKS;
+
   return BLOCKS.AIR;
 }
 
 function blockIdToKind(id: BlockId): string {
+  // Core terrain
   if (id === BLOCKS.DIRT) return "block:dirt";
   if (id === BLOCKS.GRASS) return "block:grass";
-  if (id === 3) return "block:stone";
-  if (id === 4) return "block:bedrock";
-  if (id === 5) return "block:log";
-  if (id === 6) return "block:leaves";
-  if (id === 7) return "block:plank";
+  if (id === BLOCKS.STONE) return "block:stone";
+  if (id === BLOCKS.BEDROCK) return "block:bedrock";
+
+  // Trees
+  if (id === BLOCKS.LOG) return "block:log";
+  if (id === BLOCKS.LEAVES) return "block:leaves";
+
+  // Crafted building
+  if (id === BLOCKS.PLANKS) return "block:plank";
+
+  // Biome surfaces
+  if (id === (BLOCKS as any).SAND) return "block:sand";
+  if (id === (BLOCKS as any).SNOW) return "block:snow";
+  if (id === (BLOCKS as any).CLAY) return "block:clay";
+  if (id === (BLOCKS as any).GRAVEL) return "block:gravel";
+  if (id === (BLOCKS as any).MUD) return "block:mud";
+  if (id === (BLOCKS as any).ICE) return "block:ice";
+
+  // Ores / valuables
+  if (id === (BLOCKS as any).COAL_ORE) return "block:coal_ore";
+  if (id === (BLOCKS as any).COPPER_ORE) return "block:copper_ore";
+  if (id === (BLOCKS as any).IRON_ORE) return "block:iron_ore";
+  if (id === (BLOCKS as any).SILVER_ORE) return "block:silver_ore";
+  if (id === (BLOCKS as any).GOLD_ORE) return "block:gold_ore";
+
+  if (id === (BLOCKS as any).RUBY_ORE) return "block:ruby_ore";
+  if (id === (BLOCKS as any).SAPPHIRE_ORE) return "block:sapphire_ore";
+  if (id === (BLOCKS as any).MYTHRIL_ORE) return "block:mythril_ore";
+  if (id === (BLOCKS as any).DRAGONSTONE) return "block:dragonstone";
+
+  // Crafted functional blocks
+  if (id === (BLOCKS as any).CRAFTING_TABLE) return "block:crafting_table";
+  if (id === (BLOCKS as any).CHEST) return "block:chest";
+  if (id === (BLOCKS as any).SLAB_PLANK) return "block:slab_plank";
+  if (id === (BLOCKS as any).STAIRS_PLANK) return "block:stairs_plank";
+  if (id === (BLOCKS as any).DOOR_WOOD) return "block:door_wood";
+
   return "";
 }
 
@@ -349,8 +465,10 @@ function isValidBlockCoord(n: any) {
 // Room Implementation
 // ------------------------------------------------------------
 
-// Explicitly bind the generic to MyRoomState to satisfy TypeScript
-export class MyRoom extends Room<MyRoomState> {
+export class MyRoom extends Room {
+  // Strongly type Colyseus state for this Room.
+  declare state: MyRoomState;
+
   public maxClients = 16;
 
   // Shared world per server process
@@ -382,24 +500,30 @@ export class MyRoom extends Room<MyRoomState> {
   private savePlayerData(distinctId: string, p: PlayerState) {
     let allData: any = {};
     if (fs.existsSync(this.playersPath)) {
-      try { allData = JSON.parse(fs.readFileSync(this.playersPath, "utf8")); } catch (e) {}
+      try {
+        allData = JSON.parse(fs.readFileSync(this.playersPath, "utf8"));
+      } catch (e) {}
     }
-    
+
     // Explicit conversion logic to avoid TS errors
     const itemsArray = Array.from(p.items.entries()).map((entry: any) => {
-        const [uid, item] = entry;
-        return { uid, kind: item.kind, qty: item.qty, durability: item.durability };
+      const [uid, item] = entry;
+      return { uid, kind: item.kind, qty: item.qty, durability: item.durability, maxDurability: item.maxDurability, meta: item.meta };
     });
 
     // Serialize PlayerState to JSON
     const saveData = {
-        x: p.x, y: p.y, z: p.z,
-        yaw: p.yaw, pitch: p.pitch,
-        hp: p.hp, stamina: p.stamina,
-        hotbarIndex: p.hotbarIndex,
-        inventory: Array.from(p.inventory.slots),
-        items: itemsArray,
-        equip: p.equip.toJSON()
+      x: p.x,
+      y: p.y,
+      z: p.z,
+      yaw: p.yaw,
+      pitch: p.pitch,
+      hp: p.hp,
+      stamina: p.stamina,
+      hotbarIndex: p.hotbarIndex,
+      inventory: Array.from(p.inventory.slots),
+      items: itemsArray,
+      equip: p.equip.toJSON(),
     };
 
     allData[distinctId] = saveData;
@@ -412,7 +536,6 @@ export class MyRoom extends Room<MyRoomState> {
   // --------------------------------------------------------
 
   public onCreate(options: any) {
-    // This requires the class to extend Room<MyRoomState>
     this.setState(new MyRoomState());
     console.log("MyRoom created:", this.roomId, options);
 
@@ -477,10 +600,9 @@ export class MyRoom extends Room<MyRoomState> {
         p.hotbarIndex = normalizeHotbarIndex(p.hotbarIndex);
         syncEquipToolToHotbar(p);
       });
-      
+
       // Autosave triggered internally by WorldStore logic on dirty + time check
       MyRoom.WORLD.maybeAutosave();
-
     }, TICK_MS);
 
     // --------------------------------------------------------
@@ -666,7 +788,12 @@ export class MyRoom extends Room<MyRoomState> {
     });
 
     // --------------------------------------------------------
-    // Crafting Handler
+    // Crafting Handler (LEGACY craft:commit)
+    // --------------------------------------------------------
+    // NOTE:
+    // - If you migrate to Option B (server-side craft slots + craft:take),
+    //   you should remove this entire handler and update the client.
+    // - Kept here to preserve existing logic exactly.
     // --------------------------------------------------------
 
     this.onMessage("craft:commit", (client: Client, msg: CraftCommitMsg) => {
@@ -675,8 +802,8 @@ export class MyRoom extends Room<MyRoomState> {
 
       const indices = msg?.srcIndices;
       if (!Array.isArray(indices) || indices.length !== 9) {
-          console.log(`[CRAFT] Invalid indices from ${client.sessionId}`);
-          return;
+        console.log(`[CRAFT] Invalid indices from ${client.sessionId}`);
+        return;
       }
 
       // 1. Resolve Items from 3x3 Grid
@@ -684,55 +811,55 @@ export class MyRoom extends Room<MyRoomState> {
       const validSlotIndices: number[] = [];
 
       ensureSlotsLength(p);
-      
+
       for (let i = 0; i < 9; i++) {
-          const slotIdx = indices[i];
-          if (slotIdx === -1) {
-              kinds.push("");
-              continue;
-          }
-          
-          if (slotIdx < 0 || slotIdx >= p.inventory.slots.length) {
-             console.log(`[CRAFT] Index out of bounds: ${slotIdx}`);
-             return;
-          }
+        const slotIdx = indices[i];
+        if (slotIdx === -1) {
+          kinds.push("");
+          continue;
+        }
 
-          const uid = p.inventory.slots[slotIdx];
-          const item = uid ? p.items.get(uid) : null;
-          
-          if (!uid || !item) {
-             console.log(`[CRAFT] Slot mismatch/empty: ${slotIdx}`);
-             return; 
-          }
+        if (slotIdx < 0 || slotIdx >= p.inventory.slots.length) {
+          console.log(`[CRAFT] Index out of bounds: ${slotIdx}`);
+          return;
+        }
 
-          kinds.push(item.kind);
-          validSlotIndices.push(slotIdx);
+        const uid = p.inventory.slots[slotIdx];
+        const item = uid ? p.items.get(uid) : null;
+
+        if (!uid || !item) {
+          console.log(`[CRAFT] Slot mismatch/empty: ${slotIdx}`);
+          return;
+        }
+
+        kinds.push(item.kind);
+        validSlotIndices.push(slotIdx);
       }
 
       // 2. Check Match
       const match = CraftingSystem.findMatch(kinds);
       if (!match) {
-          console.log(`[CRAFT] No match for ${client.sessionId}`);
-          return;
+        console.log(`[CRAFT] No match for ${client.sessionId}`);
+        return;
       }
 
-      // 3. Consume Ingredients
+      // 3. Consume Ingredients (1 from each used slot)
       for (const slotIdx of validSlotIndices) {
-          const uid = p.inventory.slots[slotIdx];
-          const it = p.items.get(uid);
-          if (it) {
-              it.qty -= 1;
-              if (it.qty <= 0) {
-                  p.inventory.slots[slotIdx] = "";
-                  p.items.delete(uid);
-              }
+        const uid = p.inventory.slots[slotIdx];
+        const it = p.items.get(uid);
+        if (it) {
+          it.qty -= 1;
+          if (it.qty <= 0) {
+            p.inventory.slots[slotIdx] = "";
+            p.items.delete(uid);
           }
+        }
       }
 
       // 4. Add Result
-      const added = addKindToInventory(p, match.result.kind, match.result.qty);
+      addKindToInventory(p, match.result.kind, match.result.qty);
       syncEquipToolToHotbar(p);
-      
+
       console.log(`[CRAFT] ${client.sessionId} crafted ${match.result.kind} x${match.result.qty}`);
       client.send("craft:success", { item: match.result.kind });
     });
@@ -771,9 +898,12 @@ export class MyRoom extends Room<MyRoomState> {
 
     const withinWorld = (x: number, y: number, z: number) => {
       return (
-        x >= -MAX_COORD && x <= MAX_COORD &&
-        y >= -MAX_COORD && y <= MAX_COORD &&
-        z >= -MAX_COORD && z <= MAX_COORD
+        x >= -MAX_COORD &&
+        x <= MAX_COORD &&
+        y >= -MAX_COORD &&
+        y <= MAX_COORD &&
+        z >= -MAX_COORD &&
+        z <= MAX_COORD
       );
     };
 
@@ -816,7 +946,7 @@ export class MyRoom extends Room<MyRoomState> {
       // Apply break
       const { newId } = MyRoom.WORLD.applyBreak(x, y, z);
 
-      // Add item
+      // Add item (drops the broken block kind)
       const kind = blockIdToKind(prevId);
       if (kind) addKindToInventory(p, kind, 1);
 
@@ -868,7 +998,7 @@ export class MyRoom extends Room<MyRoomState> {
         return;
       }
 
-      // Consume
+      // Consume from hotbar
       const took = consumeFromHotbar(p, 1);
       if (took <= 0) {
         reject(client, "no_blocks_in_hotbar", { op: "place", src });
@@ -881,7 +1011,7 @@ export class MyRoom extends Room<MyRoomState> {
       console.log(`[WORLD] place by ${client.sessionId} at ${x},${y},${z}`);
     });
 
-    this.onMessage("hello", (client: Client, message: any) => {
+    this.onMessage("hello", (client: Client, _message: any) => {
       client.send("hello_ack", { ok: true, serverTime: Date.now() });
     });
   }
@@ -891,85 +1021,96 @@ export class MyRoom extends Room<MyRoomState> {
 
     // 1. Identify the user (use persistent ID or fallback to session ID)
     const distinctId = options.distinctId || client.sessionId;
-    
+
     // Store distinctId on the client object for later use in onLeave
     (client as any).auth = { distinctId };
 
     const p = new PlayerState();
     p.id = client.sessionId;
     p.name = (options.name || "Steve").trim().substring(0, 16);
-    
+
     // 2. Try to Load Saved Data
     const saved = this.loadPlayerData(distinctId);
 
     if (saved) {
-        console.log(`[PERSIST] Restoring player ${distinctId}...`);
-        p.x = isFiniteNum(saved.x) ? saved.x : 0; 
-        p.y = isFiniteNum(saved.y) ? saved.y : 10; 
-        p.z = isFiniteNum(saved.z) ? saved.z : 0;
-        p.yaw = isFiniteNum(saved.yaw) ? saved.yaw : 0; 
-        p.pitch = isFiniteNum(saved.pitch) ? saved.pitch : 0;
-        p.hp = isFiniteNum(saved.hp) ? saved.hp : 20; 
-        p.stamina = isFiniteNum(saved.stamina) ? saved.stamina : 100;
-        p.hotbarIndex = saved.hotbarIndex || 0;
+      console.log(`[PERSIST] Restoring player ${distinctId}...`);
+      p.x = isFiniteNum(saved.x) ? saved.x : 0;
+      p.y = isFiniteNum(saved.y) ? saved.y : 10;
+      p.z = isFiniteNum(saved.z) ? saved.z : 0;
+      p.yaw = isFiniteNum(saved.yaw) ? saved.yaw : 0;
+      p.pitch = isFiniteNum(saved.pitch) ? saved.pitch : 0;
+      p.hp = isFiniteNum(saved.hp) ? saved.hp : 20;
+      p.stamina = isFiniteNum(saved.stamina) ? saved.stamina : 100;
+      p.hotbarIndex = saved.hotbarIndex || 0;
 
-        // Restore Items
-        (saved.items || []).forEach((savedItem: any) => {
-             const it = new ItemState();
-             it.uid = savedItem.uid;
-             it.kind = savedItem.kind;
-             it.qty = savedItem.qty;
-             it.durability = savedItem.durability || 0;
-             it.maxDurability = savedItem.kind.startsWith("tool:") ? 100 : 0;
-             p.items.set(it.uid, it);
-        });
+      // Restore Items
+      (saved.items || []).forEach((savedItem: any) => {
+        const it = new ItemState();
+        it.uid = savedItem.uid;
+        it.kind = savedItem.kind;
+        it.qty = savedItem.qty;
+        it.durability = savedItem.durability || 0;
+        it.maxDurability = savedItem.maxDurability || (savedItem.kind?.startsWith("tool:") ? 100 : 0);
+        it.meta = savedItem.meta || "";
+        p.items.set(it.uid, it);
+      });
 
-        // Restore Inventory Grid
-        p.inventory.cols = 9; p.inventory.rows = 4;
-        ensureSlotsLength(p); // Ensure array exists first
-        (saved.inventory || []).forEach((uid: string, idx: number) => {
-            if (idx < p.inventory.slots.length) p.inventory.slots[idx] = uid;
-        });
-        
-        // Restore Equip
-        if (saved.equip) {
-            p.equip.tool = saved.equip.tool || "";
-            p.equip.head = saved.equip.head || "";
-            p.equip.chest = saved.equip.chest || "";
-            p.equip.legs = saved.equip.legs || "";
-            p.equip.feet = saved.equip.feet || "";
-            p.equip.offhand = saved.equip.offhand || "";
-        }
+      // Restore Inventory Grid
+      p.inventory.cols = 9;
+      p.inventory.rows = 4;
+      ensureSlotsLength(p);
+      (saved.inventory || []).forEach((uid: string, idx: number) => {
+        if (idx < p.inventory.slots.length) p.inventory.slots[idx] = uid;
+      });
 
+      // Restore Equip
+      if (saved.equip) {
+        p.equip.tool = saved.equip.tool || "";
+        p.equip.head = saved.equip.head || "";
+        p.equip.chest = saved.equip.chest || "";
+        p.equip.legs = saved.equip.legs || "";
+        p.equip.feet = saved.equip.feet || "";
+        p.equip.offhand = saved.equip.offhand || "";
+      }
     } else {
-        // 3. New Player Setup (Starter Gear)
-        console.log(`[PERSIST] New player ${distinctId}, giving starter gear.`);
-        p.x = 0; p.y = 10; p.z = 0;
-        p.yaw = 0; p.pitch = 0;
-        p.maxHp = 20; p.hp = 20;
-        p.maxStamina = 100; p.stamina = 100;
-        
-        p.inventory.cols = 9; p.inventory.rows = 4;
-        ensureSlotsLength(p);
-        p.hotbarIndex = 0;
+      // 3. New Player Setup (Starter Gear)
+      console.log(`[PERSIST] New player ${distinctId}, giving starter gear.`);
+      p.x = 0;
+      p.y = 10;
+      p.z = 0;
+      p.yaw = 0;
+      p.pitch = 0;
+      p.maxHp = 20;
+      p.hp = 20;
+      p.maxStamina = 100;
+      p.stamina = 100;
 
-        const add = (kind: string, qty: number, slotIdx: number) => {
-             const uid = makeUid(client.sessionId, kind.split(":")[1] || "item");
-             const it = new ItemState();
-             it.uid = uid;
-             it.kind = kind;
-             it.qty = qty;
-             if (kind.startsWith("tool:")) {
-                 it.durability = 100;
-                 it.maxDurability = 100;
-             }
-             p.items.set(uid, it);
-             p.inventory.slots[slotIdx] = uid;
-        };
+      p.inventory.cols = 9;
+      p.inventory.rows = 4;
+      ensureSlotsLength(p);
+      p.hotbarIndex = 0;
 
-        add("tool:pickaxe_wood", 1, 0);
-        add("block:dirt", 32, 1);
-        add("block:grass", 16, 2);
+      const add = (kind: string, qty: number, slotIdx: number) => {
+        const uid = makeUid(client.sessionId, kind.split(":")[1] || "item");
+        const it = new ItemState();
+        it.uid = uid;
+        it.kind = kind;
+        it.qty = qty;
+        if (kind.startsWith("tool:")) {
+          it.durability = 100;
+          it.maxDurability = 100;
+        }
+        p.items.set(uid, it);
+        p.inventory.slots[slotIdx] = uid;
+      };
+
+      add("tool:pickaxe_wood", 1, 0);
+      add("block:dirt", 32, 1);
+      add("block:grass", 16, 2);
+
+      // Bonus starter: small planks + sticks for crafting tests
+      add("block:plank", 8, 3);
+      add("item:stick", 8, 4);
     }
 
     syncEquipToolToHotbar(p);
@@ -984,12 +1125,12 @@ export class MyRoom extends Room<MyRoomState> {
 
   public onLeave(client: Client, code: number) {
     console.log(client.sessionId, "left", code);
-    
+
     const p = this.state.players.get(client.sessionId);
     const distinctId = (client as any).auth?.distinctId;
 
     if (p && distinctId) {
-        this.savePlayerData(distinctId, p);
+      this.savePlayerData(distinctId, p);
     }
 
     this.state.players.delete(client.sessionId);
@@ -998,16 +1139,16 @@ export class MyRoom extends Room<MyRoomState> {
 
   public onDispose() {
     console.log("Room disposing...");
-    
+
     // Force Save on Shutdown
     try {
-        if (MyRoom.WORLD.isDirty()) {
-            console.log("[PERSISTENCE] Saving world before shutdown...");
-            MyRoom.WORLD.saveToFileSync(this.worldPath);
-            console.log("[PERSISTENCE] Saved.");
-        }
+      if (MyRoom.WORLD.isDirty()) {
+        console.log("[PERSISTENCE] Saving world before shutdown...");
+        MyRoom.WORLD.saveToFileSync(this.worldPath);
+        console.log("[PERSISTENCE] Saved.");
+      }
     } catch (e) {
-        console.error("[PERSISTENCE] Save failed on dispose:", e);
+      console.error("[PERSISTENCE] Save failed on dispose:", e);
     }
   }
 }

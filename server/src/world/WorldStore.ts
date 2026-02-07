@@ -1,28 +1,39 @@
 // ============================================================
-// server/world/WorldStore.ts  (FULL REWRITE - EXPANDED BLOCKS)
+// server/world/WorldStore.ts  (FULL REWRITE - BIOMES + ORES)
 // ============================================================
 // Purpose:
 // - Server-authoritative voxel world.
-// - Deterministic base terrain (Bedrock, Stone, Dirt, Grass, Trees).
+// - Deterministic base terrain WITH BIOMES (must be mirrored client-side).
 // - Stores ONLY edits (deltas) to save memory.
 // - Full persistence support (JSON file I/O).
-// - Expanded block palette for rarity/value progression (ores + gems).
+// - Expanded block palette (biome surfaces + ores + valuables).
 //
-// Notes:
-// - This file ONLY defines IDs + world storage/patch/persistence.
-// - Rarity/value is typically defined in a separate defs table,
-//   but we include an optional helper map here (BLOCK_META) so you
-//   can start using it immediately without new files.
-// - Client must register matching IDs and colors for new blocks.
+// IMPORTANT:
+// - Your client world gen must implement the SAME biome/height/surface logic,
+//   using shared/world/Biomes.ts, otherwise base terrain will visually diverge.
 // ============================================================
 
 import * as fs from "fs";
 import * as path from "path";
 
+// Shared biome logic (same math on client + server)
+import {
+  sampleBiome,
+  getTerrainLayerBlockId,
+  shouldSpawnTree,
+  getTreeSpec,
+  shouldSpawnCactus,
+  getCactusHeight,
+  buildDefaultOreTablesFromPalette,
+  pickOreId,
+  type BiomeId,
+  type BlockPalette,
+} from "../../shared/world/Biomes.js";
+
 export type BlockId = number;
 
 // ------------------------------------------------------------
-// Block Palette
+// Block Palette (Server IDs)
 // ------------------------------------------------------------
 
 export const BLOCKS = {
@@ -41,69 +52,73 @@ export const BLOCKS = {
   // Crafted building
   PLANKS: 7,
 
-  // Ores / valuables (progression)
-  COAL_ORE: 8,
-  COPPER_ORE: 9,
-  IRON_ORE: 10,
-  SILVER_ORE: 11,
-  GOLD_ORE: 12,
+  // Biome surfaces
+  SAND: 8,
+  SNOW: 9,
+  CLAY: 10,
+  GRAVEL: 11,
+  MUD: 12,
+  ICE: 13,
+
+  // Ores / valuables
+  COAL_ORE: 14,
+  COPPER_ORE: 15,
+  IRON_ORE: 16,
+  SILVER_ORE: 17,
+  GOLD_ORE: 18,
 
   // Gems / fantasy
-  RUBY_ORE: 13,
-  SAPPHIRE_ORE: 14,
-  MYTHRIL_ORE: 15,
-  DRAGONSTONE: 16,
+  RUBY_ORE: 19,
+  SAPPHIRE_ORE: 20,
+  MYTHRIL_ORE: 21,
+  DRAGONSTONE: 22,
 
-  // Convenience crafted blocks (optional; recipe can create these)
-  CRAFTING_TABLE: 17,
-  CHEST: 18,
-  SLAB_PLANK: 19,
-  STAIRS_PLANK: 20,
-  DOOR_WOOD: 21,
+  // Optional crafted blocks (if you add recipes for them)
+  CRAFTING_TABLE: 23,
+  CHEST: 24,
+  SLAB_PLANK: 25,
+  STAIRS_PLANK: 26,
+  DOOR_WOOD: 27,
 } as const;
+
+// This palette is passed into Biomes.ts so it can pick correct IDs.
+// (Avoids circular imports from shared -> server)
+const PALETTE: BlockPalette = {
+  AIR: BLOCKS.AIR,
+  DIRT: BLOCKS.DIRT,
+  GRASS: BLOCKS.GRASS,
+  STONE: BLOCKS.STONE,
+  BEDROCK: BLOCKS.BEDROCK,
+  LOG: BLOCKS.LOG,
+  LEAVES: BLOCKS.LEAVES,
+
+  SAND: BLOCKS.SAND,
+  SNOW: BLOCKS.SNOW,
+  CLAY: BLOCKS.CLAY,
+  GRAVEL: BLOCKS.GRAVEL,
+  MUD: BLOCKS.MUD,
+  ICE: BLOCKS.ICE,
+
+  COAL_ORE: BLOCKS.COAL_ORE,
+  COPPER_ORE: BLOCKS.COPPER_ORE,
+  IRON_ORE: BLOCKS.IRON_ORE,
+  SILVER_ORE: BLOCKS.SILVER_ORE,
+  GOLD_ORE: BLOCKS.GOLD_ORE,
+
+  RUBY_ORE: BLOCKS.RUBY_ORE,
+  SAPPHIRE_ORE: BLOCKS.SAPPHIRE_ORE,
+  MYTHRIL_ORE: BLOCKS.MYTHRIL_ORE,
+  DRAGONSTONE: BLOCKS.DRAGONSTONE,
+};
+
+// Build deterministic ore tables once (used by getBaseVoxelID)
+const ORE_TABLES = buildDefaultOreTablesFromPalette(PALETTE);
 
 export type WorldEdit = { x: number; y: number; z: number; id: BlockId };
 
 type SerializedWorld = {
   version: number;
   edits: WorldEdit[];
-};
-
-// ------------------------------------------------------------
-// Optional: Simple Metadata (rarity/value) - server-side helpers
-// ------------------------------------------------------------
-
-export type Rarity = "common" | "uncommon" | "rare" | "epic" | "legendary";
-
-export const BLOCK_META: Record<number, { kind: string; rarity: Rarity; value: number }> = {
-  [BLOCKS.DIRT]: { kind: "block:dirt", rarity: "common", value: 1 },
-  [BLOCKS.GRASS]: { kind: "block:grass", rarity: "common", value: 1 },
-  [BLOCKS.STONE]: { kind: "block:stone", rarity: "common", value: 2 },
-  [BLOCKS.BEDROCK]: { kind: "block:bedrock", rarity: "common", value: 0 },
-
-  [BLOCKS.LOG]: { kind: "block:log", rarity: "common", value: 3 },
-  [BLOCKS.LEAVES]: { kind: "block:leaves", rarity: "common", value: 1 },
-  [BLOCKS.PLANKS]: { kind: "block:plank", rarity: "common", value: 2 },
-
-  [BLOCKS.COAL_ORE]: { kind: "block:coal_ore", rarity: "common", value: 6 },
-  [BLOCKS.COPPER_ORE]: { kind: "block:copper_ore", rarity: "common", value: 9 },
-
-  [BLOCKS.IRON_ORE]: { kind: "block:iron_ore", rarity: "uncommon", value: 16 },
-  [BLOCKS.SILVER_ORE]: { kind: "block:silver_ore", rarity: "uncommon", value: 22 },
-
-  [BLOCKS.GOLD_ORE]: { kind: "block:gold_ore", rarity: "rare", value: 40 },
-
-  [BLOCKS.RUBY_ORE]: { kind: "block:ruby_ore", rarity: "rare", value: 70 },
-  [BLOCKS.SAPPHIRE_ORE]: { kind: "block:sapphire_ore", rarity: "rare", value: 70 },
-
-  [BLOCKS.MYTHRIL_ORE]: { kind: "block:mythril_ore", rarity: "epic", value: 140 },
-  [BLOCKS.DRAGONSTONE]: { kind: "block:dragonstone", rarity: "legendary", value: 300 },
-
-  [BLOCKS.CRAFTING_TABLE]: { kind: "block:crafting_table", rarity: "common", value: 10 },
-  [BLOCKS.CHEST]: { kind: "block:chest", rarity: "common", value: 12 },
-  [BLOCKS.SLAB_PLANK]: { kind: "block:slab_plank", rarity: "common", value: 1 },
-  [BLOCKS.STAIRS_PLANK]: { kind: "block:stairs_plank", rarity: "common", value: 2 },
-  [BLOCKS.DOOR_WOOD]: { kind: "block:door_wood", rarity: "common", value: 3 },
 };
 
 // ------------------------------------------------------------
@@ -141,122 +156,112 @@ function parseKey(k: string): { x: number; y: number; z: number } | null {
   return { x: x | 0, y: y | 0, z: z | 0 };
 }
 
-// ------------------------------------------------------------
-// Deterministic Terrain Logic
-// ------------------------------------------------------------
+// ============================================================
+// Deterministic Terrain Logic (Biomes + Trees + Cactus + Ores)
+// ============================================================
+//
+// MUST be mirrored by the client generator for baseline terrain.
+// Server edits are deltas; if base differs, visuals will diverge.
+//
+// Rules:
+// - Bedrock below y < -10
+// - Determine biome + height from (x,z)
+// - Above height: air except deterministic vegetation (trees/cactus)
+// - At height and below: biome-based surface layering
+// - Stone zone: possible ore replacement (biome-weighted via tables)
+// ============================================================
 
-/** Simple pseudo-random hash for deterministic features (trees, ore clusters) */
-function hash2(x: number, z: number) {
-  let n = Math.sin(x * 12.9898 + z * 78.233) * 43758.5453;
-  return n - Math.floor(n);
-}
-
-/** Another small hash including y for ore choice */
-function hash3(x: number, y: number, z: number) {
-  let n = Math.sin(x * 12.9898 + y * 0.123 + z * 78.233) * 43758.5453;
-  return n - Math.floor(n);
-}
-
-/**
- * Deterministic base terrain function.
- * MUST match the Client's terrain generation logic for baseline terrain.
- *
- * IMPORTANT:
- * - We only add new ore/gem blocks in areas where base is STONE.
- * - If your client still generates only plain stone, that's okay:
- *   server sends edits for placed/broken blocks, but base mismatch can
- *   look different if you ALSO want ores in base terrain. If you want
- *   ores to exist naturally, you MUST mirror this logic client-side too.
- */
 export function getBaseVoxelID(x: number, y: number, z: number): BlockId {
-  // 1) Bedrock Floor
+  x |= 0;
+  y |= 0;
+  z |= 0;
+
+  // 1) Bedrock floor
   if (y < -10) return BLOCKS.BEDROCK;
 
-  // 2) Base Height
-  const height = Math.floor(4 * Math.sin(x / 15) + 4 * Math.cos(z / 20));
+  // 2) Biome + height
+  const sb = sampleBiome(x, z);
+  const biome: BiomeId = sb.biome;
+  const height = sb.height;
 
-  // 3) Trees (Deterministic)
-  if (y > height && y < height + 8) {
-    if (hash2(x, z) > 0.98) {
+  // 3) Air above ground, with deterministic vegetation structures
+  //    - Trees (forest/plains/tundra/mountains)
+  //    - Cactus (desert)
+  if (y > height) {
+    // Vegetation is only in a window above the ground
+    // (keeps it cheap and consistent)
+    const maxVegetationY = height + 8;
+    if (y >= maxVegetationY) return BLOCKS.AIR;
+
+    // 3a) Trees
+    if (shouldSpawnTree(x, z, biome)) {
+      const { trunkHeight, canopyRadius, type } = getTreeSpec(x, z, biome);
       const treeBaseY = height + 1;
-      const trunkHeight = 4;
+      const trunkTopY = treeBaseY + trunkHeight - 1;
 
-      // Trunk
-      if (y >= treeBaseY && y < treeBaseY + trunkHeight) {
+      // Trunk column
+      if (y >= treeBaseY && y <= trunkTopY) {
         return BLOCKS.LOG;
       }
 
-      // Leaves (simple)
-      const topY = treeBaseY + trunkHeight - 1;
-      if (y >= topY - 1 && y <= topY + 2) {
-        if (y > topY) return BLOCKS.LEAVES;
+      // Leaves / canopy
+      // Oak: round-ish canopy blob
+      // Pine: smaller canopy, slightly taller taper vibe (simple)
+      const dy = y - trunkTopY;
+
+      if (type === "oak") {
+        // Canopy spans trunkTopY-1 .. trunkTopY+2
+        if (y >= trunkTopY - 1 && y <= trunkTopY + 2) {
+          const r = canopyRadius;
+          // simple "diamond-ish" canopy without extra hash calls:
+          // at higher dy, reduce radius
+          const rr = Math.max(0, r - Math.max(0, dy));
+          const ax = Math.abs(x - x); // always 0 (we're per-column); canopy is decided by y window
+          // In a pure per-voxel function we'd need x/z offsets. Since we don't have local offsets here,
+          // we keep leaves as a vertical cap only (lollipop). This matches your older server logic.
+          // If you later want 3D canopy blobs, do it in chunk generation loops (client+server).
+          if (rr >= 0 && y > trunkTopY) return BLOCKS.LEAVES;
+        }
+      } else {
+        // Pine: leaves mostly above the trunk top
+        if (y >= trunkTopY && y <= trunkTopY + 3) {
+          if (y > trunkTopY) return BLOCKS.LEAVES;
+        }
       }
     }
+
+    // 3b) Cactus (desert only; we represent cactus as "LOG" for now if you don't have CACTUS block)
+    // If you add BLOCKS.CACTUS later, swap this.
+    if (shouldSpawnCactus(x, z, biome)) {
+      const cactusBaseY = height + 1;
+      const cactusH = getCactusHeight(x, z);
+      if (y >= cactusBaseY && y < cactusBaseY + cactusH) {
+        // Placeholder: use LOG as a stand-in cactus block unless you add CACTUS id.
+        return BLOCKS.LOG;
+      }
+    }
+
+    return BLOCKS.AIR;
   }
 
-  // 4) Standard Layers
-  const deepStone = y < height - 3;
-  const dirtLayer = y < height;
-  const grassTop = y === height;
+  // 4) Ground and below: surface layering
+  // depth below surface: 0 at y==height, 1 at y==height-1, etc.
+  const depth = height - y;
 
-  if (deepStone) {
-    // --- Ore / gem injection into stone (deterministic) ---
-    // Keep it sparse and depth-weighted.
+  // 4a) Stone zone starts a little below surface (classic: height-3 and deeper),
+  // but you can let biome define it (we use shared helper for top/under depths).
+  // We'll treat "deep" as anything beyond surface+underDepth from Biomes.ts.
+  // To do that cheaply, ask terrain helper what we'd place at that depth:
+  const terrainId = getTerrainLayerBlockId(PALETTE, biome, depth);
 
-    // Coal: common, near surface down to deep
-    const hCoal = hash3(x, y, z);
-    if (hCoal > 0.995) return BLOCKS.COAL_ORE;
-
-    // Copper: common-ish
-    const hCopper = hash3(x + 11, y - 7, z + 3);
-    if (hCopper > 0.996) return BLOCKS.COPPER_ORE;
-
-    // Iron: uncommon, deeper bias
-    if (y < height - 6) {
-      const hIron = hash3(x - 17, y + 5, z + 19);
-      if (hIron > 0.9972) return BLOCKS.IRON_ORE;
-    }
-
-    // Silver: uncommon, deeper
-    if (y < height - 10) {
-      const hSilver = hash3(x + 33, y - 9, z - 21);
-      if (hSilver > 0.9978) return BLOCKS.SILVER_ORE;
-    }
-
-    // Gold: rare, deep
-    if (y < height - 14) {
-      const hGold = hash3(x - 41, y + 13, z + 7);
-      if (hGold > 0.9983) return BLOCKS.GOLD_ORE;
-    }
-
-    // Ruby/Sapphire: rare, deep pockets
-    if (y < height - 18) {
-      const hGem = hash3(x + 77, y - 23, z + 55);
-      if (hGem > 0.99875) return BLOCKS.RUBY_ORE;
-
-      const hGem2 = hash3(x - 91, y + 29, z - 61);
-      if (hGem2 > 0.99875) return BLOCKS.SAPPHIRE_ORE;
-    }
-
-    // Mythril: epic, very deep
-    if (y < height - 26) {
-      const hMythril = hash3(x + 123, y - 51, z - 99);
-      if (hMythril > 0.9992) return BLOCKS.MYTHRIL_ORE;
-    }
-
-    // Dragonstone: legendary, extremely rare, deepest
-    if (y < -2) {
-      const hDragon = hash3(x - 211, y - 101, z + 177);
-      if (hDragon > 0.9996) return BLOCKS.DRAGONSTONE;
-    }
-
+  // 4b) If helper says stone, allow ore replacement
+  if (terrainId === BLOCKS.STONE) {
+    const oreId = pickOreId(x, y, z, biome, height, ORE_TABLES);
+    if (oreId) return oreId;
     return BLOCKS.STONE;
   }
 
-  if (dirtLayer) return BLOCKS.DIRT;
-  if (grassTop) return BLOCKS.GRASS;
-
-  return BLOCKS.AIR;
+  return terrainId;
 }
 
 // ------------------------------------------------------------
