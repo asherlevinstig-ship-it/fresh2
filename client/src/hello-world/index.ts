@@ -1,9 +1,9 @@
 // @ts-nocheck
 /*
- * fresh2 - client main/index (FINAL PRODUCTION VERSION)
+ * fresh2 - client main/index (FINAL PRODUCTION VERSION - OPTION B)
  * -------------------------------------------------------------------
  * INCLUDES:
- * - 3x3 Crafting Grid (Virtual Mapping Strategy)
+ * - 3x3 Crafting Grid (REAL CONTAINER - Minecraft-style)
  * - Inventory UI (Drag & Drop, Logic, Splitting)
  * - Server-Authoritative Logic (Colyseus) with Persistent ID
  * - World Generation (Synced Bedrock/Trees)
@@ -11,6 +11,12 @@
  * - Network Interpolation (Smooth movement)
  * - Debug Console (F4)
  * - Dynamic Environment Switching (Localhost vs Prod)
+ *
+ * CHANGES FOR OPTION B:
+ * - Removed virtual mapping craft indices -> inventory
+ * - Craft slots are REAL: me.craft.slots[0..8] are uid strings like inventory
+ * - Craft preview/result is server-derived: me.craft.resultKind/resultQty/recipeId
+ * - Clicking result sends "craft:take" (server consumes from craft container)
  */
 
 import { Engine } from "noa-engine";
@@ -18,8 +24,11 @@ import * as BABYLON from "babylonjs";
 import * as Colyseus from "colyseus.js";
 
 /* ============================================================
- * 1. RECIPE DATA & SYSTEM (Client-Side Prediction)
+ * 1. RECIPE DATA (Client-Side Optional Reference)
  * ============================================================
+ * NOTE:
+ * - With Option B, crafting result is server authoritative.
+ * - We keep recipes here only for debugging/UI hints if desired.
  */
 
 const RECIPES = [
@@ -52,87 +61,6 @@ const RECIPES = [
   },
 ];
 
-const CraftingSystem = {
-  findMatch(gridKinds) {
-    if (!gridKinds || gridKinds.length !== 9) return null;
-    const nonEmpties = gridKinds.filter((k) => k && k !== "");
-
-    for (const recipe of RECIPES) {
-      if (recipe.type === "shapeless") {
-        if (this.matchesShapeless(nonEmpties, recipe)) return recipe;
-      } else {
-        if (this.matchesShaped(gridKinds, recipe)) return recipe;
-      }
-    }
-    return null;
-  },
-
-  matchesShapeless(inputs, recipe) {
-    if (!recipe.ingredients) return false;
-    if (inputs.length !== recipe.ingredients.length) return false;
-    const remaining = [...inputs];
-    for (const required of recipe.ingredients) {
-      const idx = remaining.indexOf(required);
-      if (idx === -1) return false;
-      remaining.splice(idx, 1);
-    }
-    return true;
-  },
-
-  matchesShaped(grid, recipe) {
-    if (!recipe.pattern || !recipe.key) return false;
-    const matrix = [
-      [grid[0], grid[1], grid[2]],
-      [grid[3], grid[4], grid[5]],
-      [grid[6], grid[7], grid[8]],
-    ];
-    const inputShape = this.trimMatrix(matrix);
-    const recipeMatrix = recipe.pattern.map((row) => row.split(""));
-
-    if (inputShape.length !== recipeMatrix.length) return false;
-    if (!inputShape[0] || inputShape[0].length !== recipeMatrix[0].length) return false;
-
-    for (let r = 0; r < inputShape.length; r++) {
-      for (let c = 0; c < inputShape[0].length; c++) {
-        const inputKind = inputShape[r][c];
-        const keyChar = recipeMatrix[r][c];
-        if (keyChar === " ") {
-          if (inputKind !== "") return false;
-        } else {
-          const expected = recipe.key[keyChar];
-          if (inputKind !== expected) return false;
-        }
-      }
-    }
-    return true;
-  },
-
-  trimMatrix(matrix) {
-    let minR = 3,
-      maxR = -1,
-      minC = 3,
-      maxC = -1;
-    for (let r = 0; r < 3; r++) {
-      for (let c = 0; c < 3; c++) {
-        if (matrix[r][c] !== "") {
-          if (r < minR) minR = r;
-          if (r > maxR) maxR = r;
-          if (c < minC) minC = c;
-          if (c > maxC) maxC = c;
-        }
-      }
-    }
-    if (maxR === -1) return [];
-    const res = [];
-    for (let r = minR; r <= maxR; r++) {
-      const row = [];
-      for (let c = minC; c <= maxC; c++) row.push(matrix[r][c]);
-      res.push(row);
-    }
-    return res;
-  },
-};
-
 /* ============================================================
  * 2. NOA ENGINE SETUP
  * ============================================================
@@ -163,21 +91,23 @@ let inventoryOpen = false;
 
 // Multiplayer
 let colyRoom = null;
-const remotePlayers = {}; // { [sid]: { mesh, targetPos, lastPos } }
+const remotePlayers = {}; // { [sid]: { mesh, targetPos } }
 
-// Client State
+// Client State (mirrors server snapshot)
 const LOCAL_INV = {
   cols: 9,
   rows: 4,
-  slots: [], // uid strings
-  items: {}, // uid -> ItemState
+  slots: [], // uid strings (length 36)
+  items: {}, // uid -> { kind, qty, ... }
   equip: { head: "", chest: "", legs: "", feet: "", tool: "", offhand: "" },
 };
 
-// Crafting State (Virtual Mapping)
+// Crafting State (Option B: real container)
 const LOCAL_CRAFT = {
-  indices: new Array(9).fill(-1), // maps craft slot 0..8 -> inventory index 0..35
-  result: null,
+  slots: new Array(9).fill(""), // uid strings (length 9)
+  resultKind: "",
+  resultQty: 0,
+  recipeId: "",
 };
 
 const LOCAL_HOTBAR = { index: 0 };
@@ -187,7 +117,7 @@ const MESH = {
   weaponRoot: null,
   armR: null,
   tool: null, // FPS
-  avatarRoot: null, // TPS (Local)
+  avatarRoot: null, // TPS (Local) (not used in original, kept for compatibility)
 };
 
 const STATE = {
@@ -305,7 +235,7 @@ function createInventoryOverlay() {
     border: "1px solid #333",
   });
 
-  // 3x3 Grid
+  // 3x3 Craft Grid (REAL craft slots: craft:0..8)
   const craftGrid = document.createElement("div");
   Object.assign(craftGrid.style, {
     display: "grid",
@@ -321,7 +251,7 @@ function createInventoryOverlay() {
     craftCells.push({ cell, icon, qty });
   }
 
-  // Result
+  // Result slot (server-derived preview)
   const resWrap = document.createElement("div");
   const { cell: resCell, icon: resIcon, qty: resQty } = makeSlot("craft:result");
   resCell.style.border = "1px solid #6c6";
@@ -402,6 +332,9 @@ function createInventoryOverlay() {
       fontSize: "10px",
       textAlign: "center",
       pointerEvents: "none",
+      lineHeight: "1.1",
+      padding: "2px",
+      wordBreak: "break-word",
     });
     const qty = document.createElement("div");
     Object.assign(qty.style, {
@@ -415,40 +348,65 @@ function createInventoryOverlay() {
     return { cell, icon, qty };
   }
 
-  function getInvItem(idx) {
-    if (idx < 0 || idx >= LOCAL_INV.slots.length) return null;
-    const uid = LOCAL_INV.slots[idx];
-    return uid ? LOCAL_INV.items[uid] : null;
-  }
-
   function getItemShort(kind) {
     return kind ? kind.split(":")[1] || kind : "";
+  }
+
+  function getItemByUid(uid) {
+    if (!uid) return null;
+    return LOCAL_INV.items[uid] || null;
+  }
+
+  function getUidForSlotId(slotId) {
+    if (!slotId || typeof slotId !== "string") return "";
+    if (slotId.startsWith("inv:")) {
+      const idx = parseInt(slotId.split(":")[1]);
+      if (!Number.isFinite(idx)) return "";
+      return LOCAL_INV.slots[idx] || "";
+    }
+    if (slotId.startsWith("craft:")) {
+      const s = slotId.split(":")[1];
+      if (s === "result") return ""; // result is not a uid slot
+      const idx = parseInt(s);
+      if (!Number.isFinite(idx)) return "";
+      return LOCAL_CRAFT.slots[idx] || "";
+    }
+    if (slotId.startsWith("eq:")) {
+      const key = slotId.split(":")[1];
+      return (LOCAL_INV.equip && LOCAL_INV.equip[key]) || "";
+    }
+    return "";
+  }
+
+  function getItemForSlotId(slotId) {
+    const uid = getUidForSlotId(slotId);
+    return uid ? getItemByUid(uid) : null;
   }
 
   // --- Render Loop ---
   function refresh() {
     // Inventory
     for (let i = 0; i < 36; i++) {
-      const it = getInvItem(i);
+      const uid = LOCAL_INV.slots[i] || "";
+      const it = uid ? LOCAL_INV.items[uid] : null;
       invCells[i].icon.textContent = it ? getItemShort(it.kind) : "";
       invCells[i].qty.textContent = it && it.qty > 1 ? it.qty : "";
-
-      const isCraftUsed = LOCAL_CRAFT.indices.includes(i);
-      invCells[i].cell.style.opacity = isCraftUsed ? "0.3" : "1";
+      invCells[i].cell.style.opacity = "1";
     }
 
-    // Crafting
+    // Crafting grid (REAL slots)
     for (let i = 0; i < 9; i++) {
-      const invIdx = LOCAL_CRAFT.indices[i];
-      const it = getInvItem(invIdx);
+      const uid = LOCAL_CRAFT.slots[i] || "";
+      const it = uid ? LOCAL_INV.items[uid] : null;
       craftCells[i].icon.textContent = it ? getItemShort(it.kind) : "";
       craftCells[i].qty.textContent = it && it.qty > 1 ? it.qty : "";
     }
 
-    // Result
-    const res = LOCAL_CRAFT.result;
-    resIcon.textContent = res ? getItemShort(res.kind) : "";
-    resQty.textContent = res ? res.qty : "";
+    // Result (server-derived preview)
+    const rk = LOCAL_CRAFT.resultKind || "";
+    const rq = LOCAL_CRAFT.resultQty || 0;
+    resIcon.textContent = rk ? getItemShort(rk) : "";
+    resQty.textContent = rk && rq > 1 ? String(rq) : rk && rq === 1 ? "1" : "";
 
     // Equip
     eqKeys.forEach((k) => {
@@ -460,28 +418,21 @@ function createInventoryOverlay() {
   }
 
   // --- Drag & Drop Logic ---
-  const drag = { active: false, srcId: null, invIdx: -1, ghost: null };
+  const drag = { active: false, srcId: null, srcUid: "", ghost: null };
 
   function startDrag(e, slotId) {
-    let it = null;
-    let invIdx = -1;
+    if (!slotId) return;
 
-    if (slotId.startsWith("inv:")) {
-      invIdx = parseInt(slotId.split(":")[1]);
-      if (LOCAL_CRAFT.indices.includes(invIdx)) return; // Locked
-      it = getInvItem(invIdx);
-    } else if (slotId.startsWith("craft:")) {
-      const cIdx = parseInt(slotId.split(":")[1]);
-      if (isNaN(cIdx)) return; // result slot
-      invIdx = LOCAL_CRAFT.indices[cIdx];
-      it = getInvItem(invIdx);
-    }
+    // Cannot drag result slot
+    if (slotId === "craft:result") return;
 
+    const uid = getUidForSlotId(slotId);
+    const it = uid ? getItemByUid(uid) : null;
     if (!it) return;
 
     drag.active = true;
     drag.srcId = slotId;
-    drag.invIdx = invIdx;
+    drag.srcUid = uid;
 
     const g = document.createElement("div");
     g.textContent = getItemShort(it.kind);
@@ -494,6 +445,10 @@ function createInventoryOverlay() {
       zIndex: "10001",
       borderRadius: "4px",
       color: "#fff",
+      maxWidth: "120px",
+      fontSize: "12px",
+      lineHeight: "1.1",
+      wordBreak: "break-word",
     });
     document.body.appendChild(g);
     drag.ghost = g;
@@ -509,72 +464,34 @@ function createInventoryOverlay() {
 
   function endDrag(e) {
     if (!drag.active) return;
-    drag.ghost.remove();
+
+    if (drag.ghost) {
+      try {
+        drag.ghost.remove();
+      } catch (_) {}
+    }
+    drag.ghost = null;
+
+    const srcId = drag.srcId;
     drag.active = false;
+    drag.srcId = null;
 
     const el = document.elementFromPoint(e.clientX, e.clientY);
     const dropSlot = el ? el.closest("[data-id]") : null;
 
-    // Logic:
-    // If drop on Craft Slot -> Map index
-    // If drop on Inv Slot -> Move item (Server)
-    // If drop outside -> Clear craft mapping (if source was craft)
-
-    if (!dropSlot) {
-      if (drag.srcId.startsWith("craft:")) {
-        const cIdx = parseInt(drag.srcId.split(":")[1]);
-        LOCAL_CRAFT.indices[cIdx] = -1;
-        updateCraft();
-        refresh();
-      }
-      return;
-    }
+    // If dropped nowhere, cancel (no local edits; server is authoritative)
+    if (!dropSlot) return;
 
     const destId = dropSlot.dataset.id;
+    if (!destId || destId === srcId) return;
 
-    // 1. Drop onto Crafting Grid
-    if (destId.startsWith("craft:") && !destId.includes("result")) {
-      const cIdx = parseInt(destId.split(":")[1]);
+    // Block moving into result slot
+    if (destId === "craft:result") return;
 
-      // If dragging FROM craft, swap indices
-      if (drag.srcId.startsWith("craft:")) {
-        const oldCIdx = parseInt(drag.srcId.split(":")[1]);
-        const temp = LOCAL_CRAFT.indices[cIdx];
-        LOCAL_CRAFT.indices[cIdx] = LOCAL_CRAFT.indices[oldCIdx];
-        LOCAL_CRAFT.indices[oldCIdx] = temp;
-      } else {
-        // Dragging FROM inv
-        LOCAL_CRAFT.indices[cIdx] = drag.invIdx;
-      }
-      updateCraft();
-      refresh();
-      return;
+    // Send server move (handles swap / merge / equip rules)
+    if (colyRoom) {
+      colyRoom.send("inv:move", { from: srcId, to: destId });
     }
-
-    // 2. Drop onto Inventory
-    if (destId.startsWith("inv:")) {
-      // If coming from Craft, just clear craft slot
-      if (drag.srcId.startsWith("craft:")) {
-        const cIdx = parseInt(drag.srcId.split(":")[1]);
-        LOCAL_CRAFT.indices[cIdx] = -1;
-        updateCraft();
-        refresh();
-        return;
-      }
-      // If coming from Inv, move item
-      if (colyRoom && drag.srcId !== destId) {
-        colyRoom.send("inv:move", { from: drag.srcId, to: destId });
-      }
-    }
-  }
-
-  function updateCraft() {
-    const kinds = LOCAL_CRAFT.indices.map((idx) => {
-      const it = getInvItem(idx);
-      return it ? it.kind : "";
-    });
-    const match = CraftingSystem.findMatch(kinds);
-    LOCAL_CRAFT.result = match ? match.result : null;
   }
 
   // Bind Events
@@ -587,13 +504,14 @@ function createInventoryOverlay() {
   [...invCells, ...craftCells, ...Object.values(eqCells), { cell: resCell }].forEach((o) => {
     o.cell.addEventListener("mousedown", (e) => {
       const id = o.cell.dataset.id;
+
       if (id === "craft:result") {
-        if (LOCAL_CRAFT.result && colyRoom) {
-          colyRoom.send("craft:commit", { srcIndices: LOCAL_CRAFT.indices });
-        }
-      } else {
-        startDrag(e, id);
+        // Clicking result crafts (server authoritative)
+        if (colyRoom) colyRoom.send("craft:take", {});
+        return;
       }
+
+      startDrag(e, id);
     });
   });
 
@@ -633,6 +551,7 @@ function createHotbarUI() {
     padding: "5px",
     background: "rgba(0,0,0,0.5)",
     borderRadius: "8px",
+    zIndex: "9997",
   });
 
   const slots = [];
@@ -656,6 +575,9 @@ function createHotbarUI() {
       color: "white",
       fontSize: "10px",
       textAlign: "center",
+      lineHeight: "1.1",
+      padding: "4px",
+      wordBreak: "break-word",
     });
     const qty = document.createElement("div");
     Object.assign(qty.style, {
@@ -848,25 +770,44 @@ function updateRigAnim(dt) {
 
 function snapshotState(me) {
   if (!me) return;
+
   LOCAL_STATS.hp = me.hp;
   LOCAL_STATS.stamina = me.stamina;
   LOCAL_HOTBAR.index = me.hotbarIndex;
 
-  // FIXED: Pad inventory to 36 slots
+  // Inventory: pad to 36
   const rawSlots = (me.inventory?.slots || []).map(String);
   while (rawSlots.length < 36) rawSlots.push("");
+  if (rawSlots.length > 36) rawSlots.length = 36;
   LOCAL_INV.slots = rawSlots;
 
+  // Items map
   const items = {};
-  if (me.items) me.items.forEach((it, uid) => (items[uid] = { kind: it.kind, qty: it.qty }));
+  if (me.items) {
+    me.items.forEach((it, uid) => {
+      items[uid] = {
+        kind: it.kind,
+        qty: it.qty,
+        durability: it.durability,
+        maxDurability: it.maxDurability,
+        meta: it.meta,
+      };
+    });
+  }
   LOCAL_INV.items = items;
+
+  // Equip
   LOCAL_INV.equip = JSON.parse(JSON.stringify(me.equip || {}));
 
-  // Clean craft indices if item gone
-  for (let i = 0; i < 9; i++) {
-    const idx = LOCAL_CRAFT.indices[i];
-    if (idx !== -1 && !LOCAL_INV.slots[idx]) LOCAL_CRAFT.indices[i] = -1;
-  }
+  // Craft container: pad to 9
+  const craftSlots = (me.craft?.slots || []).map(String);
+  while (craftSlots.length < 9) craftSlots.push("");
+  if (craftSlots.length > 9) craftSlots.length = 9;
+  LOCAL_CRAFT.slots = craftSlots;
+
+  LOCAL_CRAFT.resultKind = String(me.craft?.resultKind || "");
+  LOCAL_CRAFT.resultQty = Number(me.craft?.resultQty || 0) || 0;
+  LOCAL_CRAFT.recipeId = String(me.craft?.recipeId || "");
 
   if (inventoryUI.isOpen()) inventoryUI.refresh();
   hotbarUI.refresh();
@@ -875,7 +816,7 @@ function snapshotState(me) {
 // DYNAMIC ENDPOINT SWITCH (Vercel Frontend -> Colyseus Cloud Backend)
 const ENDPOINT = window.location.hostname.includes("localhost")
   ? "ws://localhost:2567"
-  : "https://us-mia-ea26ba04.colyseus.cloud";
+  : "wss://us-mia-ea26ba04.colyseus.cloud";
 
 const client = new Colyseus.Client(ENDPOINT);
 
@@ -893,32 +834,44 @@ function getDistinctId() {
 // --------------------------------
 
 client
-  .joinOrCreate("my_room", { 
+  .joinOrCreate("my_room", {
     name: "Steve",
-    distinctId: getDistinctId() // <--- Send the persistent ID
+    distinctId: getDistinctId(), // <--- Send the persistent ID
   })
   .then((room) => {
     colyRoom = room;
     uiLog("Connected to Server!");
 
     room.onStateChange((state) => {
-      // 1. Sync Self
+      // 1) Sync Self
       const me = state.players.get(room.sessionId);
       if (me) snapshotState(me);
 
-      // 2. Sync Remotes
+      // 2) Sync Remotes (spawn/update)
       state.players.forEach((p, sid) => {
         if (sid === room.sessionId) return;
+
         if (!remotePlayers[sid]) {
-          // Spawn
           const rig = createAvatar(noa.rendering.getScene());
           remotePlayers[sid] = { mesh: rig.root, targetPos: [p.x, p.y, p.z] };
           uiLog(`Player ${sid} joined`);
         }
-        // Update Target
+
         remotePlayers[sid].targetPos = [p.x, p.y, p.z];
         if (remotePlayers[sid].mesh) remotePlayers[sid].mesh.rotation.y = p.yaw;
       });
+
+      // 3) Cleanup Remotes Not Present
+      for (const sid in remotePlayers) {
+        if (!state.players.has(sid)) {
+          const rp = remotePlayers[sid];
+          try {
+            if (rp.mesh && rp.mesh.dispose) rp.mesh.dispose();
+          } catch (e) {}
+          delete remotePlayers[sid];
+          uiLog(`Player ${sid} left`);
+        }
+      }
     });
 
     room.onMessage("world:patch", (patch) => {
@@ -929,11 +882,30 @@ client
       noa.setBlock(msg.id, msg.x, msg.y, msg.z);
     });
 
+    room.onMessage("block:reject", (msg) => {
+      UI_CONSOLE.warn(`Block rejected: ${msg.reason || "unknown"}`);
+      // Reconcile by requesting a patch around player
+      try {
+        const p = noa.entities.getPosition(noa.playerEntity);
+        room.send("world:patch:req", {
+          x: Math.floor(p[0]),
+          y: Math.floor(p[1]),
+          z: Math.floor(p[2]),
+          r: 24,
+          limit: 8000,
+        });
+      } catch (e) {}
+    });
+
     room.onMessage("craft:success", (msg) => {
-      uiLog(`Crafted: ${msg.item}`);
-      LOCAL_CRAFT.indices.fill(-1); // Clear grid on success
-      LOCAL_CRAFT.result = null;
-      inventoryUI.refresh();
+      uiLog(`Crafted: ${msg.item}${msg.qty ? " x" + msg.qty : ""}`);
+      // No client-side clearing. Server owns craft grid.
+      if (inventoryUI.isOpen()) inventoryUI.refresh();
+      hotbarUI.refresh();
+    });
+
+    room.onMessage("craft:reject", (msg) => {
+      UI_CONSOLE.warn(`Craft rejected: ${msg.reason || "unknown"}`);
     });
   })
   .catch((e) => uiLog(`Connect Error: ${e}`, "red"));
@@ -954,6 +926,7 @@ function setView(mode) {
 // Mouse
 noa.inputs.down.on("fire", () => {
   if (inventoryOpen) return;
+
   STATE.swingT = 0;
   if (colyRoom) colyRoom.send("swing");
 
@@ -967,11 +940,12 @@ noa.inputs.down.on("fire", () => {
 noa.inputs.down.on("alt-fire", () => {
   if (inventoryOpen || !noa.targetedBlock) return;
   const p = noa.targetedBlock.adjacent;
+
   const idx = LOCAL_HOTBAR.index;
   const uid = LOCAL_INV.slots[idx];
   const it = uid ? LOCAL_INV.items[uid] : null;
 
-  if (it && it.kind.startsWith("block:")) {
+  if (it && it.kind && it.kind.startsWith("block:")) {
     let id = 0;
     if (it.kind.includes("dirt")) id = ID.dirt;
     if (it.kind.includes("log")) id = ID.log;
@@ -1011,7 +985,7 @@ window.addEventListener("keydown", (e) => {
 
 // --- RENDER LOOP (FIXED DT CALCULATION) ---
 noa.on("beforeRender", () => {
-  // 1. Ensure Scene Initialized
+  // 1) Ensure Scene Initialized
   if (!STATE.scene) {
     const scene = noa.rendering.getScene();
     if (scene) {
@@ -1022,17 +996,17 @@ noa.on("beforeRender", () => {
     }
   }
 
-  // 2. Robust Delta Time Calculation
+  // 2) Robust Delta Time Calculation
   const now = performance.now();
   const dt = (now - STATE.lastTime) / 1000; // seconds
   STATE.lastTime = now;
 
   if (dt > 0.1) return; // Skip giant lag spikes
 
-  // 3. Update Animations
+  // 3) Update Animations
   updateRigAnim(dt);
 
-  // 4. Network Interpolation
+  // 4) Network Interpolation
   for (const sid in remotePlayers) {
     const rp = remotePlayers[sid];
     if (rp && rp.mesh) {
@@ -1045,7 +1019,7 @@ noa.on("beforeRender", () => {
     }
   }
 
-  // 5. Send Move (Throttle)
+  // 5) Send Move (Throttle)
   STATE.moveAccum += dt;
   if (colyRoom && !inventoryOpen && STATE.moveAccum > 0.05) {
     // 20hz

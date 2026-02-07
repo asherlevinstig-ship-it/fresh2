@@ -1,13 +1,14 @@
 // ============================================================
 // rooms/MyRoom.ts  (FULL REWRITE - NO OMITS)
 // ------------------------------------------------------------
-// Notes:
-// - Colyseus v0.17+ Room generic is NOT "Room<State>".
-// - To avoid TS2559 (MyRoomState vs RoomOptions mismatch), we:
-//   1) import Room/Client from "colyseus" (matches app.config.ts)
-//   2) extend `Room` without generics
-//   3) `declare state: MyRoomState` for strong typing
-// - All original logic preserved.
+// Option B (Minecraft-style crafting container):
+// - Crafting grid is a REAL 3x3 container on PlayerState: p.craft.slots[0..8]
+// - Craft preview/result is server-derived: p.craft.resultKind/resultQty/recipeId
+// - Clicking result triggers server action "craft:take" (consumes from craft grid)
+// - Inventory + equipment logic preserved
+// - Added hardening fixes:
+//   * Block placement consumes EXACT kind from hotbar (prevents kind spoof)
+//   * Crafting uses craft grid state only (no client index mapping)
 // ============================================================
 
 import { Room, Client } from "colyseus";
@@ -24,6 +25,7 @@ import {
   EquipmentState,
 } from "./schema/MyRoomState.js";
 import { CraftingSystem } from "../crafting/CraftingSystem.js";
+import type { CraftingRecipe } from "../crafting/Recipes.js";
 
 // ------------------------------------------------------------
 // Message Types
@@ -50,8 +52,10 @@ type InvSplitMsg = { slot: string };
 type InvConsumeHotbarMsg = { qty?: number };
 type InvAddMsg = { kind: string; qty?: number };
 
-type CraftCommitMsg = { srcIndices: number[] }; // Array of 9 inventory slot indices
+// Option B: client clicks crafting result (server authoritative)
+type CraftTakeMsg = {};
 
+// World/block messages
 type BlockBreakMsg = { x: number; y: number; z: number; src?: string };
 type BlockPlaceMsg = { x: number; y: number; z: number; kind: string; src?: string };
 
@@ -85,8 +89,12 @@ function dist3(ax: number, ay: number, az: number, bx: number, by: number, bz: n
 // ------------------------------------------------------------
 
 type EquipKey = "head" | "chest" | "legs" | "feet" | "tool" | "offhand";
+type CraftKey = { kind: "craft"; index: number };
 
-type SlotRef = { kind: "inv"; index: number } | { kind: "eq"; key: EquipKey };
+type SlotRef =
+  | { kind: "inv"; index: number }
+  | { kind: "eq"; key: EquipKey }
+  | CraftKey;
 
 function parseSlotRef(s: any): SlotRef | null {
   if (typeof s !== "string") return null;
@@ -104,6 +112,12 @@ function parseSlotRef(s: any): SlotRef | null {
     return { kind: "eq", key };
   }
 
+  if (s.startsWith("craft:")) {
+    const idx = Number(s.slice(6));
+    if (!Number.isInteger(idx) || idx < 0 || idx > 8) return null;
+    return { kind: "craft", index: idx };
+  }
+
   return null;
 }
 
@@ -119,14 +133,24 @@ function ensureSlotsLength(p: PlayerState) {
   while (p.inventory.slots.length > total) p.inventory.slots.pop();
 }
 
+function ensureCraftSlotsLength(p: PlayerState) {
+  // Craft slots always 9
+  while (p.craft.slots.length < 9) p.craft.slots.push("");
+  while (p.craft.slots.length > 9) p.craft.slots.pop();
+}
+
 function getSlotUid(p: PlayerState, slot: SlotRef): string {
   if (slot.kind === "inv") {
     ensureSlotsLength(p);
     const total = getTotalSlots(p);
     if (slot.index < 0 || slot.index >= total) return "";
     return String(p.inventory.slots[slot.index] || "");
-  } else {
+  } else if (slot.kind === "eq") {
     return String((p.equip as any)[slot.key] || "");
+  } else {
+    ensureCraftSlotsLength(p);
+    if (slot.index < 0 || slot.index >= 9) return "";
+    return String(p.craft.slots[slot.index] || "");
   }
 }
 
@@ -137,8 +161,12 @@ function setSlotUid(p: PlayerState, slot: SlotRef, uid: string) {
     const total = getTotalSlots(p);
     if (slot.index < 0 || slot.index >= total) return;
     p.inventory.slots[slot.index] = uid;
-  } else {
+  } else if (slot.kind === "eq") {
     (p.equip as any)[slot.key] = uid;
+  } else {
+    ensureCraftSlotsLength(p);
+    if (slot.index < 0 || slot.index >= 9) return;
+    p.craft.slots[slot.index] = uid;
   }
 }
 
@@ -293,6 +321,40 @@ function addKindToInventory(p: PlayerState, kind: string, qty: number) {
   return qty - remaining;
 }
 
+function canAddKindToInventory(p: PlayerState, kind: string, qty: number) {
+  ensureSlotsLength(p);
+  if (!kind || qty <= 0) return true;
+
+  const maxStack = maxStackForKind(kind);
+  let remaining = qty;
+
+  // Space in existing stacks
+  if (maxStack > 1) {
+    for (let i = 0; i < p.inventory.slots.length; i++) {
+      const uid = String(p.inventory.slots[i] || "");
+      if (!uid) continue;
+      const it = p.items.get(uid);
+      if (!it) continue;
+      if (String(it.kind || "") !== kind) continue;
+
+      const cur = isFiniteNum(it.qty) ? it.qty : 0;
+      const space = Math.max(0, maxStack - cur);
+      if (space <= 0) continue;
+
+      const take = Math.min(space, remaining);
+      remaining -= take;
+      if (remaining <= 0) return true;
+    }
+  }
+
+  // Space in empty slots
+  const empties = p.inventory.slots.reduce((acc, uid) => acc + (!String(uid || "") ? 1 : 0), 0);
+  const perSlot = Math.max(1, maxStack);
+  const capacityFromEmpties = empties * perSlot;
+
+  return remaining <= capacityFromEmpties;
+}
+
 function consumeFromHotbar(p: PlayerState, qty: number) {
   ensureSlotsLength(p);
 
@@ -318,6 +380,252 @@ function consumeFromHotbar(p: PlayerState, qty: number) {
   }
 
   return take;
+}
+
+// IMPORTANT: server must only consume the exact kind being placed
+function consumeSpecificFromHotbar(p: PlayerState, kind: string, qty: number) {
+  ensureSlotsLength(p);
+
+  const idx = normalizeHotbarIndex(p.hotbarIndex);
+  const uid = String(p.inventory.slots[idx] || "");
+  if (!uid) return 0;
+
+  const it = p.items.get(uid);
+  if (!it) return 0;
+
+  const curKind = String(it.kind || "");
+  if (curKind !== kind) return 0;
+  if (!isBlockKind(curKind)) return 0;
+
+  const cur = isFiniteNum(it.qty) ? it.qty : 0;
+  if (cur <= 0) return 0;
+
+  const take = Math.min(cur, qty);
+  it.qty = cur - take;
+
+  if (it.qty <= 0) {
+    p.inventory.slots[idx] = "";
+    p.items.delete(uid);
+  }
+
+  return take;
+}
+
+// ------------------------------------------------------------
+// Crafting Helpers (Option B)
+// ------------------------------------------------------------
+
+function getCraftKinds(p: PlayerState): string[] {
+  ensureCraftSlotsLength(p);
+  const kinds: string[] = new Array(9).fill("");
+  for (let i = 0; i < 9; i++) {
+    const uid = String(p.craft.slots[i] || "");
+    if (!uid) {
+      kinds[i] = "";
+      continue;
+    }
+    const it = p.items.get(uid);
+    kinds[i] = it ? String(it.kind || "") : "";
+  }
+  return kinds;
+}
+
+function recomputeCraftResult(p: PlayerState) {
+  ensureCraftSlotsLength(p);
+
+  const kinds = getCraftKinds(p);
+  const match = CraftingSystem.findMatch(kinds);
+
+  if (!match) {
+    p.craft.resultKind = "";
+    p.craft.resultQty = 0;
+    p.craft.recipeId = "";
+    return;
+  }
+
+  p.craft.resultKind = String(match.result.kind || "");
+  p.craft.resultQty = isFiniteNum(match.result.qty) ? match.result.qty : 1;
+  p.craft.recipeId = String(match.id || "");
+}
+
+function craftTrimMatrixWithBounds(matrix: string[][]): { trimmed: string[][]; minR: number; minC: number } | null {
+  let minR = 3,
+    maxR = -1,
+    minC = 3,
+    maxC = -1;
+
+  for (let r = 0; r < 3; r++) {
+    for (let c = 0; c < 3; c++) {
+      if (matrix[r][c] !== "") {
+        if (r < minR) minR = r;
+        if (r > maxR) maxR = r;
+        if (c < minC) minC = c;
+        if (c > maxC) maxC = c;
+      }
+    }
+  }
+
+  if (maxR === -1) return null;
+
+  const trimmed: string[][] = [];
+  for (let r = minR; r <= maxR; r++) {
+    const row: string[] = [];
+    for (let c = minC; c <= maxC; c++) row.push(matrix[r][c]);
+    trimmed.push(row);
+  }
+
+  return { trimmed, minR, minC };
+}
+
+function patternToMatrixAndTrimWithBounds(pattern: string[]): { trimmed: string[][]; minR: number; minC: number } | null {
+  const maxW = Math.max(...pattern.map((r) => r.length));
+  const raw = pattern.map((row) => row.padEnd(maxW, " ").split(""));
+
+  const H = raw.length;
+  const W = maxW;
+
+  let minR = H,
+    maxR = -1,
+    minC = W,
+    maxC = -1;
+
+  // treat " " as empty
+  for (let r = 0; r < H; r++) {
+    for (let c = 0; c < W; c++) {
+      if (raw[r][c] !== " ") {
+        if (r < minR) minR = r;
+        if (r > maxR) maxR = r;
+        if (c < minC) minC = c;
+        if (c > maxC) maxC = c;
+      }
+    }
+  }
+
+  if (maxR === -1) return null;
+
+  const trimmed: string[][] = [];
+  for (let r = minR; r <= maxR; r++) {
+    const row: string[] = [];
+    for (let c = minC; c <= maxC; c++) row.push(raw[r][c]);
+    trimmed.push(row);
+  }
+
+  return { trimmed, minR, minC };
+}
+
+/**
+ * Consume recipe ingredients from the player's REAL craft grid (p.craft.slots).
+ * Assumes recipe match is valid; still performs safety checks.
+ */
+function consumeCraftIngredients(p: PlayerState, recipe: CraftingRecipe): boolean {
+  ensureCraftSlotsLength(p);
+
+  const kinds = getCraftKinds(p);
+
+  // Build 3x3 matrix of kinds
+  const inputMatrix: string[][] = [
+    [kinds[0], kinds[1], kinds[2]],
+    [kinds[3], kinds[4], kinds[5]],
+    [kinds[6], kinds[7], kinds[8]],
+  ];
+
+  if (recipe.type === "shapeless") {
+    if (!recipe.ingredients) return false;
+
+    // Build list of craft indices with their kind
+    const available: { idx: number; kind: string }[] = [];
+    for (let i = 0; i < 9; i++) {
+      const k = kinds[i];
+      if (k) available.push({ idx: i, kind: k });
+    }
+
+    // Must be exact count like matcher does
+    if (available.length !== recipe.ingredients.length) return false;
+
+    // For each required ingredient, find a distinct craft slot
+    const used = new Set<number>();
+    const toConsume: number[] = [];
+
+    for (const req of recipe.ingredients) {
+      let found = -1;
+      for (const a of available) {
+        if (used.has(a.idx)) continue;
+        if (a.kind === req) {
+          found = a.idx;
+          break;
+        }
+      }
+      if (found === -1) return false;
+      used.add(found);
+      toConsume.push(found);
+    }
+
+    // Consume 1 from each chosen craft slot
+    for (const craftIdx of toConsume) {
+      const uid = String(p.craft.slots[craftIdx] || "");
+      if (!uid) return false;
+      const it = p.items.get(uid);
+      if (!it) return false;
+
+      const cur = isFiniteNum(it.qty) ? it.qty : 0;
+      if (cur <= 0) return false;
+
+      it.qty = cur - 1;
+      if (it.qty <= 0) {
+        p.craft.slots[craftIdx] = "";
+        p.items.delete(uid);
+      }
+    }
+
+    return true;
+  }
+
+  // Shaped
+  if (!recipe.pattern || !recipe.key) return false;
+
+  const inTrim = craftTrimMatrixWithBounds(inputMatrix);
+  const patTrim = patternToMatrixAndTrimWithBounds(recipe.pattern);
+
+  if (!inTrim || !patTrim) return false;
+
+  // Dimensions should match if recipe matched
+  if (inTrim.trimmed.length !== patTrim.trimmed.length) return false;
+  if (inTrim.trimmed[0].length !== patTrim.trimmed[0].length) return false;
+
+  // Consume where pattern has non-space characters (using input bounding box offset)
+  for (let r = 0; r < patTrim.trimmed.length; r++) {
+    for (let c = 0; c < patTrim.trimmed[0].length; c++) {
+      const ch = patTrim.trimmed[r][c];
+      if (ch === " ") continue;
+
+      const expectedKind = recipe.key[ch];
+      if (!expectedKind) return false;
+
+      const absR = inTrim.minR + r;
+      const absC = inTrim.minC + c;
+      const craftIdx = absR * 3 + absC;
+      if (craftIdx < 0 || craftIdx > 8) return false;
+
+      const uid = String(p.craft.slots[craftIdx] || "");
+      if (!uid) return false;
+
+      const it = p.items.get(uid);
+      if (!it) return false;
+
+      if (String(it.kind || "") !== expectedKind) return false;
+
+      const cur = isFiniteNum(it.qty) ? it.qty : 0;
+      if (cur <= 0) return false;
+
+      it.qty = cur - 1;
+      if (it.qty <= 0) {
+        p.craft.slots[craftIdx] = "";
+        p.items.delete(uid);
+      }
+    }
+  }
+
+  return true;
 }
 
 // ------------------------------------------------------------
@@ -408,8 +716,11 @@ export class MyRoom extends Room {
     // Explicit conversion logic to avoid TS errors
     const itemsArray = Array.from(p.items.entries()).map((entry: any) => {
       const [uid, item] = entry;
-      return { uid, kind: item.kind, qty: item.qty, durability: item.durability };
+      return { uid, kind: item.kind, qty: item.qty, durability: item.durability, maxDurability: item.maxDurability, meta: item.meta };
     });
+
+    ensureSlotsLength(p);
+    ensureCraftSlotsLength(p);
 
     // Serialize PlayerState to JSON
     const saveData = {
@@ -422,6 +733,7 @@ export class MyRoom extends Room {
       stamina: p.stamina,
       hotbarIndex: p.hotbarIndex,
       inventory: Array.from(p.inventory.slots),
+      craft: Array.from(p.craft.slots),
       items: itemsArray,
       equip: p.equip.toJSON(),
     };
@@ -475,6 +787,7 @@ export class MyRoom extends Room {
 
       this.state.players.forEach((p: PlayerState, sid: string) => {
         ensureSlotsLength(p);
+        ensureCraftSlotsLength(p);
 
         // Clamp stats
         p.maxHp = clamp(isFiniteNum(p.maxHp) ? p.maxHp : 20, 1, 200);
@@ -499,6 +812,10 @@ export class MyRoom extends Room {
         // Sync Equip
         p.hotbarIndex = normalizeHotbarIndex(p.hotbarIndex);
         syncEquipToolToHotbar(p);
+
+        // Keep craft preview accurate (items could be deleted by other logic)
+        // This is cheap (9 slots) and avoids stale result
+        recomputeCraftResult(p);
       });
 
       // Autosave triggered internally by WorldStore logic on dirty + time check
@@ -553,7 +870,7 @@ export class MyRoom extends Room {
     });
 
     // --------------------------------------------------------
-    // Inventory Handlers
+    // Inventory + Craft + Equip Handlers (Unified Move/Split)
     // --------------------------------------------------------
 
     this.onMessage("inv:consumeHotbar", (client: Client, msg: InvConsumeHotbarMsg) => {
@@ -574,6 +891,19 @@ export class MyRoom extends Room {
       syncEquipToolToHotbar(p);
     });
 
+    /**
+     * Move items between:
+     * - inv:* (inventory)
+     * - eq:*  (equipment)
+     * - craft:* (crafting grid)
+     *
+     * Supports:
+     * - swap
+     * - merge stacks (where maxStack > 1 and kinds match)
+     * - equipment compatibility checks
+     *
+     * Crafting preview is recomputed when craft slots are involved.
+     */
     this.onMessage("inv:move", (client: Client, msg: InvMoveMsg) => {
       const p = this.state.players.get(client.sessionId);
       if (!p) return;
@@ -583,10 +913,15 @@ export class MyRoom extends Room {
       if (!from || !to) return;
 
       ensureSlotsLength(p);
+      ensureCraftSlotsLength(p);
+
       const total = getTotalSlots(p);
 
       if (from.kind === "inv" && (from.index < 0 || from.index >= total)) return;
       if (to.kind === "inv" && (to.index < 0 || to.index >= total)) return;
+
+      if (from.kind === "craft" && (from.index < 0 || from.index >= 9)) return;
+      if (to.kind === "craft" && (to.index < 0 || to.index >= 9)) return;
 
       const fromUid = getSlotUid(p, from);
       const toUid = getSlotUid(p, to);
@@ -603,17 +938,27 @@ export class MyRoom extends Room {
         if (toItem && !isEquipSlotCompatible(to.key, String(toItem.kind || ""))) return;
       }
 
-      // Swap
+      // If moving to craft slot, allow anything (blocks/items/tools) by default.
+      // If you want to restrict (e.g., only craftable ingredients), add checks here.
+
+      // Empty destination: direct move
       if (!toUid) {
         setSlotUid(p, to, fromUid);
         setSlotUid(p, from, "");
         syncEquipToolToHotbar(p);
+
+        // Craft preview update if craft involved
+        if (from.kind === "craft" || to.kind === "craft") recomputeCraftResult(p);
         return;
       }
+
+      // Empty source: direct move (rare, but symmetric)
       if (!fromUid) {
         setSlotUid(p, from, toUid);
         setSlotUid(p, to, "");
         syncEquipToolToHotbar(p);
+
+        if (from.kind === "craft" || to.kind === "craft") recomputeCraftResult(p);
         return;
       }
 
@@ -634,18 +979,27 @@ export class MyRoom extends Room {
               setSlotUid(p, from, "");
               p.items.delete(fromUid);
             }
+
             syncEquipToolToHotbar(p);
+            if (from.kind === "craft" || to.kind === "craft") recomputeCraftResult(p);
             return;
           }
         }
       }
 
-      // Direct Swap
+      // Direct swap
       setSlotUid(p, to, fromUid);
       setSlotUid(p, from, toUid);
       syncEquipToolToHotbar(p);
+
+      if (from.kind === "craft" || to.kind === "craft") recomputeCraftResult(p);
     });
 
+    /**
+     * Split a stack in an inventory slot into an empty inventory slot.
+     * (Original behavior preserved: only supports inv slots, not craft slots.)
+     * If you'd like Minecraft-style right-click behavior into craft slots, we'll add a separate message for it.
+     */
     this.onMessage("inv:split", (client: Client, msg: InvSplitMsg) => {
       const p = this.state.players.get(client.sessionId);
       if (!p) return;
@@ -688,75 +1042,81 @@ export class MyRoom extends Room {
     });
 
     // --------------------------------------------------------
-    // Crafting Handler
+    // Crafting Handler (Option B)
     // --------------------------------------------------------
 
-    this.onMessage("craft:commit", (client: Client, msg: CraftCommitMsg) => {
+    /**
+     * Client clicks the crafting result slot.
+     * Server validates current craft grid, consumes ingredients from craft grid,
+     * and adds the result to inventory (if there is space).
+     */
+    this.onMessage("craft:take", (client: Client, _msg: CraftTakeMsg) => {
       const p = this.state.players.get(client.sessionId);
       if (!p) return;
 
-      const indices = msg?.srcIndices;
-      if (!Array.isArray(indices) || indices.length !== 9) {
-        console.log(`[CRAFT] Invalid indices from ${client.sessionId}`);
-        return;
-      }
-
-      // 1. Resolve Items from 3x3 Grid
-      const kinds: string[] = [];
-      const validSlotIndices: number[] = [];
-
+      ensureCraftSlotsLength(p);
       ensureSlotsLength(p);
 
-      for (let i = 0; i < 9; i++) {
-        const slotIdx = indices[i];
-        if (slotIdx === -1) {
-          kinds.push("");
-          continue;
-        }
+      // Recompute to ensure preview is current and authoritative
+      recomputeCraftResult(p);
 
-        if (slotIdx < 0 || slotIdx >= p.inventory.slots.length) {
-          console.log(`[CRAFT] Index out of bounds: ${slotIdx}`);
-          return;
-        }
+      const resultKind = String(p.craft.resultKind || "");
+      const resultQty = isFiniteNum(p.craft.resultQty) ? p.craft.resultQty : 0;
 
-        const uid = p.inventory.slots[slotIdx];
-        const item = uid ? p.items.get(uid) : null;
-
-        if (!uid || !item) {
-          console.log(`[CRAFT] Slot mismatch/empty: ${slotIdx}`);
-          return;
-        }
-
-        kinds.push(item.kind);
-        validSlotIndices.push(slotIdx);
-      }
-
-      // 2. Check Match
-      const match = CraftingSystem.findMatch(kinds);
-      if (!match) {
-        console.log(`[CRAFT] No match for ${client.sessionId}`);
+      if (!resultKind || resultQty <= 0) {
+        console.log(`[CRAFT] No craft result for ${client.sessionId}`);
+        client.send("craft:reject", { reason: "no_result" });
         return;
       }
 
-      // 3. Consume Ingredients
-      for (const slotIdx of validSlotIndices) {
-        const uid = p.inventory.slots[slotIdx];
-        const it = p.items.get(uid);
-        if (it) {
-          it.qty -= 1;
-          if (it.qty <= 0) {
-            p.inventory.slots[slotIdx] = "";
-            p.items.delete(uid);
-          }
-        }
+      // Find the matching recipe based on current craft grid
+      const kinds = getCraftKinds(p);
+      const match = CraftingSystem.findMatch(kinds);
+
+      if (!match) {
+        // Preview stale or manipulated
+        p.craft.resultKind = "";
+        p.craft.resultQty = 0;
+        p.craft.recipeId = "";
+        client.send("craft:reject", { reason: "no_match" });
+        return;
       }
 
-      // 4. Add Result
-      addKindToInventory(p, match.result.kind, match.result.qty);
-      syncEquipToolToHotbar(p);
+      // Ensure the match result equals the preview (consistency)
+      if (String(match.result.kind || "") !== resultKind || (match.result.qty || 0) !== resultQty) {
+        recomputeCraftResult(p);
+        client.send("craft:reject", { reason: "result_changed" });
+        return;
+      }
 
-      console.log(`[CRAFT] ${client.sessionId} crafted ${match.result.kind} x${match.result.qty}`);
-      client.send("craft:success", { item: match.result.kind });
+      // Ensure inventory has space BEFORE consuming
+      if (!canAddKindToInventory(p, resultKind, resultQty)) {
+        client.send("craft:reject", { reason: "inventory_full" });
+        return;
+      }
+
+      // Consume from craft grid
+      const ok = consumeCraftIngredients(p, match);
+      if (!ok) {
+        // If consumption failed, recompute preview and reject
+        recomputeCraftResult(p);
+        client.send("craft:reject", { reason: "consume_failed" });
+        return;
+      }
+
+      // Add result
+      const added = addKindToInventory(p, resultKind, resultQty);
+      if (added !== resultQty) {
+        // This should not happen due to canAddKindToInventory, but keep it safe:
+        // We do not attempt rollback here; we just warn and resync via recompute.
+        console.warn(`[CRAFT] Unexpected partial add for ${client.sessionId}: ${added}/${resultQty}`);
+      }
+
+      syncEquipToolToHotbar(p);
+      recomputeCraftResult(p);
+
+      console.log(`[CRAFT] ${client.sessionId} crafted ${resultKind} x${resultQty}`);
+      client.send("craft:success", { item: resultKind, qty: resultQty });
     });
 
     // --------------------------------------------------------
@@ -893,10 +1253,10 @@ export class MyRoom extends Room {
         return;
       }
 
-      // Consume
-      const took = consumeFromHotbar(p, 1);
+      // Consume EXACT kind from hotbar (prevents spoof)
+      const took = consumeSpecificFromHotbar(p, kind, 1);
       if (took <= 0) {
-        reject(client, "no_blocks_in_hotbar", { op: "place", src });
+        reject(client, "no_matching_block_in_hotbar", { op: "place", src, kind });
         return;
       }
 
@@ -945,7 +1305,8 @@ export class MyRoom extends Room {
         it.kind = savedItem.kind;
         it.qty = savedItem.qty;
         it.durability = savedItem.durability || 0;
-        it.maxDurability = savedItem.kind.startsWith("tool:") ? 100 : 0;
+        it.maxDurability = savedItem.maxDurability || (savedItem.kind?.startsWith("tool:") ? 100 : 0);
+        it.meta = savedItem.meta || "";
         p.items.set(it.uid, it);
       });
 
@@ -955,6 +1316,12 @@ export class MyRoom extends Room {
       ensureSlotsLength(p); // Ensure array exists first
       (saved.inventory || []).forEach((uid: string, idx: number) => {
         if (idx < p.inventory.slots.length) p.inventory.slots[idx] = uid;
+      });
+
+      // Restore Craft Grid (Option B)
+      ensureCraftSlotsLength(p);
+      (saved.craft || []).forEach((uid: string, idx: number) => {
+        if (idx >= 0 && idx < 9) p.craft.slots[idx] = String(uid || "");
       });
 
       // Restore Equip
@@ -984,6 +1351,8 @@ export class MyRoom extends Room {
       ensureSlotsLength(p);
       p.hotbarIndex = 0;
 
+      ensureCraftSlotsLength(p);
+
       const add = (kind: string, qty: number, slotIdx: number) => {
         const uid = makeUid(client.sessionId, kind.split(":")[1] || "item");
         const it = new ItemState();
@@ -1004,6 +1373,8 @@ export class MyRoom extends Room {
     }
 
     syncEquipToolToHotbar(p);
+    recomputeCraftResult(p);
+
     this.state.players.set(client.sessionId, p);
 
     client.send("welcome", { roomId: this.roomId, sessionId: client.sessionId });

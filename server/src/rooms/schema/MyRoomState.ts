@@ -1,60 +1,47 @@
 // ============================================================
-// schema/MyRoomState.ts  (FULL REWRITE - NO OMITS)
+// rooms/schema/MyRoomState.ts  (FULL REWRITE - NO OMITS)
 // ------------------------------------------------------------
-// Includes:
-// - Player transform (x,y,z,yaw,pitch)
-// - Stats (hp/stamina + sprint/swing flags)
-// - Hotbar selection (0..8)
-// - Inventory: fixed grid (cols/rows + slots = item uid or "")
-// - Equipment: references item uids
-// - Items: MapSchema of ItemState keyed by uid
+// Minecraft-style crafting container (Option B):
+// - Each player has a REAL 3x3 craft grid: craft.slots[0..8] (uid strings)
+// - Craft result is server-derived fields on craft: resultKind/resultQty (optional recipeId)
+// - Inventory remains 9x4 (36) uid slots + items Map(uid->ItemState) like before
 // ============================================================
 
 import { Schema, type, MapSchema, ArraySchema } from "@colyseus/schema";
 
-/** One item stack or equipment instance */
+// ------------------------------------------------------------
+// Item State
+// ------------------------------------------------------------
+
 export class ItemState extends Schema {
-  /** Unique item instance id (also used as key in PlayerState.items) */
   @type("string") uid: string = "";
-
-  /** Item kind/type id e.g. "block:dirt", "tool:pickaxe_wood" */
   @type("string") kind: string = "";
-
-  /** Stack quantity (tools usually 1) */
   @type("number") qty: number = 0;
 
-  /** Durability for tools (0..maxDurability) */
+  // Optional tool stats
   @type("number") durability: number = 0;
-
-  /** Max durability for tools */
   @type("number") maxDurability: number = 0;
 
-  /** Optional metadata (simple string; upgrade later if needed) */
+  // Optional metadata (e.g., custom name, enchant tags, etc.)
   @type("string") meta: string = "";
 }
 
-/** Fixed-size inventory grid */
-export class InventoryState extends Schema {
-  /** Grid columns (Minecraft-style default 9) */
-  @type("number") cols: number = 9;
+// ------------------------------------------------------------
+// Inventory State (uid references into items map)
+// ------------------------------------------------------------
 
-  /** Grid rows (default 4 -> 36 slots) */
+export class InventoryState extends Schema {
+  @type("number") cols: number = 9;
   @type("number") rows: number = 4;
 
-  /**
-   * Slot contents: item uid OR "" for empty.
-   * Length should be cols*rows (server enforces).
-   */
+  // Each entry is an ItemState.uid or "" for empty
   @type(["string"]) slots: ArraySchema<string> = new ArraySchema<string>();
-
-  constructor() {
-    super();
-    const total = 9 * 4;
-    for (let i = 0; i < total; i++) this.slots.push("");
-  }
 }
 
-/** Equipment slots hold item uids (must exist in PlayerState.items) */
+// ------------------------------------------------------------
+// Equipment State (uid references into items map)
+// ------------------------------------------------------------
+
 export class EquipmentState extends Schema {
   @type("string") head: string = "";
   @type("string") chest: string = "";
@@ -64,43 +51,81 @@ export class EquipmentState extends Schema {
   @type("string") offhand: string = "";
 }
 
-/** Player replicated state */
+// ------------------------------------------------------------
+// Crafting State (Option B - real container)
+// ------------------------------------------------------------
+
+export class CraftingState extends Schema {
+  // 3x3 grid: slots 0..8 (uid references into items map), "" for empty
+  @type(["string"]) slots: ArraySchema<string> = new ArraySchema<string>();
+
+  // Server-derived preview
+  @type("string") resultKind: string = "";
+  @type("number") resultQty: number = 0;
+
+  // Optional: store the matched recipe id for debugging/UI hints
+  @type("string") recipeId: string = "";
+
+  constructor() {
+    super();
+    // Ensure exactly 9 slots exist by default
+    for (let i = 0; i < 9; i++) this.slots.push("");
+  }
+}
+
+// ------------------------------------------------------------
+// Player State
+// ------------------------------------------------------------
+
 export class PlayerState extends Schema {
+  // Identity
   @type("string") id: string = "";
   @type("string") name: string = "Steve";
 
-  // transform
+  // Transform
   @type("number") x: number = 0;
-  @type("number") y: number = 0;
+  @type("number") y: number = 10;
   @type("number") z: number = 0;
-
   @type("number") yaw: number = 0;
   @type("number") pitch: number = 0;
 
-  // stats
+  // Stats
   @type("number") hp: number = 20;
   @type("number") maxHp: number = 20;
 
   @type("number") stamina: number = 100;
   @type("number") maxStamina: number = 100;
 
+  // Actions
   @type("boolean") sprinting: boolean = false;
   @type("boolean") swinging: boolean = false;
 
-  // hotbar selection (0..8)
+  // Hotbar selection index (0..8)
   @type("number") hotbarIndex: number = 0;
 
-  // items owned by player (key = uid)
+  // Containers
+  @type(InventoryState) inventory: InventoryState = new InventoryState();
+  @type(EquipmentState) equip: EquipmentState = new EquipmentState();
+  @type(CraftingState) craft: CraftingState = new CraftingState();
+
+  // Items: uid -> ItemState
   @type({ map: ItemState }) items: MapSchema<ItemState> = new MapSchema<ItemState>();
 
-  // inventory grid
-  @type(InventoryState) inventory: InventoryState = new InventoryState();
+  constructor() {
+    super();
 
-  // equipped uids
-  @type(EquipmentState) equip: EquipmentState = new EquipmentState();
+    // Initialize inventory slots (default 9x4 = 36)
+    // Your server already has ensureSlotsLength(), but having a baseline helps clients.
+    const total = Math.max(1, (this.inventory.cols || 9) * (this.inventory.rows || 4));
+    for (let i = 0; i < total; i++) this.inventory.slots.push("");
+  }
 }
 
-/** Room state */
+// ------------------------------------------------------------
+// Room State
+// ------------------------------------------------------------
+
 export class MyRoomState extends Schema {
+  // sessionId -> PlayerState
   @type({ map: PlayerState }) players: MapSchema<PlayerState> = new MapSchema<PlayerState>();
 }
