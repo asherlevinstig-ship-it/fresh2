@@ -26,9 +26,8 @@ import {
   getCactusHeight,
   buildDefaultOreTablesFromPalette,
   pickOreId,
-  type BiomeId,
-  type BlockPalette,
-} from "../../shared/world/Biomes.js";
+} from "./Biomes.js";
+
 
 export type BlockId = number;
 
