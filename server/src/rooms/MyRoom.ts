@@ -1,33 +1,24 @@
 // ============================================================
-// rooms/MyRoom.ts  (FULL REWRITE - NO OMITS, CLEAN + COMPLETE)
+// rooms/MyRoom.ts  (FULL REWRITE - NO OMITS, NO craft:commit)
 // ------------------------------------------------------------
-// Features (ALL LOGIC PRESERVED + Minecraft Inventory UX):
-// - Colyseus Room (no generics) + typed `declare state: MyRoomState`
-// - Persistent world (WorldStore) autosave + onDispose save
-// - Persistent players (players.json) incl inventory/items/equip/craft/cursor
-// - Movement, sprint stamina drain/regen, swing stamina cost, hotbar equip sync
-// - Inventory add/consume helpers, stacking rules, equip compatibility rules
-// - Option B Crafting: REAL craft container p.craft.slots[0..8] (uid strings)
-//   - Server-derived preview: p.craft.resultKind/resultQty/recipeId
-//   - Craft result click: "craft:take" puts result into CURSOR (Minecraft-like)
-// - Minecraft cursor (server authoritative):
-//   - "slot:click" (left): pickup/place/merge/swap
-//   - "slot:rclick" (right): pickup half / place 1 / swap on mismatch
-//   - "slot:dblclick": collect matching stacks into cursor (from inv + craft)
-// - Legacy messages preserved:
-//   - inv:move (drag/drop) across inv/eq/craft
-//   - inv:split (inv only) half -> first empty inv slot
-//   - inv:add, inv:consumeHotbar
-// - World patch request + block break/place with reach & rate limit
-//   - Place consumes EXACT kind from hotbar
+// - Colyseus v0.17+ Room generic is NOT "Room<State>".
+// - Extend `Room` without generics; `declare state: MyRoomState` for typing.
+// - Server-authoritative inventory + Minecraft cursor + Option B crafting.
+// - IMPORTANT: The old virtual-mapping crafting message ("craft:commit") is
+//   REMOVED ENTIRELY. Crafting uses craft:* slots + craft:take.
 // ============================================================
 
 import { Room, Client } from "colyseus";
 import * as fs from "fs";
 import * as path from "path";
 
+// Imports with .js extensions for Node16/NodeNext resolution
 import { WorldStore, BLOCKS, type BlockId } from "../world/WorldStore.js";
-import { MyRoomState, PlayerState, ItemState } from "./schema/MyRoomState.js";
+import {
+  MyRoomState,
+  PlayerState,
+  ItemState,
+} from "./schema/MyRoomState.js";
 import { CraftingSystem } from "../crafting/CraftingSystem.js";
 import type { CraftingRecipe } from "../crafting/Recipes.js";
 
@@ -304,7 +295,7 @@ function addKindToInventory(p: PlayerState, kind: string, qty: number) {
   const maxStack = maxStackForKind(kind);
   let remaining = qty;
 
-  // 1) Stack into existing slots
+  // 1) Stack into existing stacks
   while (remaining > 0) {
     const stackUid = findStackableUid(p, kind);
     if (!stackUid) break;
@@ -321,7 +312,7 @@ function addKindToInventory(p: PlayerState, kind: string, qty: number) {
     remaining -= add;
   }
 
-  // 2) New stacks in empty slots
+  // 2) Create new stacks
   while (remaining > 0) {
     const idx = firstEmptyInvIndex(p);
     if (idx === -1) break;
@@ -435,7 +426,6 @@ function recomputeCraftResult(p: PlayerState) {
   p.craft.recipeId = String(match.id || "");
 }
 
-/** Trim input 3x3 matrix to bounding box and return bounds */
 function trimMatrixWithBounds(matrix: string[][]): { trimmed: string[][]; minR: number; minC: number } | null {
   let minR = 3,
     maxR = -1,
@@ -465,23 +455,17 @@ function trimMatrixWithBounds(matrix: string[][]): { trimmed: string[][]; minR: 
   return { trimmed, minR, minC };
 }
 
-/**
- * Consume recipe ingredients from the player's craft container (p.craft.slots).
- * Assumes CraftingSystem matched; still performs sanity checks.
- */
 function consumeCraftIngredients(p: PlayerState, recipe: CraftingRecipe): boolean {
   ensureCraftSlotsLength(p);
 
   const kinds = getCraftKinds(p);
 
-  // Shapeless: consume 1 from any matching slot per ingredient
   if (recipe.type === "shapeless") {
     if (!recipe.ingredients) return false;
 
     const available: { idx: number; kind: string }[] = [];
-    for (let i = 0; i < 9; i++) {
-      if (kinds[i]) available.push({ idx: i, kind: kinds[i] });
-    }
+    for (let i = 0; i < 9; i++) if (kinds[i]) available.push({ idx: i, kind: kinds[i] });
+
     if (available.length !== recipe.ingredients.length) return false;
 
     const used = new Set<number>();
@@ -521,7 +505,6 @@ function consumeCraftIngredients(p: PlayerState, recipe: CraftingRecipe): boolea
     return true;
   }
 
-  // Shaped: align trimmed input bounding box to recipe matrix dimensions
   if (!recipe.pattern || !recipe.key) return false;
 
   const inputMatrix: string[][] = [
@@ -538,7 +521,7 @@ function consumeCraftIngredients(p: PlayerState, recipe: CraftingRecipe): boolea
   if (inTrim.trimmed.length !== recipeMatrix.length) return false;
   if (!inTrim.trimmed[0] || inTrim.trimmed[0].length !== recipeMatrix[0].length) return false;
 
-  // Consume exactly the pattern's non-space positions inside the input's bounding box
+  // Consume only non-space pattern positions
   for (let r = 0; r < recipeMatrix.length; r++) {
     for (let c = 0; c < recipeMatrix[0].length; c++) {
       const keyChar = recipeMatrix[r][c];
@@ -580,7 +563,7 @@ function consumeCraftIngredients(p: PlayerState, recipe: CraftingRecipe): boolea
 // ------------------------------------------------------------
 
 type CursorPayload = {
-  uid?: string; // for tools (non-stackables) we keep original uid
+  uid?: string;
   durability?: number;
   maxDurability?: number;
   itemMeta?: string;
@@ -634,7 +617,6 @@ function createItemFromCursor(p: PlayerState, ownerSessionId: string, kind: stri
   it.kind = String(kind || "");
   it.qty = Math.max(0, Math.floor(Number(qty) || 0));
 
-  // Restore tool details if provided in cursor meta
   if (maxStackForKind(it.kind) <= 1) {
     const meta = cursorGetMeta(p);
     it.durability = isFiniteNum(meta.durability) ? meta.durability! : 0;
@@ -651,7 +633,6 @@ function canPlaceCursorIntoEquip(p: PlayerState, eqKey: EquipKey) {
   return isEquipSlotCompatible(eqKey, String(p.cursor.kind || ""));
 }
 
-/** Pickup FULL stack from slot into cursor (left click on slot while cursor empty) */
 function cursorPickupFullFromSlot(p: PlayerState, slot: SlotRef) {
   const uid = getSlotUid(p, slot);
   if (!uid) return;
@@ -665,7 +646,6 @@ function cursorPickupFullFromSlot(p: PlayerState, slot: SlotRef) {
 
   const maxS = maxStackForKind(kind);
 
-  // Tool (non-stackable): keep uid in cursor meta, do NOT delete item
   if (maxS <= 1) {
     cursorSetStack(p, kind, 1, {
       uid: String(it.uid || uid),
@@ -677,13 +657,11 @@ function cursorPickupFullFromSlot(p: PlayerState, slot: SlotRef) {
     return;
   }
 
-  // Stackable: move stack to cursor; delete item state
   cursorSetStack(p, kind, qty);
   setSlotUid(p, slot, "");
   p.items.delete(uid);
 }
 
-/** Place FULL cursor stack into an EMPTY slot */
 function cursorPlaceFullIntoEmptySlot(p: PlayerState, client: Client, slot: SlotRef) {
   const cKind = String(p.cursor.kind || "");
   const cQty = isFiniteNum(p.cursor.qty) ? p.cursor.qty : 0;
@@ -691,7 +669,6 @@ function cursorPlaceFullIntoEmptySlot(p: PlayerState, client: Client, slot: Slot
 
   const maxC = maxStackForKind(cKind);
 
-  // Tool: reattach existing uid
   if (maxC <= 1 && cursorIsToolHoldingUid(p)) {
     const meta = cursorGetMeta(p);
     const uid = String(meta.uid || "");
@@ -708,13 +685,11 @@ function cursorPlaceFullIntoEmptySlot(p: PlayerState, client: Client, slot: Slot
     return;
   }
 
-  // Stackable: create new item stack
   const uid = createItemFromCursor(p, client.sessionId, cKind, cQty);
   setSlotUid(p, slot, uid);
   cursorClear(p);
 }
 
-/** Attempt to merge cursor stack into slot stack (same kind, stackable). Returns true if handled. */
 function cursorTryMergeIntoSlot(p: PlayerState, slot: SlotRef): boolean {
   const uid = getSlotUid(p, slot);
   if (!uid) return false;
@@ -735,7 +710,7 @@ function cursorTryMergeIntoSlot(p: PlayerState, slot: SlotRef): boolean {
   if (maxS <= 1) return false;
 
   const space = Math.max(0, maxS - sQty);
-  if (space <= 0) return true; // nothing to do but considered handled
+  if (space <= 0) return true;
 
   const moved = Math.min(space, cQty);
   it.qty = sQty + moved;
@@ -745,7 +720,6 @@ function cursorTryMergeIntoSlot(p: PlayerState, slot: SlotRef): boolean {
   return true;
 }
 
-/** Swap cursor stack with slot stack (full swap, Minecraft left click mismatch) */
 function cursorSwapWithSlot(p: PlayerState, client: Client, slot: SlotRef) {
   const slotUid = getSlotUid(p, slot);
   const slotItem = slotUid ? p.items.get(slotUid) : null;
@@ -756,13 +730,11 @@ function cursorSwapWithSlot(p: PlayerState, client: Client, slot: SlotRef) {
 
   if (!cKind0 || cQty0 <= 0) return;
 
-  // If slot is empty, swap degenerates to place full
   if (!slotUid || !slotItem) {
     cursorPlaceFullIntoEmptySlot(p, client, slot);
     return;
   }
 
-  // Capture slot stack for new cursor
   const sKind = String(slotItem.kind || "");
   const sQty = isFiniteNum(slotItem.qty) ? slotItem.qty : 0;
   const sMax = maxStackForKind(sKind);
@@ -781,18 +753,15 @@ function cursorSwapWithSlot(p: PlayerState, client: Client, slot: SlotRef) {
         maxDurability: isFiniteNum(slotItem.maxDurability) ? slotItem.maxDurability : 0,
         itemMeta: String(slotItem.meta || ""),
       };
-      // remove slot binding only (keep tool item)
       setSlotUid(p, slot, "");
     } else {
       newCursorKind = sKind;
       newCursorQty = sQty;
-      // remove slot binding + delete item state (cursor will hold it)
       setSlotUid(p, slot, "");
       p.items.delete(slotUid);
     }
   }
 
-  // Place old cursor into slot (recreate stack or reattach tool uid)
   const maxC = maxStackForKind(cKind0);
   if (maxC <= 1 && cMeta0.uid) {
     const uid = String(cMeta0.uid || "");
@@ -809,11 +778,9 @@ function cursorSwapWithSlot(p: PlayerState, client: Client, slot: SlotRef) {
     setSlotUid(p, slot, uidPlaced);
   }
 
-  // Now cursor becomes former slot stack
   cursorSetStack(p, newCursorKind, newCursorQty, newCursorMeta);
 }
 
-/** Right-click pickup HALF (ceil) from slot into cursor while cursor empty */
 function cursorPickupHalfFromSlot(p: PlayerState, slot: SlotRef) {
   const uid = getSlotUid(p, slot);
   if (!uid) return;
@@ -827,7 +794,6 @@ function cursorPickupHalfFromSlot(p: PlayerState, slot: SlotRef) {
 
   const maxS = maxStackForKind(kind);
 
-  // Tool: behaves like pickup full
   if (maxS <= 1) {
     cursorPickupFullFromSlot(p, slot);
     return;
@@ -846,7 +812,6 @@ function cursorPickupHalfFromSlot(p: PlayerState, slot: SlotRef) {
   }
 }
 
-/** Right-click place ONE item from cursor into slot (empty or same-kind stack). Returns true if handled. */
 function cursorPlaceOneIntoSlot(p: PlayerState, client: Client, slot: SlotRef): boolean {
   const cKind = String(p.cursor.kind || "");
   const cQty = isFiniteNum(p.cursor.qty) ? p.cursor.qty : 0;
@@ -854,10 +819,9 @@ function cursorPlaceOneIntoSlot(p: PlayerState, client: Client, slot: SlotRef): 
 
   const maxC = maxStackForKind(cKind);
 
-  // Tool: right-click place behaves like place full (qty=1)
   if (maxC <= 1) {
     const uidSlot = getSlotUid(p, slot);
-    if (uidSlot) return false; // if occupied, let caller swap
+    if (uidSlot) return false;
     cursorPlaceFullIntoEmptySlot(p, client, slot);
     return true;
   }
@@ -865,7 +829,6 @@ function cursorPlaceOneIntoSlot(p: PlayerState, client: Client, slot: SlotRef): 
   const slotUid = getSlotUid(p, slot);
   const slotItem = slotUid ? p.items.get(slotUid) : null;
 
-  // Empty slot -> create stack of 1
   if (!slotUid || !slotItem) {
     const uidNew = createItemFromCursor(p, client.sessionId, cKind, 1);
     setSlotUid(p, slot, uidNew);
@@ -875,7 +838,6 @@ function cursorPlaceOneIntoSlot(p: PlayerState, client: Client, slot: SlotRef): 
     return true;
   }
 
-  // Same kind stack with space -> add 1
   const sKind = String(slotItem.kind || "");
   const sQty = isFiniteNum(slotItem.qty) ? slotItem.qty : 0;
 
@@ -892,7 +854,6 @@ function cursorPlaceOneIntoSlot(p: PlayerState, client: Client, slot: SlotRef): 
   return true;
 }
 
-/** Double click: collect matching stacks from inv + craft into cursor (stackables only) */
 function cursorDoubleClickCollect(p: PlayerState) {
   if (cursorIsEmpty(p)) return;
 
@@ -931,14 +892,12 @@ function cursorDoubleClickCollect(p: PlayerState) {
     }
   };
 
-  // Inventory
   const total = getTotalSlots(p);
   for (let i = 0; i < total; i++) {
     takeFromSlot({ kind: "inv", index: i });
     if (qty >= maxS) break;
   }
 
-  // Craft
   for (let i = 0; i < 9; i++) {
     takeFromSlot({ kind: "craft", index: i });
     if (qty >= maxS) break;
@@ -975,7 +934,7 @@ function blockIdToKind(id: BlockId): string {
 }
 
 // ------------------------------------------------------------
-// Room
+// Room Implementation
 // ------------------------------------------------------------
 
 export class MyRoom extends Room {
@@ -1054,7 +1013,7 @@ export class MyRoom extends Room {
   }
 
   // --------------------------------------------------------
-  // Lifecycle
+  // Room Lifecycle
   // --------------------------------------------------------
 
   public onCreate(options: any) {
@@ -1075,11 +1034,14 @@ export class MyRoom extends Room {
       console.log(`[PERSIST] No save file found at ${this.worldPath}. Starting fresh.`);
     }
 
-    // 2) Autosave
-    MyRoom.WORLD.configureAutosave({ path: this.worldPath, minIntervalMs: 30000 });
+    // 2) Configure Autosave
+    MyRoom.WORLD.configureAutosave({
+      path: this.worldPath,
+      minIntervalMs: 30000,
+    });
 
     // 3) Simulation Tick
-    const TICK_MS = 50;
+    const TICK_MS = 50; // 20 Hz
     const STAMINA_DRAIN_PER_SEC = 18;
     const STAMINA_REGEN_PER_SEC = 12;
     const SWING_COST = 8;
@@ -1099,7 +1061,7 @@ export class MyRoom extends Room {
         p.hp = clamp(isFiniteNum(p.hp) ? p.hp : p.maxHp, 0, p.maxHp);
         p.stamina = clamp(isFiniteNum(p.stamina) ? p.stamina : p.maxStamina, 0, p.maxStamina);
 
-        // Sprint
+        // Sprint drain/regen
         if (p.sprinting) {
           const drain = STAMINA_DRAIN_PER_SEC * dt;
           p.stamina = clamp(p.stamina - drain, 0, p.maxStamina);
@@ -1113,7 +1075,7 @@ export class MyRoom extends Room {
         const t0 = lastSwingAt.get(sid) || 0;
         if (p.swinging && nowMs() - t0 > SWING_FLAG_MS) p.swinging = false;
 
-        // Sync equip
+        // Sync Equip
         p.hotbarIndex = normalizeHotbarIndex(p.hotbarIndex);
         syncEquipToolToHotbar(p);
 
@@ -1126,11 +1088,12 @@ export class MyRoom extends Room {
         }
       });
 
+      // Autosave
       MyRoom.WORLD.maybeAutosave();
     }, TICK_MS);
 
     // --------------------------------------------------------
-    // Movement
+    // Movement Handlers
     // --------------------------------------------------------
 
     this.onMessage("move", (client: Client, msg: MoveMsg) => {
@@ -1177,7 +1140,7 @@ export class MyRoom extends Room {
     });
 
     // --------------------------------------------------------
-    // Inventory (legacy)
+    // Inventory Handlers (legacy)
     // --------------------------------------------------------
 
     this.onMessage("inv:consumeHotbar", (client: Client, msg: InvConsumeHotbarMsg) => {
@@ -1198,7 +1161,7 @@ export class MyRoom extends Room {
       syncEquipToolToHotbar(p);
     });
 
-    // Drag/drop across inv/eq/craft
+    // Legacy drag-drop across inv/eq/craft
     this.onMessage("inv:move", (client: Client, msg: InvMoveMsg) => {
       const p = this.state.players.get(client.sessionId);
       if (!p) return;
@@ -1227,7 +1190,7 @@ export class MyRoom extends Room {
       const fromItem = fromUid ? p.items.get(fromUid) : null;
       const toItem = toUid ? p.items.get(toUid) : null;
 
-      // Equip compatibility
+      // Equipment compatibility
       if (to.kind === "eq") {
         if (fromItem && !isEquipSlotCompatible(to.key, String(fromItem.kind || ""))) return;
         if (toItem && !isEquipSlotCompatible(to.key, String(toItem.kind || ""))) return;
@@ -1282,7 +1245,6 @@ export class MyRoom extends Room {
       if (from.kind === "craft" || to.kind === "craft") recomputeCraftResult(p);
     });
 
-    // Legacy split (inv only) -> first empty inv slot
     this.onMessage("inv:split", (client: Client, msg: InvSplitMsg) => {
       const p = this.state.players.get(client.sessionId);
       if (!p) return;
@@ -1339,14 +1301,12 @@ export class MyRoom extends Room {
       ensureSlotsLength(p);
       ensureCraftSlotsLength(p);
 
-      // Equip restriction
       if (!cursorIsEmpty(p) && slot.kind === "eq") {
         if (!canPlaceCursorIntoEquip(p, slot.key)) return;
       }
 
       const slotUid = getSlotUid(p, slot);
 
-      // Cursor empty -> pickup full
       if (cursorIsEmpty(p)) {
         cursorPickupFullFromSlot(p, slot);
         syncEquipToolToHotbar(p);
@@ -1354,8 +1314,6 @@ export class MyRoom extends Room {
         return;
       }
 
-      // Cursor not empty
-      // If slot empty -> place full
       if (!slotUid) {
         cursorPlaceFullIntoEmptySlot(p, client, slot);
         syncEquipToolToHotbar(p);
@@ -1363,12 +1321,8 @@ export class MyRoom extends Room {
         return;
       }
 
-      // Slot occupied:
-      // Try merge; if not possible -> swap
       const merged = cursorTryMergeIntoSlot(p, slot);
-      if (!merged) {
-        cursorSwapWithSlot(p, client, slot);
-      }
+      if (!merged) cursorSwapWithSlot(p, client, slot);
 
       syncEquipToolToHotbar(p);
       if (slot.kind === "craft") recomputeCraftResult(p);
@@ -1384,14 +1338,12 @@ export class MyRoom extends Room {
       ensureSlotsLength(p);
       ensureCraftSlotsLength(p);
 
-      // Equip restriction
       if (!cursorIsEmpty(p) && slot.kind === "eq") {
         if (!canPlaceCursorIntoEquip(p, slot.key)) return;
       }
 
       const slotUid = getSlotUid(p, slot);
 
-      // Cursor empty -> pickup half
       if (cursorIsEmpty(p)) {
         cursorPickupHalfFromSlot(p, slot);
         syncEquipToolToHotbar(p);
@@ -1399,11 +1351,8 @@ export class MyRoom extends Room {
         return;
       }
 
-      // Cursor not empty:
-      // Try place one (empty or same stack). If can't, swap.
       const handled = cursorPlaceOneIntoSlot(p, client, slot);
       if (!handled) {
-        // If slot is empty and couldn't place (rare), fallback to place full
         if (!slotUid) cursorPlaceFullIntoEmptySlot(p, client, slot);
         else cursorSwapWithSlot(p, client, slot);
       }
@@ -1426,7 +1375,7 @@ export class MyRoom extends Room {
     });
 
     // --------------------------------------------------------
-    // Crafting Result Click (Option B)
+    // Craft result click (Option B) - NO craft:commit EXISTS
     // --------------------------------------------------------
 
     this.onMessage("craft:take", (client: Client, _msg: CraftTakeMsg) => {
@@ -1455,11 +1404,10 @@ export class MyRoom extends Room {
         return;
       }
 
-      // Cursor placement rules for result
       const maxS = maxStackForKind(resultKind);
 
+      // Cursor capacity rules
       if (maxS <= 1) {
-        // Tool result: cursor must be empty
         if (!cursorIsEmpty(p)) {
           client.send("craft:reject", { reason: "cursor_not_empty" });
           return;
@@ -1478,7 +1426,6 @@ export class MyRoom extends Room {
         }
       }
 
-      // Consume ingredients from craft container
       const ok = consumeCraftIngredients(p, match);
       if (!ok) {
         recomputeCraftResult(p);
@@ -1486,9 +1433,8 @@ export class MyRoom extends Room {
         return;
       }
 
-      // Put result into cursor (stackable) or create tool item + store uid in cursor meta
+      // Put result into cursor
       if (maxS <= 1) {
-        // Create tool item instance, then store its uid in cursor meta
         const uid = makeUid(client.sessionId, "crafted");
         const it = new ItemState();
         it.uid = uid;
@@ -1516,7 +1462,7 @@ export class MyRoom extends Room {
     });
 
     // --------------------------------------------------------
-    // World / Blocks
+    // World & Block Handlers
     // --------------------------------------------------------
 
     this.onMessage("world:patch:req", (client: Client, msg: WorldPatchReqMsg) => {
@@ -1546,8 +1492,16 @@ export class MyRoom extends Room {
       return true;
     };
 
-    const withinWorld = (x: number, y: number, z: number) =>
-      x >= -MAX_COORD && x <= MAX_COORD && y >= -MAX_COORD && y <= MAX_COORD && z >= -MAX_COORD && z <= MAX_COORD;
+    const withinWorld = (x: number, y: number, z: number) => {
+      return (
+        x >= -MAX_COORD &&
+        x <= MAX_COORD &&
+        y >= -MAX_COORD &&
+        y <= MAX_COORD &&
+        z >= -MAX_COORD &&
+        z <= MAX_COORD
+      );
+    };
 
     const reject = (client: Client, reason: string, extra?: any) => {
       client.send("block:reject", { reason, ...(extra || {}) });
@@ -1671,6 +1625,7 @@ export class MyRoom extends Room {
 
     if (saved) {
       console.log(`[PERSIST] Restoring player ${distinctId}...`);
+
       p.x = isFiniteNum(saved.x) ? saved.x : 0;
       p.y = isFiniteNum(saved.y) ? saved.y : 10;
       p.z = isFiniteNum(saved.z) ? saved.z : 0;
@@ -1768,7 +1723,6 @@ export class MyRoom extends Room {
 
     client.send("welcome", { roomId: this.roomId, sessionId: client.sessionId });
 
-    // Initial patch around spawn
     const patch = MyRoom.WORLD.encodePatchAround({ x: p.x, y: p.y, z: p.z }, 96, { limit: 8000 });
     client.send("world:patch", patch);
   }
@@ -1779,7 +1733,9 @@ export class MyRoom extends Room {
     const p = this.state.players.get(client.sessionId);
     const distinctId = (client as any).auth?.distinctId;
 
-    if (p && distinctId) this.savePlayerData(distinctId, p);
+    if (p && distinctId) {
+      this.savePlayerData(distinctId, p);
+    }
 
     this.state.players.delete(client.sessionId);
     this.lastBlockOpAt.delete(client.sessionId);
