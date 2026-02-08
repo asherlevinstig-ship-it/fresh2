@@ -1,21 +1,22 @@
 // @ts-nocheck
 /*
- * fresh2 - client main/index (FINAL PRODUCTION VERSION - BIOMES EDITION)
+ * fresh2 - client main/index (FULL REWRITE - NO OMITS - TOWN SAFE ZONE EDITION)
  * -------------------------------------------------------------------
  * INCLUDES:
- * - 3x3 Crafting Grid (Virtual Mapping Strategy)
- * - Inventory UI (Drag & Drop, Logic, Splitting)
+ * - 3x3 Crafting Grid (Virtual Mapping Strategy, Client Preview)
+ * - Inventory UI (Drag & Drop, Logic, Splitting UI Hook)
  * - Server-Authoritative Logic (Colyseus) with Persistent ID
- * - World Generation (NOW BIOME-AWARE: Plains/Forest/Desert/Tundra/Mountains/Swamp)
+ * - World Generation (BIOME-AWARE: Plains/Forest/Desert/Tundra/Mountains/Swamp)
  * - 3D Rigs (FPS Hands + 3rd Person Avatars)
  * - Network Interpolation (Smooth movement)
  * - Debug Console (F4)
  * - Dynamic Environment Switching (Localhost vs Prod)
+ * - NEW: Registers onMessage for `welcome` and `block:reject` (removes warnings)
+ * - NEW: Friendly Safe Zone feedback + client-side craft duplicate index guard
  *
  * IMPORTANT:
- * - This file now mirrors the server's biome/height/layer/ore logic.
- * - It imports shared/world/Biomes.ts (built to .js by your bundler).
- * - If your bundler path differs, adjust the import path below.
+ * - This file mirrors the server's biome/height/layer/ore logic via shared Biomes.ts.
+ * - It expects `../../world/Biomes` to resolve to compiled JS.
  */
 
 import { Engine } from "noa-engine";
@@ -42,132 +43,34 @@ import {
   pickOreId,
 } from "../../world/Biomes";
 
-
-
 /* ============================================================
  * 1. RECIPE DATA & SYSTEM (Client-Side Prediction)
  * ============================================================
  */
 
 const RECIPES = [
-  {
-    id: "planks_from_log",
-    type: "shapeless",
-    ingredients: ["block:log"],
-    result: { kind: "block:plank", qty: 4 },
-  },
-  {
-    id: "sticks",
-    type: "shaped",
-    pattern: ["#", "#"],
-    key: { "#": "block:plank" },
-    result: { kind: "item:stick", qty: 4 },
-  },
-  {
-    id: "pickaxe_wood",
-    type: "shaped",
-    pattern: ["###", " | ", " | "],
-    key: { "#": "block:plank", "|": "item:stick" },
-    result: { kind: "tool:pickaxe_wood", qty: 1 },
-  },
-  {
-    id: "pickaxe_stone",
-    type: "shaped",
-    pattern: ["###", " | ", " | "],
-    key: { "#": "block:stone", "|": "item:stick" },
-    result: { kind: "tool:pickaxe_stone", qty: 1 },
-  },
+  { id: "planks_from_log", type: "shapeless", ingredients: ["block:log"], result: { kind: "block:plank", qty: 4 } },
+  { id: "sticks", type: "shaped", pattern: ["#", "#"], key: { "#": "block:plank" }, result: { kind: "item:stick", qty: 4 } },
+  { id: "pickaxe_wood", type: "shaped", pattern: ["###", " | ", " | "], key: { "#": "block:plank", "|": "item:stick" }, result: { kind: "tool:pickaxe_wood", qty: 1 } },
+  { id: "pickaxe_stone", type: "shaped", pattern: ["###", " | ", " | "], key: { "#": "block:stone", "|": "item:stick" }, result: { kind: "tool:pickaxe_stone", qty: 1 } },
 
-  // Expanded (if server also has them, client preview works)
-  {
-    id: "crafting_table",
-    type: "shaped",
-    pattern: ["##", "##"],
-    key: { "#": "block:plank" },
-    result: { kind: "block:crafting_table", qty: 1 },
-  },
-  {
-    id: "chest",
-    type: "shaped",
-    pattern: ["###", "# #", "###"],
-    key: { "#": "block:plank" },
-    result: { kind: "block:chest", qty: 1 },
-  },
-  {
-    id: "slab_plank",
-    type: "shaped",
-    pattern: ["###"],
-    key: { "#": "block:plank" },
-    result: { kind: "block:slab_plank", qty: 6 },
-  },
-  {
-    id: "stairs_plank",
-    type: "shaped",
-    pattern: ["#  ", "## ", "###"],
-    key: { "#": "block:plank" },
-    result: { kind: "block:stairs_plank", qty: 4 },
-  },
-  {
-    id: "door_wood",
-    type: "shaped",
-    pattern: ["##", "##", "##"],
-    key: { "#": "block:plank" },
-    result: { kind: "block:door_wood", qty: 1 },
-  },
-  {
-    id: "axe_wood",
-    type: "shaped",
-    pattern: ["## ", "#| ", " | "],
-    key: { "#": "block:plank", "|": "item:stick" },
-    result: { kind: "tool:axe_wood", qty: 1 },
-  },
-  {
-    id: "shovel_wood",
-    type: "shaped",
-    pattern: ["# ", "| ", "| "],
-    key: { "#": "block:plank", "|": "item:stick" },
-    result: { kind: "tool:shovel_wood", qty: 1 },
-  },
-  {
-    id: "sword_wood",
-    type: "shaped",
-    pattern: ["#", "#", "|"],
-    key: { "#": "block:plank", "|": "item:stick" },
-    result: { kind: "tool:sword_wood", qty: 1 },
-  },
-  {
-    id: "axe_stone",
-    type: "shaped",
-    pattern: ["## ", "#| ", " | "],
-    key: { "#": "block:stone", "|": "item:stick" },
-    result: { kind: "tool:axe_stone", qty: 1 },
-  },
-  {
-    id: "shovel_stone",
-    type: "shaped",
-    pattern: ["# ", "| ", "| "],
-    key: { "#": "block:stone", "|": "item:stick" },
-    result: { kind: "tool:shovel_stone", qty: 1 },
-  },
-  {
-    id: "sword_stone",
-    type: "shaped",
-    pattern: ["#", "#", "|"],
-    key: { "#": "block:stone", "|": "item:stick" },
-    result: { kind: "tool:sword_stone", qty: 1 },
-  },
-  {
-    id: "club_wood",
-    type: "shapeless",
-    ingredients: ["block:plank", "item:stick"],
-    result: { kind: "tool:club_wood", qty: 1 },
-  },
-  {
-    id: "wand_training",
-    type: "shapeless",
-    ingredients: ["item:stick", "block:plank"],
-    result: { kind: "tool:wand_training", qty: 1 },
-  },
+  // Expanded
+  { id: "crafting_table", type: "shaped", pattern: ["##", "##"], key: { "#": "block:plank" }, result: { kind: "block:crafting_table", qty: 1 } },
+  { id: "chest", type: "shaped", pattern: ["###", "# #", "###"], key: { "#": "block:plank" }, result: { kind: "block:chest", qty: 1 } },
+  { id: "slab_plank", type: "shaped", pattern: ["###"], key: { "#": "block:plank" }, result: { kind: "block:slab_plank", qty: 6 } },
+  { id: "stairs_plank", type: "shaped", pattern: ["#  ", "## ", "###"], key: { "#": "block:plank" }, result: { kind: "block:stairs_plank", qty: 4 } },
+  { id: "door_wood", type: "shaped", pattern: ["##", "##", "##"], key: { "#": "block:plank" }, result: { kind: "block:door_wood", qty: 1 } },
+
+  { id: "axe_wood", type: "shaped", pattern: ["## ", "#| ", " | "], key: { "#": "block:plank", "|": "item:stick" }, result: { kind: "tool:axe_wood", qty: 1 } },
+  { id: "shovel_wood", type: "shaped", pattern: ["# ", "| ", "| "], key: { "#": "block:plank", "|": "item:stick" }, result: { kind: "tool:shovel_wood", qty: 1 } },
+  { id: "sword_wood", type: "shaped", pattern: ["#", "#", "|"], key: { "#": "block:plank", "|": "item:stick" }, result: { kind: "tool:sword_wood", qty: 1 } },
+
+  { id: "axe_stone", type: "shaped", pattern: ["## ", "#| ", " | "], key: { "#": "block:stone", "|": "item:stick" }, result: { kind: "tool:axe_stone", qty: 1 } },
+  { id: "shovel_stone", type: "shaped", pattern: ["# ", "| ", "| "], key: { "#": "block:stone", "|": "item:stick" }, result: { kind: "tool:shovel_stone", qty: 1 } },
+  { id: "sword_stone", type: "shaped", pattern: ["#", "#", "|"], key: { "#": "block:stone", "|": "item:stick" }, result: { kind: "tool:sword_stone", qty: 1 } },
+
+  { id: "club_wood", type: "shapeless", ingredients: ["block:plank", "item:stick"], result: { kind: "tool:club_wood", qty: 1 } },
+  { id: "wand_training", type: "shapeless", ingredients: ["item:stick", "block:plank"], result: { kind: "tool:wand_training", qty: 1 } },
 ];
 
 const CraftingSystem = {
@@ -226,10 +129,7 @@ const CraftingSystem = {
   },
 
   trimMatrix(matrix) {
-    let minR = 3,
-      maxR = -1,
-      minC = 3,
-      maxC = -1;
+    let minR = 3, maxR = -1, minC = 3, maxC = -1;
     for (let r = 0; r < 3; r++) {
       for (let c = 0; c < 3; c++) {
         if (matrix[r][c] !== "") {
@@ -281,7 +181,7 @@ let inventoryOpen = false;
 
 // Multiplayer
 let colyRoom = null;
-const remotePlayers = {}; // { [sid]: { mesh, targetPos, lastPos } }
+const remotePlayers = {}; // { [sid]: { mesh, targetPos } }
 
 // Client State
 const LOCAL_INV = {
@@ -430,6 +330,7 @@ function createInventoryOverlay() {
     gridTemplateColumns: "repeat(3, 48px)",
     gap: "4px",
   });
+
   const craftCells = [];
   for (let i = 0; i < 9; i++) {
     const { cell, icon, qty } = makeSlot(`craft:${i}`);
@@ -460,6 +361,7 @@ function createInventoryOverlay() {
     gridTemplateColumns: "repeat(3, 48px)",
     gap: "4px",
   });
+
   const eqKeys = ["head", "chest", "legs", "feet", "tool", "offhand"];
   const eqCells = {};
   eqKeys.forEach((k) => {
@@ -481,6 +383,7 @@ function createInventoryOverlay() {
     gridTemplateColumns: "repeat(9, 48px)",
     gap: "4px",
   });
+
   const invCells = [];
   for (let i = 0; i < 36; i++) {
     const { cell, icon, qty } = makeSlot(`inv:${i}`);
@@ -510,6 +413,7 @@ function createInventoryOverlay() {
       cursor: "pointer",
       userSelect: "none",
     });
+
     const icon = document.createElement("div");
     Object.assign(icon.style, {
       position: "absolute",
@@ -521,6 +425,7 @@ function createInventoryOverlay() {
       textAlign: "center",
       pointerEvents: "none",
     });
+
     const qty = document.createElement("div");
     Object.assign(qty.style, {
       position: "absolute",
@@ -530,6 +435,7 @@ function createInventoryOverlay() {
       fontWeight: "bold",
       pointerEvents: "none",
     });
+
     return { cell, icon, qty };
   }
 
@@ -543,6 +449,16 @@ function createInventoryOverlay() {
     return kind ? kind.split(":")[1] || kind : "";
   }
 
+  function hasDuplicateCraftIndices(indices) {
+    const seen = new Set();
+    for (const idx of indices) {
+      if (idx === -1) continue;
+      if (seen.has(idx)) return true;
+      seen.add(idx);
+    }
+    return false;
+  }
+
   // --- Render Loop ---
   function refresh() {
     // Inventory
@@ -550,7 +466,6 @@ function createInventoryOverlay() {
       const it = getInvItem(i);
       invCells[i].icon.textContent = it ? getItemShort(it.kind) : "";
       invCells[i].qty.textContent = it && it.qty > 1 ? it.qty : "";
-
       const isCraftUsed = LOCAL_CRAFT.indices.includes(i);
       invCells[i].cell.style.opacity = isCraftUsed ? "0.3" : "1";
     }
@@ -633,11 +548,7 @@ function createInventoryOverlay() {
     const el = document.elementFromPoint(e.clientX, e.clientY);
     const dropSlot = el ? el.closest("[data-id]") : null;
 
-    // Logic:
-    // If drop on Craft Slot -> Map index
-    // If drop on Inv Slot -> Move item (Server)
     // If drop outside -> Clear craft mapping (if source was craft)
-
     if (!dropSlot) {
       if (drag.srcId.startsWith("craft:")) {
         const cIdx = parseInt(drag.srcId.split(":")[1]);
@@ -650,18 +561,18 @@ function createInventoryOverlay() {
 
     const destId = dropSlot.dataset.id;
 
-    // 1. Drop onto Crafting Grid
+    // Drop onto Crafting Grid
     if (destId.startsWith("craft:") && !destId.includes("result")) {
       const cIdx = parseInt(destId.split(":")[1]);
 
-      // If dragging FROM craft, swap indices
+      // From craft: swap indices
       if (drag.srcId.startsWith("craft:")) {
         const oldCIdx = parseInt(drag.srcId.split(":")[1]);
         const temp = LOCAL_CRAFT.indices[cIdx];
         LOCAL_CRAFT.indices[cIdx] = LOCAL_CRAFT.indices[oldCIdx];
         LOCAL_CRAFT.indices[oldCIdx] = temp;
       } else {
-        // Dragging FROM inv
+        // From inv
         LOCAL_CRAFT.indices[cIdx] = drag.invIdx;
       }
       updateCraft();
@@ -669,9 +580,9 @@ function createInventoryOverlay() {
       return;
     }
 
-    // 2. Drop onto Inventory
+    // Drop onto Inventory
     if (destId.startsWith("inv:")) {
-      // If coming from Craft, just clear craft slot
+      // From Craft -> clear craft slot
       if (drag.srcId.startsWith("craft:")) {
         const cIdx = parseInt(drag.srcId.split(":")[1]);
         LOCAL_CRAFT.indices[cIdx] = -1;
@@ -679,7 +590,7 @@ function createInventoryOverlay() {
         refresh();
         return;
       }
-      // If coming from Inv, move item
+      // From Inv -> move (server)
       if (colyRoom && drag.srcId !== destId) {
         colyRoom.send("inv:move", { from: drag.srcId, to: destId });
       }
@@ -706,9 +617,15 @@ function createInventoryOverlay() {
     o.cell.addEventListener("mousedown", (e) => {
       const id = o.cell.dataset.id;
       if (id === "craft:result") {
-        if (LOCAL_CRAFT.result && colyRoom) {
-          colyRoom.send("craft:commit", { srcIndices: LOCAL_CRAFT.indices });
+        if (!LOCAL_CRAFT.result || !colyRoom) return;
+
+        // Client-side guard: prevent duplicate indices exploit attempt
+        if (hasDuplicateCraftIndices(LOCAL_CRAFT.indices)) {
+          UI_CONSOLE.warn("Craft invalid: duplicate ingredient slot mapping.");
+          return;
         }
+
+        colyRoom.send("craft:commit", { srcIndices: LOCAL_CRAFT.indices });
       } else {
         startDrag(e, id);
       }
@@ -751,6 +668,7 @@ function createHotbarUI() {
     padding: "5px",
     background: "rgba(0,0,0,0.5)",
     borderRadius: "8px",
+    zIndex: "9997",
   });
 
   const slots = [];
@@ -764,6 +682,7 @@ function createHotbarUI() {
       position: "relative",
       background: "rgba(0,0,0,0.3)",
     });
+
     const icon = document.createElement("div");
     Object.assign(icon.style, {
       position: "absolute",
@@ -775,6 +694,7 @@ function createHotbarUI() {
       fontSize: "10px",
       textAlign: "center",
     });
+
     const qty = document.createElement("div");
     Object.assign(qty.style, {
       position: "absolute",
@@ -784,6 +704,7 @@ function createHotbarUI() {
       fontWeight: "bold",
       color: "#fff",
     });
+
     s.appendChild(icon);
     s.appendChild(qty);
     div.appendChild(s);
@@ -973,11 +894,9 @@ function getVoxelID(x, y, z) {
       const trunkTopY = treeBaseY + spec.trunkHeight - 1;
 
       // Trunk column
-      if (y >= treeBaseY && y <= trunkTopY) {
-        return ID.log;
-      }
+      if (y >= treeBaseY && y <= trunkTopY) return ID.log;
 
-      // Leaves (mirror server "vertical cap" behavior)
+      // Leaves
       const dy = y - trunkTopY;
       if (spec.type === "oak") {
         if (y >= trunkTopY - 1 && y <= trunkTopY + 2) {
@@ -994,9 +913,7 @@ function getVoxelID(x, y, z) {
     if (shouldSpawnCactus(x, z, biome)) {
       const cactusBaseY = height + 1;
       const cactusH = getCactusHeight(x, z);
-      if (y >= cactusBaseY && y < cactusBaseY + cactusH) {
-        return ID.log;
-      }
+      if (y >= cactusBaseY && y < cactusBaseY + cactusH) return ID.log;
     }
 
     return 0;
@@ -1005,17 +922,15 @@ function getVoxelID(x, y, z) {
   // Ground and below: biome layering
   const depth = height - y;
 
-  // Use shared helper to pick terrain layer (returns numeric block id)
   const terrainNumericId = getTerrainLayerBlockId(PALETTE, biome, depth);
 
-  // If stone zone, allow ore replacement (shared helper)
+  // Stone zone -> ore replacement
   if (terrainNumericId === PALETTE.STONE) {
     const oreId = pickOreId(x, y, z, biome, height, ORE_TABLES);
     return oreId || ID.stone;
   }
 
-  // Convert numeric block id -> registered noa ID (same number)
-  // Since we registered blocks with exact IDs, we can just return the number.
+  // Since we registered blocks with exact IDs, return numeric id
   return terrainNumericId;
 }
 
@@ -1087,12 +1002,12 @@ function createAvatar(scene) {
   body.parent = root;
   body.position.y = 0.9;
 
-  const parts = { root, head, body };
   [head, body].forEach((m) => {
     noa.rendering.addMeshToScene(m, false);
     m.isPickable = false;
   });
-  return parts;
+
+  return { root, head, body };
 }
 
 function updateRigAnim(dt) {
@@ -1100,7 +1015,6 @@ function updateRigAnim(dt) {
   if (viewMode === 0 && MESH.weaponRoot) {
     const vel = noa.entities.getPhysicsBody(noa.playerEntity).velocity;
     const moving = Math.abs(vel[0]) > 0.1 || Math.abs(vel[2]) > 0.1;
-
     if (moving) STATE.bobPhase += dt * 10;
     MESH.weaponRoot.position.y = Math.sin(STATE.bobPhase) * 0.02;
     MESH.weaponRoot.position.x = Math.cos(STATE.bobPhase) * 0.02;
@@ -1124,11 +1038,12 @@ function updateRigAnim(dt) {
 
 function snapshotState(me) {
   if (!me) return;
+
   LOCAL_STATS.hp = me.hp;
   LOCAL_STATS.stamina = me.stamina;
   LOCAL_HOTBAR.index = me.hotbarIndex;
 
-  // FIXED: Pad inventory to 36 slots
+  // Pad inventory to 36 slots
   const rawSlots = (me.inventory?.slots || []).map(String);
   while (rawSlots.length < 36) rawSlots.push("");
   LOCAL_INV.slots = rawSlots;
@@ -1136,6 +1051,7 @@ function snapshotState(me) {
   const items = {};
   if (me.items) me.items.forEach((it, uid) => (items[uid] = { kind: it.kind, qty: it.qty }));
   LOCAL_INV.items = items;
+
   LOCAL_INV.equip = JSON.parse(JSON.stringify(me.equip || {}));
 
   // Clean craft indices if item gone
@@ -1155,7 +1071,7 @@ const ENDPOINT = window.location.hostname.includes("localhost")
 
 const client = new Colyseus.Client(ENDPOINT);
 
-// --- NEW: Persistent ID Logic ---
+// Persistent ID
 function getDistinctId() {
   const key = "fresh2_player_id";
   let id = localStorage.getItem(key);
@@ -1167,20 +1083,36 @@ function getDistinctId() {
 }
 
 client
-  .joinOrCreate("my_room", {
-    name: "Steve",
-    distinctId: getDistinctId(),
-  })
+  .joinOrCreate("my_room", { name: "Steve", distinctId: getDistinctId() })
   .then((room) => {
     colyRoom = room;
     uiLog("Connected to Server!");
 
+    // ---- REGISTER MESSAGES (remove SDK warnings) ----
+    room.onMessage("welcome", (msg) => {
+      uiLog(`Welcome: room=${msg?.roomId || "?"} sid=${msg?.sessionId || "?"}`);
+    });
+
+    room.onMessage("block:reject", (msg) => {
+      const reason = msg?.reason || "unknown";
+      if (reason === "safe_zone") {
+        UI_CONSOLE.warn("Town of Beginnings is a Safe Zone — building/breaking disabled here.");
+        return;
+      }
+      UI_CONSOLE.warn(`Block rejected: ${reason}`);
+    });
+
+    room.onMessage("craft:reject", (msg) => {
+      UI_CONSOLE.warn(`Craft rejected: ${msg?.reason || "unknown"}`);
+    });
+
+    // ---- STATE SYNC ----
     room.onStateChange((state) => {
-      // 1. Sync Self
+      // 1) Sync self
       const me = state.players.get(room.sessionId);
       if (me) snapshotState(me);
 
-      // 2. Sync Remotes
+      // 2) Sync remotes
       state.players.forEach((p, sid) => {
         if (sid === room.sessionId) return;
         if (!remotePlayers[sid]) {
@@ -1193,6 +1125,7 @@ client
       });
     });
 
+    // ---- WORLD PATCH + UPDATES ----
     room.onMessage("world:patch", (patch) => {
       (patch.edits || []).forEach((e) => noa.setBlock(e.id, e.x, e.y, e.z));
     });
@@ -1207,8 +1140,12 @@ client
       LOCAL_CRAFT.result = null;
       inventoryUI.refresh();
     });
+
+    // (Optional) handshake
+    room.send("hello");
+    room.onMessage("hello_ack", (m) => uiLog(`hello_ack ok=${!!m?.ok}`));
   })
-  .catch((e) => uiLog(`Connect Error: ${e}`, "red"));
+  .catch((e) => UI_CONSOLE.error(`Connect Error: ${e}`));
 
 /* ============================================================
  * 10. INPUTS & GAME LOOP
@@ -1223,10 +1160,11 @@ function setView(mode) {
   if (MESH.avatarRoot) MESH.avatarRoot.setEnabled(mode === 1);
 }
 
-// Mouse
+// Mouse - Break
 noa.inputs.down.on("fire", () => {
   if (inventoryOpen) return;
   STATE.swingT = 0;
+
   if (colyRoom) colyRoom.send("swing");
 
   if (noa.targetedBlock) {
@@ -1236,18 +1174,19 @@ noa.inputs.down.on("fire", () => {
   }
 });
 
+// Mouse - Place
 noa.inputs.down.on("alt-fire", () => {
   if (inventoryOpen || !noa.targetedBlock) return;
+
   const p = noa.targetedBlock.adjacent;
   const idx = LOCAL_HOTBAR.index;
   const uid = LOCAL_INV.slots[idx];
   const it = uid ? LOCAL_INV.items[uid] : null;
 
   if (it && it.kind.startsWith("block:")) {
-    // Map kind -> voxel ID
     const kind = it.kind;
 
-    // Exact matches (preferred)
+    // Map kind -> voxel ID (client predict only; server is authoritative)
     const map = {
       "block:dirt": ID.dirt,
       "block:grass": ID.grass,
@@ -1284,7 +1223,7 @@ noa.inputs.down.on("alt-fire", () => {
 
     let id = map[kind] || 0;
 
-    // Back-compat string includes fallback
+    // Fallback string includes
     if (!id) {
       if (kind.includes("dirt")) id = ID.dirt;
       if (kind.includes("grass")) id = ID.grass;
@@ -1340,30 +1279,26 @@ window.addEventListener("keydown", (e) => {
   }
 });
 
-// --- RENDER LOOP (FIXED DT CALCULATION) ---
+// --- RENDER LOOP ---
 noa.on("beforeRender", () => {
-  // 1. Ensure Scene Initialized
+  // 1) Ensure Scene
   if (!STATE.scene) {
     const scene = noa.rendering.getScene();
-    if (scene) {
-      STATE.scene = scene;
-      initFpsRig(STATE.scene);
-    } else {
-      return;
-    }
+    if (!scene) return;
+    STATE.scene = scene;
+    initFpsRig(STATE.scene);
   }
 
-  // 2. Robust Delta Time Calculation
+  // 2) Delta time
   const now = performance.now();
   const dt = (now - STATE.lastTime) / 1000;
   STATE.lastTime = now;
+  if (dt > 0.1) return;
 
-  if (dt > 0.1) return; // Skip giant lag spikes
-
-  // 3. Update Animations
+  // 3) Animations
   updateRigAnim(dt);
 
-  // 4. Network Interpolation
+  // 4) Network interpolation
   for (const sid in remotePlayers) {
     const rp = remotePlayers[sid];
     if (rp && rp.mesh) {
@@ -1375,7 +1310,7 @@ noa.on("beforeRender", () => {
     }
   }
 
-  // 5. Send Move (Throttle)
+  // 5) Send move (throttle)
   STATE.moveAccum += dt;
   if (colyRoom && !inventoryOpen && STATE.moveAccum > 0.05) {
     STATE.moveAccum = 0;
@@ -1383,9 +1318,9 @@ noa.on("beforeRender", () => {
       const p = noa.entities.getPosition(noa.playerEntity);
       const cam = noa.camera;
       colyRoom.send("move", { x: p[0], y: p[1], z: p[2], yaw: cam.heading, pitch: cam.pitch });
-    } catch (e) {}
+    } catch {}
   }
 });
 
-// Initial spawn
+// Initial spawn (client-side; server will correct)
 noa.entities.setPosition(noa.playerEntity, 0, 10, 0);

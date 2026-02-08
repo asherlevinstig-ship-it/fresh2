@@ -1,5 +1,5 @@
 // ============================================================
-// rooms/MyRoom.ts  (FULL REWRITE - NO OMITS - BIOMES BLOCKS SUPPORT)
+// rooms/MyRoom.ts  (FULL REWRITE - NO OMITS - BIOMES + TOWN SAFE ZONE)
 // ------------------------------------------------------------
 // Keeps all logic:
 // - movement, sprint/stamina, swing, hotbar/equip sync
@@ -9,11 +9,18 @@
 // - break/place with reach + rate limit
 // - persistence + autosave + shutdown save
 //
-// Fixes included:
-// - Player persistent identity: PlayerState.id = distinctId (not sessionId)
-// - UID generation uses persistent id
-// - block:place ignores msg.kind (derives from hotbar item, server-authoritative)
-// - craft:commit rejects duplicate inventory indices + sends craft:reject
+// Adds:
+// - Town of Beginnings: perfectly-flat stamped blueprint + AIR clearing
+// - Safe zone enforcement: disallow break/place inside town radius
+//
+// Improvements included (server-authoritative hardening):
+// - Persistent identity: PlayerState.id = distinctId (not sessionId)
+// - UID generation uses persistent id (so items remain stable across reconnects)
+// - block:place ignores msg.kind (derives from hotbar item server-side)
+//
+// Notes:
+// - Colyseus v0.17+ Room generic is NOT "Room<State>"
+// - We extend Room without generics and declare state for typing
 // ============================================================
 
 import { Room, Client } from "colyseus";
@@ -26,6 +33,9 @@ import { MyRoomState, PlayerState, ItemState } from "./schema/MyRoomState.js";
 
 // Legacy crafting (kept)
 import { CraftingSystem } from "../crafting/CraftingSystem.js";
+
+// Town stamp + safe zone
+import { stampTownOfBeginnings, inTownSafeZone } from "../world/regions/applyBlueprint.js";
 
 // ------------------------------------------------------------
 // Message Types
@@ -52,8 +62,7 @@ type InvSplitMsg = { slot: string };
 type InvConsumeHotbarMsg = { qty?: number };
 type InvAddMsg = { kind: string; qty?: number };
 
-// Legacy crafting commit (virtual mapping indices)
-type CraftCommitMsg = { srcIndices: number[] };
+type CraftCommitMsg = { srcIndices: number[] }; // Array of 9 inventory slot indices
 
 type BlockBreakMsg = { x: number; y: number; z: number; src?: string };
 type BlockPlaceMsg = { x: number; y: number; z: number; kind?: string; src?: string };
@@ -277,7 +286,7 @@ function addKindToInventory(p: PlayerState, kind: string, qty: number) {
   const maxStack = maxStackForKind(kind);
   let remaining = qty;
 
-  // 1) stack into existing
+  // 1) Stack into existing
   while (remaining > 0) {
     const stackUid = findStackableUid(p, kind);
     if (!stackUid) break;
@@ -294,7 +303,7 @@ function addKindToInventory(p: PlayerState, kind: string, qty: number) {
     remaining -= add;
   }
 
-  // 2) new stacks
+  // 2) New stacks in empty slots
   while (remaining > 0) {
     const idx = firstEmptyInvIndex(p);
     if (idx === -1) break;
@@ -302,7 +311,7 @@ function addKindToInventory(p: PlayerState, kind: string, qty: number) {
     const add = Math.min(maxStack, remaining);
     remaining -= add;
 
-    const owner = String(p.id || "player"); // p.id is distinctId (persistent)
+    const owner = String(p.id || "player");
     const uid = makeUid(owner, "loot");
 
     const it2 = new ItemState();
@@ -565,6 +574,14 @@ export class MyRoom extends Room {
       path: this.worldPath,
       minIntervalMs: 30000,
     });
+
+    // 2.5) Stamp Town of Beginnings (version-gated by town_stamp.json)
+    try {
+      const res = stampTownOfBeginnings(MyRoom.WORLD, { verbose: true });
+      console.log(`[TOWN] stamp result:`, res);
+    } catch (e) {
+      console.error(`[TOWN] stamp failed:`, e);
+    }
 
     // 3) Simulation Tick
     const TICK_MS = 50; // 20 Hz
@@ -958,6 +975,12 @@ export class MyRoom extends Room {
         return;
       }
 
+      // Town safe zone enforcement
+      if (inTownSafeZone(x, y, z)) {
+        reject(client, "safe_zone", { op: "break", src, x, y, z });
+        return;
+      }
+
       const d = dist3(p.x, p.y + 1.6, p.z, x + 0.5, y + 0.5, z + 0.5);
       if (d > BLOCK_REACH) {
         reject(client, "too_far", { op: "break", src, d });
@@ -998,6 +1021,12 @@ export class MyRoom extends Room {
 
       if (!withinWorld(x, y, z)) {
         reject(client, "out_of_bounds", { op: "place", src });
+        return;
+      }
+
+      // Town safe zone enforcement
+      if (inTownSafeZone(x, y, z)) {
+        reject(client, "safe_zone", { op: "place", src, x, y, z });
         return;
       }
 
@@ -1050,12 +1079,12 @@ export class MyRoom extends Room {
     // 1) Identify user (persistent)
     const distinctId = String(options.distinctId || client.sessionId);
 
-    // store auth for onLeave
+    // Store distinctId on client for onLeave save
     (client as any).auth = { distinctId };
 
     const p = new PlayerState();
 
-    // IMPORTANT: PlayerState.id is persistent distinct id (not session id)
+    // IMPORTANT: PlayerState.id = persistent distinctId (NOT sessionId)
     p.id = distinctId;
     p.name = String(options.name || "Steve").trim().substring(0, 16);
 
@@ -1145,13 +1174,16 @@ export class MyRoom extends Room {
       add("item:stick", 8, 4);
     }
 
+    // Sync equip -> hotbar tool
     syncEquipToolToHotbar(p);
+
+    // Attach to room by sessionId
     this.state.players.set(client.sessionId, p);
 
-    // welcome (client can register handler)
+    // Welcome (client can register handler)
     client.send("welcome", { roomId: this.roomId, sessionId: client.sessionId });
 
-    // Initial patch around spawn (ints are safer)
+    // Initial patch around player (ints safer)
     const patch = MyRoom.WORLD.encodePatchAround(
       { x: Math.floor(p.x), y: Math.floor(p.y), z: Math.floor(p.z) },
       96,
