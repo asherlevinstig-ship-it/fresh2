@@ -1,5 +1,5 @@
 // ============================================================
-// rooms/MyRoom.ts  (FULL REWRITE - NO OMITS - TOWN STAMP + SAFE ZONE + DUP CRAFT GUARD)
+// rooms/MyRoom.ts  (FULL REWRITE - NO OMITS - WORLD BOOTSTRAP GUARD + TOWN STAMP + SAFE ZONE + DUP CRAFT GUARD)
 // ------------------------------------------------------------
 // Keeps ALL logic from your current server rewrite:
 // - movement, sprint/stamina tick, swing
@@ -10,12 +10,12 @@
 // - break/place with reach + rate limit + rejects
 // - persistence + autosave + shutdown save
 //
-// ADDITIONS / FIXES INCLUDED:
-// - Town of Beginnings blueprint stamping (versioned) during onCreate()
-// - Optional FORCE_TOWN_STAMP flag (for dev) and verbose logs
-// - Optional FORCE_TOWN_SPAWN flag (for dev/visibility) overriding persistence coords
-// - Safe zone enforcement (reject break/place inside town radius)
-// - Reject duplicate craft indices (prevents crafting dup exploit)
+// ADDITIONS / FIXES INCLUDED (without removing any existing behaviour):
+// - Prevent repeated world load / stamp / autosave config per process: WORLD_BOOTSTRAPPED guard
+// - Optional autoDispose control (default false for persistent world room)
+// - FORCE_TOWN_STAMP / FORCE_TOWN_SPAWN are env-driven (still defaults match your intent)
+// - Safer player save writes (atomic temp file + rename)
+// - Extra robustness: inventory references cleaned if item missing
 //
 // IMPORTANT:
 // - Colyseus v0.17+ Room generic is NOT Room<State>; extend Room without generics.
@@ -28,11 +28,7 @@ import * as path from "path";
 
 import { WorldStore, BLOCKS, type BlockId } from "../world/WorldStore.js";
 
-import {
-  MyRoomState,
-  PlayerState,
-  ItemState,
-} from "./schema/MyRoomState.js";
+import { MyRoomState, PlayerState, ItemState } from "./schema/MyRoomState.js";
 
 import { CraftingSystem } from "../crafting/CraftingSystem.js";
 
@@ -95,6 +91,27 @@ function dist3(ax: number, ay: number, az: number, bx: number, by: number, bz: n
   const dy = ay - by;
   const dz = az - bz;
   return Math.sqrt(dx * dx + dy * dy + dz * dz);
+}
+
+function readJsonFileSafe(filePath: string): any | null {
+  if (!fs.existsSync(filePath)) return null;
+  try {
+    const raw = fs.readFileSync(filePath, "utf8");
+    return JSON.parse(raw);
+  } catch (e) {
+    console.error(`[PERSIST] Failed to read/parse JSON: ${filePath}`, e);
+    return null;
+  }
+}
+
+function writeJsonAtomic(filePath: string, data: any) {
+  const dir = path.dirname(filePath);
+  try {
+    if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
+  } catch {}
+  const tmp = `${filePath}.tmp.${process.pid}.${Math.floor(Math.random() * 1e9)}`;
+  fs.writeFileSync(tmp, JSON.stringify(data, null, 2));
+  fs.renameSync(tmp, filePath);
 }
 
 // ------------------------------------------------------------
@@ -391,11 +408,15 @@ function kindToBlockId(kind: string): BlockId {
   if (kind === "block:mythril_ore") return (BLOCKS as any).MYTHRIL_ORE ?? BLOCKS.STONE;
   if (kind === "block:dragonstone") return (BLOCKS as any).DRAGONSTONE ?? BLOCKS.STONE;
 
-  if (kind === "block:crafting_table") return (BLOCKS as any).CRAFTING_TABLE ?? (BLOCKS as any).PLANKS ?? BLOCKS.LOG;
+  if (kind === "block:crafting_table")
+    return (BLOCKS as any).CRAFTING_TABLE ?? (BLOCKS as any).PLANKS ?? BLOCKS.LOG;
   if (kind === "block:chest") return (BLOCKS as any).CHEST ?? (BLOCKS as any).PLANKS ?? BLOCKS.LOG;
-  if (kind === "block:slab_plank") return (BLOCKS as any).SLAB_PLANK ?? (BLOCKS as any).PLANKS ?? BLOCKS.LOG;
-  if (kind === "block:stairs_plank") return (BLOCKS as any).STAIRS_PLANK ?? (BLOCKS as any).PLANKS ?? BLOCKS.LOG;
-  if (kind === "block:door_wood") return (BLOCKS as any).DOOR_WOOD ?? (BLOCKS as any).PLANKS ?? BLOCKS.LOG;
+  if (kind === "block:slab_plank")
+    return (BLOCKS as any).SLAB_PLANK ?? (BLOCKS as any).PLANKS ?? BLOCKS.LOG;
+  if (kind === "block:stairs_plank")
+    return (BLOCKS as any).STAIRS_PLANK ?? (BLOCKS as any).PLANKS ?? BLOCKS.LOG;
+  if (kind === "block:door_wood")
+    return (BLOCKS as any).DOOR_WOOD ?? (BLOCKS as any).PLANKS ?? BLOCKS.LOG;
 
   return BLOCKS.AIR;
 }
@@ -462,45 +483,45 @@ export class MyRoom extends Room {
 
   public maxClients = 16;
 
-  // Shared world per server process
+  // Shared world per server process (per Node/PM2 instance)
   private static WORLD = new WorldStore({ minCoord: -100000, maxCoord: 100000 });
 
-  // Persistence paths
+  // Prevent repeated "process-level" initialization from per-room lifecycle calls.
+  private static WORLD_BOOTSTRAPPED = false;
+
+  // DEV toggles (env-driven, with safe defaults)
+  // - FORCE_TOWN_STAMP: restamp town even if meta says done (will overwrite town area)
+  // - FORCE_TOWN_SPAWN: always spawn players at town center for visibility
+  // - ROOM_AUTO_DISPOSE: set true if you want room to dispose when empty (default false)
+  private static FORCE_TOWN_STAMP = String(process.env.FORCE_TOWN_STAMP || "false").toLowerCase() === "true";
+  private static FORCE_TOWN_SPAWN = String(process.env.FORCE_TOWN_SPAWN || "true").toLowerCase() === "true";
+  private static ROOM_AUTO_DISPOSE = String(process.env.ROOM_AUTO_DISPOSE || "false").toLowerCase() === "true";
+
+  // Persistence paths (resolved at runtime)
   private worldPath = path.join(process.cwd(), "world_data.json");
   private playersPath = path.join(process.cwd(), "players.json");
 
   // Rate limiting
   private lastBlockOpAt = new Map<string, number>();
 
-  // DEV toggles
-  // - FORCE_TOWN_STAMP: restamp town even if meta says done (will overwrite town area)
-  // - FORCE_TOWN_SPAWN: always spawn players at town center for visibility
-  private static FORCE_TOWN_STAMP = false;
-  private static FORCE_TOWN_SPAWN = true;
-
   // --------------------------------------------------------
   // Persistence Helpers
   // --------------------------------------------------------
 
   private loadPlayerData(distinctId: string) {
-    if (!fs.existsSync(this.playersPath)) return null;
+    const data = readJsonFileSafe(this.playersPath);
+    if (!data) return null;
     try {
-      const raw = fs.readFileSync(this.playersPath, "utf8");
-      const data = JSON.parse(raw);
       return data[distinctId] || null;
-    } catch (e) {
-      console.error("Load Error:", e);
+    } catch {
       return null;
     }
   }
 
   private savePlayerData(distinctId: string, p: PlayerState) {
     let allData: any = {};
-    if (fs.existsSync(this.playersPath)) {
-      try {
-        allData = JSON.parse(fs.readFileSync(this.playersPath, "utf8"));
-      } catch {}
-    }
+    const existing = readJsonFileSafe(this.playersPath);
+    if (existing && typeof existing === "object") allData = existing;
 
     const itemsArray = Array.from(p.items.entries()).map((entry: any) => {
       const [uid, item] = entry;
@@ -529,8 +550,28 @@ export class MyRoom extends Room {
     };
 
     allData[distinctId] = saveData;
-    fs.writeFileSync(this.playersPath, JSON.stringify(allData, null, 2));
-    console.log(`[PERSIST] Saved data for ${distinctId}`);
+
+    try {
+      writeJsonAtomic(this.playersPath, allData);
+      console.log(`[PERSIST] Saved data for ${distinctId}`);
+    } catch (e) {
+      console.error(`[PERSIST] Failed to save data for ${distinctId}:`, e);
+    }
+  }
+
+  private cleanupDanglingInventoryRefs(p: PlayerState) {
+    // If inventory contains a UID that isn't in items, clear it.
+    ensureSlotsLength(p);
+    for (let i = 0; i < p.inventory.slots.length; i++) {
+      const uid = String(p.inventory.slots[i] || "");
+      if (!uid) continue;
+      if (!p.items.get(uid)) p.inventory.slots[i] = "";
+    }
+    // If equip references missing items, clear those too.
+    (["tool", "head", "chest", "legs", "feet", "offhand"] as EquipKey[]).forEach((k) => {
+      const uid = String((p.equip as any)[k] || "");
+      if (uid && !p.items.get(uid)) (p.equip as any)[k] = "";
+    });
   }
 
   // --------------------------------------------------------
@@ -541,44 +582,57 @@ export class MyRoom extends Room {
     this.setState(new MyRoomState());
     console.log("MyRoom created:", this.roomId, options);
 
-    // 1) Load World from Disk
-    if (fs.existsSync(this.worldPath)) {
-      console.log(`[PERSIST] Loading world from ${this.worldPath}...`);
-      try {
-        const loaded = MyRoom.WORLD.loadFromFileSync(this.worldPath);
-        if (loaded) console.log(`[PERSIST] Loaded ${MyRoom.WORLD.editsCount()} edits.`);
-        else console.log(`[PERSIST] File existed but failed to load.`);
-      } catch (e) {
-        console.error(`[PERSIST] Error loading world:`, e);
+    // Persistent world room by default (avoids constant create/dispose churn)
+    this.autoDispose = MyRoom.ROOM_AUTO_DISPOSE;
+
+    // --------------------------------------------------------
+    // WORLD BOOTSTRAP (ONCE PER PROCESS)
+    // --------------------------------------------------------
+    if (!MyRoom.WORLD_BOOTSTRAPPED) {
+      MyRoom.WORLD_BOOTSTRAPPED = true;
+
+      // 1) Load World from Disk
+      if (fs.existsSync(this.worldPath)) {
+        console.log(`[PERSIST] Loading world from ${this.worldPath}...`);
+        try {
+          const loaded = MyRoom.WORLD.loadFromFileSync(this.worldPath);
+          if (loaded) console.log(`[PERSIST] Loaded ${MyRoom.WORLD.editsCount()} edits.`);
+          else console.log(`[PERSIST] File existed but failed to load.`);
+        } catch (e) {
+          console.error(`[PERSIST] Error loading world:`, e);
+        }
+      } else {
+        console.log(`[PERSIST] No save file found at ${this.worldPath}. Starting fresh.`);
       }
-    } else {
-      console.log(`[PERSIST] No save file found at ${this.worldPath}. Starting fresh.`);
-    }
 
-    // 2) Stamp Town of Beginnings
-    try {
-      const res = stampTownOfBeginnings(MyRoom.WORLD, {
-        verbose: true,
-        force: MyRoom.FORCE_TOWN_STAMP,
-      });
-      console.log("[TOWN] stamp result:", res);
-
-      // Extra sanity logs (helps prove stamp is in WorldStore)
+      // 2) Stamp Town of Beginnings (versioned)
       try {
-        console.log("[TOWN] center ground id =", MyRoom.WORLD.getBlock(0, TOWN_GROUND_Y, 0));
-        console.log("[TOWN] center marker id =", MyRoom.WORLD.getBlock(0, TOWN_GROUND_Y + 1, 0));
-      } catch {}
-    } catch (e) {
-      console.error("[TOWN] stamp failed:", e);
+        const res = stampTownOfBeginnings(MyRoom.WORLD, {
+          verbose: true,
+          force: MyRoom.FORCE_TOWN_STAMP,
+        });
+        console.log("[TOWN] stamp result:", res);
+
+        // Extra sanity logs (helps prove stamp is in WorldStore)
+        try {
+          console.log("[TOWN] center ground id =", MyRoom.WORLD.getBlock(0, TOWN_GROUND_Y, 0));
+          console.log("[TOWN] center marker id =", MyRoom.WORLD.getBlock(0, TOWN_GROUND_Y + 1, 0));
+        } catch {}
+      } catch (e) {
+        console.error("[TOWN] stamp failed:", e);
+      }
+
+      // 3) Configure Autosave (world-level)
+      MyRoom.WORLD.configureAutosave({
+        path: this.worldPath,
+        minIntervalMs: 30000,
+      });
     }
 
-    // 3) Configure Autosave
-    MyRoom.WORLD.configureAutosave({
-      path: this.worldPath,
-      minIntervalMs: 30000,
-    });
+    // --------------------------------------------------------
+    // Simulation Tick
+    // --------------------------------------------------------
 
-    // 4) Simulation Tick
     const TICK_MS = 50; // 20 Hz
     const STAMINA_DRAIN_PER_SEC = 18;
     const STAMINA_REGEN_PER_SEC = 12;
@@ -922,11 +976,7 @@ export class MyRoom extends Room {
     };
 
     const withinWorld = (x: number, y: number, z: number) => {
-      return (
-        x >= -MAX_COORD && x <= MAX_COORD &&
-        y >= -MAX_COORD && y <= MAX_COORD &&
-        z >= -MAX_COORD && z <= MAX_COORD
-      );
+      return x >= -MAX_COORD && x <= MAX_COORD && y >= -MAX_COORD && y <= MAX_COORD && z >= -MAX_COORD && z <= MAX_COORD;
     };
 
     const reject = (client: Client, reason: string, extra?: any) => {
@@ -1095,6 +1145,9 @@ export class MyRoom extends Room {
         p.equip.feet = saved.equip.feet || "";
         p.equip.offhand = saved.equip.offhand || "";
       }
+
+      // Robustness: clear any inventory/equip references that point to missing items.
+      this.cleanupDanglingInventoryRefs(p);
     } else {
       console.log(`[PERSIST] New player ${distinctId}, giving starter gear.`);
       p.x = 0;
@@ -1133,7 +1186,7 @@ export class MyRoom extends Room {
       add("item:stick", 8, 4);
     }
 
-    // Force spawn at town for visibility (overrides persistence)
+    // Force spawn at town for visibility (overrides persistence) - env driven
     if (MyRoom.FORCE_TOWN_SPAWN) {
       p.x = 0;
       p.y = TOWN_GROUND_Y + 2;
