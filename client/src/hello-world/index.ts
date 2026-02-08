@@ -14,23 +14,23 @@
  *
  * ADDED (Phase 2 Option A):
  * - Client-only render clamp while inside Town of Beginnings safe zone:
- *     - Reduce chunkAddDistance / chunkRemoveDistance
- *     - Reduce camera maxZ (view distance)
- *     - Optional fog (enabled inside town; disabled outside)
+ * - Reduce chunkAddDistance / chunkRemoveDistance
+ * - Reduce camera maxZ (view distance)
+ * - Optional fog (enabled inside town; disabled outside)
  * - When player exits town: restore original distances (future expansion)
  *
  * ALSO FIXED:
  * - Register room.onMessage handlers for "welcome" and "block:reject"
- *   to avoid @colyseus/sdk warnings.
+ * to avoid @colyseus/sdk warnings.
  *
  * ADDED (Spawn Under Town Fix + Logging):
  * - Prevent "spawn under town" by freezing player physics until first world patch
- *   is applied, then snapping to spawn and zeroing velocity.
+ * is applied, then snapping to spawn and zeroing velocity.
  * - Handle server "spawn:teleport" message (if server sends it).
  * - Add logging for:
- *   - Server spawn
- *   - Player position
- *   - Town center block ids after patch
+ * - Server spawn
+ * - Player position
+ * - Town center block ids after patch
  *
  * IMPORTANT:
  * - This file mirrors the server's biome/height/layer/ore logic via shared Biomes.ts
@@ -48,7 +48,7 @@ import * as Colyseus from "colyseus.js";
  * IMPORTANT:
  * - Adjust this import path to match your project structure.
  * - This must point at the compiled JS output of shared/world/Biomes.ts
- *   so client + server use identical math.
+ * so client + server use identical math.
  */
 import {
   sampleBiome,
@@ -316,7 +316,7 @@ const opts = {
   chunkAddDistance: RENDER_PRESET_OUTSIDE.chunkAddDistance,
   chunkRemoveDistance: RENDER_PRESET_OUTSIDE.chunkRemoveDistance,
   stickyPointerLock: true,
-  dragCameraOutsidePointerLock: true,
+  dragCamera outsidePointerLock: true,
   initialZoom: 0,
   zoomSpeed: 0.25,
 };

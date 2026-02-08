@@ -2,8 +2,8 @@
 <html lang="en">
 <head>
   <meta charset="utf-8" />
-  <title>Fresh2</title>
-  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Fresh2 - Town of Beginnings</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no" />
   <style>
     html, body {
       margin: 0;
@@ -11,12 +11,57 @@
       width: 100%;
       height: 100%;
       overflow: hidden;
-      font-family: Arial, Helvetica, sans-serif;
+      font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+      background-color: #000;
+    }
+
+    /* --- Loading Screen Styles --- */
+    #loading-screen {
+      position: fixed;
+      top: 0;
+      left: 0;
+      width: 100%;
+      height: 100%;
+      background: #111; /* Dark background */
+      color: #fff;
+      display: flex;
+      flex-direction: column;
+      justify-content: center;
+      align-items: center;
+      z-index: 9999; /* Always on top */
+      transition: opacity 0.5s ease-out, visibility 0.5s;
+    }
+
+    #loading-screen h1 {
+      font-size: 24px;
+      letter-spacing: 3px;
+      text-transform: uppercase;
+      margin-bottom: 15px;
+      color: #4caf50; /* RPG Green accent */
+      text-shadow: 0 2px 4px rgba(0,0,0,0.5);
+    }
+
+    #loading-screen p {
+      font-size: 14px;
+      color: #aaa;
+      animation: pulse 1.5s infinite;
+    }
+
+    /* Simple pulse animation for text */
+    @keyframes pulse {
+      0% { opacity: 0.5; }
+      50% { opacity: 1; }
+      100% { opacity: 0.5; }
     }
   </style>
 </head>
 <body>
-  <!-- Load the game as the main entry -->
+  
+  <div id="loading-screen">
+    <h1>Town of Beginnings</h1>
+    <p>Loading World Data...</p>
+  </div>
+
   <script type="module" src="/hello-world/index.ts"></script>
 </body>
 </html>
