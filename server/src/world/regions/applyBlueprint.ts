@@ -3,11 +3,16 @@
 // ------------------------------------------------------------
 // Town of Beginnings: flat safe-zone + prebuilt blueprint stamp
 //
-// Goals:
-// - Deterministic stamp that runs once per world version.
-// - Perfectly flat ground in town radius (optional).
-// - Safe zone query helper: inTownSafeZone(x,y,z) for server checks.
-// - NO TypeScript inference traps (no never[]), explicit unions.
+// FEATURES:
+// - Perfectly flat ground in town radius (box stamp for simplicity)
+// - Giant cross marker so you can SEE it immediately
+// - Safe zone helper: inTownSafeZone(x,y,z)
+// - Stamp meta on disk, versioned
+// - FORCE option to restamp even if meta says "already done"
+// - Verbose logs including meta path + counts
+//
+// IMPORTANT:
+// - This file avoids TS "never" inference by explicit union types.
 // ============================================================
 
 import * as fs from "fs";
@@ -34,7 +39,7 @@ export type TownFillOp = {
   min: Vec3i;
   max: Vec3i;
   onlyIfAir?: boolean; // if true, do not overwrite existing non-air
-  overwrite?: boolean; // if true, force overwrite (break -> place)
+  overwrite?: boolean; // if true, force overwrite (break then place)
 };
 
 // Clear (set to air)
@@ -44,38 +49,35 @@ export type TownClearOp = {
   max: Vec3i;
 };
 
-// Union
 export type TownOp = TownFillOp | TownClearOp;
 
 export type StampResult = {
   stamped: boolean;
+  forced: boolean;
   version: string;
   opsApplied: number;
   blocksTouched: number;
+  metaPath: string;
 };
 
 // -----------------------------
-// Town config (edit these freely)
+// Town config
 // -----------------------------
 
-// The “safe zone” is an XZ circle; yMin/yMax define vertical enforcement.
-// Keep it generous so players can’t build under/over the town.
 export const TOWN_SAFE_ZONE: TownRegion = {
   center: { x: 0, z: 0 },
   radius: 42,
   yMin: -64,
-  yMax: 128,
+  yMax: 256,
 };
 
-// This is the *flat* ground level the town sits on.
+// Perfectly flat ground level for town
 export const TOWN_GROUND_Y = 10;
 
-// Stamp version: bump this string whenever you change the blueprint.
-// (It will stamp again when version changes.)
-export const TOWN_STAMP_VERSION = "town_v1_flat_002";
+// Bump this whenever you change the blueprint (or just to restamp)
+export const TOWN_STAMP_VERSION = "town_v1_flat_002_marker";
 
-
-// Where we store whether it’s already stamped (in server cwd)
+// Where we store stamp metadata
 function stampMetaPath() {
   return path.join(process.cwd(), "town_stamp.json");
 }
@@ -83,11 +85,6 @@ function stampMetaPath() {
 // -----------------------------
 // Helpers
 // -----------------------------
-
-function clampInt(n: number, a: number, b: number) {
-  n = n | 0;
-  return Math.max(a, Math.min(b, n));
-}
 
 function inRange(n: number, a: number, b: number) {
   return n >= a && n <= b;
@@ -105,9 +102,8 @@ export function inTownSafeZone(x: number, y: number, z: number) {
   return distXZ(x, z, r.center.x, r.center.z) <= r.radius;
 }
 
-// Force set a block even if WorldStore.applyPlace only works on AIR.
-// We do: if placing non-air and overwrite allowed, break existing then place.
-// If placing air, break existing (if any).
+// Some WorldStore implementations only place if AIR.
+// We "force" by breaking first when overwrite is true.
 function setBlockForce(
   world: WorldStore,
   x: number,
@@ -121,7 +117,7 @@ function setBlockForce(
 
   const existing = world.getBlock(x, y, z);
 
-  // If we're clearing to AIR
+  // clearing
   if (id === BLOCKS.AIR) {
     if (existing !== BLOCKS.AIR) {
       world.applyBreak(x, y, z);
@@ -130,38 +126,39 @@ function setBlockForce(
     return 0;
   }
 
-  // Placing solid block
+  // filling
   if (existing !== BLOCKS.AIR) {
-    if (onlyIfAir) return 0; // skip
-    if (overwrite) {
-      world.applyBreak(x, y, z);
-    } else {
-      // if not overwriting, don't touch occupied
-      return 0;
-    }
+    if (onlyIfAir) return 0;
+    if (!overwrite) return 0;
+    world.applyBreak(x, y, z);
   }
 
-  // Now it should be AIR (or we allow applyPlace to decide)
   world.applyPlace(x, y, z, id);
   return 1;
 }
 
+function normalizeBox(min: Vec3i, max: Vec3i) {
+  return {
+    minX: Math.min(min.x, max.x) | 0,
+    maxX: Math.max(min.x, max.x) | 0,
+    minY: Math.min(min.y, max.y) | 0,
+    maxY: Math.max(min.y, max.y) | 0,
+    minZ: Math.min(min.z, max.z) | 0,
+    maxZ: Math.max(min.z, max.z) | 0,
+  };
+}
+
 function volume(min: Vec3i, max: Vec3i) {
-  const dx = Math.max(0, (max.x - min.x + 1) | 0);
-  const dy = Math.max(0, (max.y - min.y + 1) | 0);
-  const dz = Math.max(0, (max.z - min.z + 1) | 0);
+  const b = normalizeBox(min, max);
+  const dx = Math.max(0, (b.maxX - b.minX + 1) | 0);
+  const dy = Math.max(0, (b.maxY - b.minY + 1) | 0);
+  const dz = Math.max(0, (b.maxZ - b.minZ + 1) | 0);
   return dx * dy * dz;
 }
 
 // -----------------------------
-// Blueprint definition
+// Blueprint
 // -----------------------------
-//
-// Keep it simple and explicit. No fancy inference.
-// Everything uses the TownOp union.
-//
-// The order matters: clear → ground → structures.
-//
 
 export function townOfBeginningsBlueprint(): TownOp[] {
   const cx = TOWN_SAFE_ZONE.center.x | 0;
@@ -173,38 +170,24 @@ export function townOfBeginningsBlueprint(): TownOp[] {
   const minZ = cz - r;
   const maxZ = cz + r;
 
-  // “Town box” we’ll clear + flatten.
-  // We clear from ground up (to remove trees/terrain poking into town).
+  // Clear high enough so you don't have trees/terrain poking through
   const CLEAR_Y_MIN = TOWN_GROUND_Y;
-  const CLEAR_Y_MAX = TOWN_GROUND_Y + 40;
+  const CLEAR_Y_MAX = TOWN_GROUND_Y + 80;
 
-  // Build a small “starter plaza” in the center.
-  const plazaR = 8;
-  const plazaMin = { x: cx - plazaR, y: TOWN_GROUND_Y, z: cz - plazaR };
-  const plazaMax = { x: cx + plazaR, y: TOWN_GROUND_Y, z: cz + plazaR };
+  const PLANKS: BlockId = (BLOCKS as any).PLANKS ?? BLOCKS.LOG;
+  const CRAFTING_TABLE: BlockId | null = (BLOCKS as any).CRAFTING_TABLE ?? null;
+  const CHEST: BlockId | null = (BLOCKS as any).CHEST ?? null;
 
-  // A tiny “spawn marker” pillar
-  const pillarX = cx;
-  const pillarZ = cz;
-
-  // A basic “starter hut” rectangle
-  const hutMin = { x: cx + 12, y: TOWN_GROUND_Y + 1, z: cz - 6 };
-  const hutMax = { x: cx + 20, y: TOWN_GROUND_Y + 4, z: cz + 6 };
-
-  const doorX = cx + 12;
-  const doorZ = cz;
-
-  // Explicitly type ops as TownOp[]
   const ops: TownOp[] = [];
 
-  // 1) Clear volume above the flat ground
+  // 1) Clear everything above the town ground (box clear)
   ops.push({
     kind: "clear",
     min: { x: minX, y: CLEAR_Y_MIN, z: minZ },
     max: { x: maxX, y: CLEAR_Y_MAX, z: maxZ },
   });
 
-  // 2) Lay perfectly-flat grass ground across the town box (one layer)
+  // 2) Flat grass floor (one layer)
   ops.push({
     kind: "fill",
     id: BLOCKS.GRASS,
@@ -213,51 +196,68 @@ export function townOfBeginningsBlueprint(): TownOp[] {
     overwrite: true,
   });
 
-  // 3) Add a plaza of planks
-  ops.push({
-    kind: "fill",
-    id: (BLOCKS as any).PLANKS ?? BLOCKS.LOG,
-    min: plazaMin,
-    max: plazaMax,
-    overwrite: true,
-  });
-
-  // 4) Spawn marker (stone + torch placeholder)
+  // 3) Giant stone cross marker at center (VERY visible)
   ops.push({
     kind: "fill",
     id: BLOCKS.STONE,
-    min: { x: pillarX, y: TOWN_GROUND_Y + 1, z: pillarZ },
-    max: { x: pillarX, y: TOWN_GROUND_Y + 3, z: pillarZ },
+    min: { x: cx - 28, y: TOWN_GROUND_Y + 1, z: cz },
+    max: { x: cx + 28, y: TOWN_GROUND_Y + 1, z: cz },
+    overwrite: true,
+  });
+  ops.push({
+    kind: "fill",
+    id: BLOCKS.STONE,
+    min: { x: cx, y: TOWN_GROUND_Y + 1, z: cz - 28 },
+    max: { x: cx, y: TOWN_GROUND_Y + 1, z: cz + 28 },
     overwrite: true,
   });
 
-  // 5) Starter hut shell (wood)
+  // 4) Plaza
+  const plazaR = 9;
   ops.push({
     kind: "fill",
-    id: (BLOCKS as any).PLANKS ?? BLOCKS.LOG,
+    id: PLANKS,
+    min: { x: cx - plazaR, y: TOWN_GROUND_Y, z: cz - plazaR },
+    max: { x: cx + plazaR, y: TOWN_GROUND_Y, z: cz + plazaR },
+    overwrite: true,
+  });
+
+  // 5) Spawn pillar (stone column)
+  ops.push({
+    kind: "fill",
+    id: BLOCKS.STONE,
+    min: { x: cx, y: TOWN_GROUND_Y + 1, z: cz },
+    max: { x: cx, y: TOWN_GROUND_Y + 4, z: cz },
+    overwrite: true,
+  });
+
+  // 6) Starter hut (simple hollow box)
+  const hutMin = { x: cx + 12, y: TOWN_GROUND_Y + 1, z: cz - 6 };
+  const hutMax = { x: cx + 20, y: TOWN_GROUND_Y + 5, z: cz + 6 };
+
+  ops.push({
+    kind: "fill",
+    id: PLANKS,
     min: hutMin,
     max: hutMax,
     overwrite: true,
   });
 
-  // 6) Hollow the hut interior (air)
+  // Hollow interior
   ops.push({
     kind: "clear",
     min: { x: hutMin.x + 1, y: hutMin.y + 1, z: hutMin.z + 1 },
     max: { x: hutMax.x - 1, y: hutMax.y - 1, z: hutMax.z - 1 },
   });
 
-  // 7) Cut a doorway
+  // Doorway
   ops.push({
     kind: "clear",
-    min: { x: doorX, y: TOWN_GROUND_Y + 1, z: doorZ },
-    max: { x: doorX, y: TOWN_GROUND_Y + 2, z: doorZ },
+    min: { x: hutMin.x, y: TOWN_GROUND_Y + 1, z: cz },
+    max: { x: hutMin.x, y: TOWN_GROUND_Y + 2, z: cz },
   });
 
-  // 8) Place crafting table + chest inside (if IDs exist)
-  const CRAFTING_TABLE = (BLOCKS as any).CRAFTING_TABLE as BlockId | undefined;
-  const CHEST = (BLOCKS as any).CHEST as BlockId | undefined;
-
+  // Optional interior blocks
   if (CRAFTING_TABLE != null) {
     ops.push({
       kind: "fill",
@@ -267,7 +267,6 @@ export function townOfBeginningsBlueprint(): TownOp[] {
       overwrite: true,
     });
   }
-
   if (CHEST != null) {
     ops.push({
       kind: "fill",
@@ -292,25 +291,18 @@ export function applyTownOps(world: WorldStore, ops: TownOp[], opts?: { verbose?
   for (const op of ops) {
     opsApplied++;
 
-    const min = op.min;
-    const max = op.max;
-
-    const minX = Math.min(min.x, max.x) | 0;
-    const maxX = Math.max(min.x, max.x) | 0;
-    const minY = Math.min(min.y, max.y) | 0;
-    const maxY = Math.max(min.y, max.y) | 0;
-    const minZ = Math.min(min.z, max.z) | 0;
-    const maxZ = Math.max(min.z, max.z) | 0;
+    const b = normalizeBox(op.min, op.max);
 
     if (opts?.verbose) {
-      const v = volume({ x: minX, y: minY, z: minZ }, { x: maxX, y: maxY, z: maxZ });
-      console.log(`[TOWN] op ${opsApplied}/${ops.length} ${op.kind} vol=${v}`);
+      console.log(
+        `[TOWN] op ${opsApplied}/${ops.length} ${op.kind} vol=${volume(op.min, op.max)} box=(${b.minX},${b.minY},${b.minZ})..(${b.maxX},${b.maxY},${b.maxZ})`
+      );
     }
 
     if (op.kind === "clear") {
-      for (let x = minX; x <= maxX; x++) {
-        for (let y = minY; y <= maxY; y++) {
-          for (let z = minZ; z <= maxZ; z++) {
+      for (let x = b.minX; x <= b.maxX; x++) {
+        for (let y = b.minY; y <= b.maxY; y++) {
+          for (let z = b.minZ; z <= b.maxZ; z++) {
             blocksTouched += setBlockForce(world, x, y, z, BLOCKS.AIR);
           }
         }
@@ -322,9 +314,9 @@ export function applyTownOps(world: WorldStore, ops: TownOp[], opts?: { verbose?
     const onlyIfAir = !!op.onlyIfAir;
     const overwrite = !!op.overwrite;
 
-    for (let x = minX; x <= maxX; x++) {
-      for (let y = minY; y <= maxY; y++) {
-        for (let z = minZ; z <= maxZ; z++) {
+    for (let x = b.minX; x <= b.maxX; x++) {
+      for (let y = b.minY; y <= b.maxY; y++) {
+        for (let z = b.minZ; z <= b.maxZ; z++) {
           blocksTouched += setBlockForce(world, x, y, z, op.id, { onlyIfAir, overwrite });
         }
       }
@@ -335,14 +327,13 @@ export function applyTownOps(world: WorldStore, ops: TownOp[], opts?: { verbose?
 }
 
 // -----------------------------
-// Stamp logic (run once per version)
+// Stamp meta
 // -----------------------------
 
-function readStampMeta(): { version: string } | null {
-  const p = stampMetaPath();
-  if (!fs.existsSync(p)) return null;
+function readStampMeta(metaPath: string): { version: string } | null {
+  if (!fs.existsSync(metaPath)) return null;
   try {
-    const raw = fs.readFileSync(p, "utf8");
+    const raw = fs.readFileSync(metaPath, "utf8");
     const j = JSON.parse(raw);
     if (j && typeof j.version === "string") return { version: j.version };
     return null;
@@ -351,35 +342,59 @@ function readStampMeta(): { version: string } | null {
   }
 }
 
-function writeStampMeta(version: string) {
-  const p = stampMetaPath();
+function writeStampMeta(metaPath: string, version: string) {
   try {
-    fs.writeFileSync(p, JSON.stringify({ version, at: Date.now() }, null, 2));
+    fs.writeFileSync(metaPath, JSON.stringify({ version, at: Date.now() }, null, 2));
   } catch (e) {
     console.error("[TOWN] Failed to write stamp meta:", e);
   }
 }
 
-/**
- * Stamps Town of Beginnings if not already stamped for current version.
- * Safe to call inside Room.onCreate after world load.
- */
-export function stampTownOfBeginnings(world: WorldStore, opts?: { verbose?: boolean }): StampResult {
-  const meta = readStampMeta();
-  if (meta?.version === TOWN_STAMP_VERSION) {
-    return { stamped: false, version: TOWN_STAMP_VERSION, opsApplied: 0, blocksTouched: 0 };
+// -----------------------------
+// Public stamp entrypoint
+// -----------------------------
+
+export function stampTownOfBeginnings(
+  world: WorldStore,
+  opts?: { verbose?: boolean; force?: boolean }
+): StampResult {
+  const metaPath = stampMetaPath();
+  const meta = readStampMeta(metaPath);
+
+  const forced = !!opts?.force;
+
+  if (!forced && meta?.version === TOWN_STAMP_VERSION) {
+    if (opts?.verbose) {
+      console.log(`[TOWN] stamp skipped (already stamped) version=${TOWN_STAMP_VERSION} meta=${metaPath}`);
+    }
+    return {
+      stamped: false,
+      forced,
+      version: TOWN_STAMP_VERSION,
+      opsApplied: 0,
+      blocksTouched: 0,
+      metaPath,
+    };
+  }
+
+  if (opts?.verbose) {
+    console.log(
+      `[TOWN] stamping version=${TOWN_STAMP_VERSION} forced=${forced} meta=${metaPath} previous=${meta?.version || "none"}`
+    );
   }
 
   const ops = townOfBeginningsBlueprint();
   const applied = applyTownOps(world, ops, { verbose: opts?.verbose });
 
-  // mark dirty autosave will persist
-  writeStampMeta(TOWN_STAMP_VERSION);
+  // Update meta so we don't re-stamp every boot (unless force=true)
+  writeStampMeta(metaPath, TOWN_STAMP_VERSION);
 
   return {
     stamped: true,
+    forced,
     version: TOWN_STAMP_VERSION,
     opsApplied: applied.opsApplied,
     blocksTouched: applied.blocksTouched,
+    metaPath,
   };
 }
