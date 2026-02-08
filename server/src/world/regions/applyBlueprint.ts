@@ -1,7 +1,7 @@
 // ============================================================
 // src/world/regions/applyBlueprint.ts
 // ------------------------------------------------------------
-// Town of Beginnings v2.3 (FIXED BUILD ERROR)
+// Town of Beginnings v2.4 (TYPE FIX)
 //
 // Features:
 // - ASCII Prefab System: Draw buildings in text!
@@ -13,7 +13,7 @@
 // - EXPORTED inTownSafeZone helper (Required by MyRoom.ts)
 // - FIX: Diagonal walls are now watertight (no edge gaps)
 // - FIX: Terraforming Skirt & Lower Elevation
-// - FIX: Rotation type widened to 'number' to prevent TS compilation errors
+// - FIX: Rotation explicitly typed as 'number' to fix TS2322
 //
 // ============================================================
 
@@ -36,7 +36,7 @@ export const TOWN_SAFE_ZONE = {
 export const TOWN_GROUND_Y = 6;
 const TOWN_SLOPE_WIDTH = 24; 
 
-export const TOWN_STAMP_VERSION = "town_v3.3_fixed_build";
+export const TOWN_STAMP_VERSION = "town_v3.4_type_fix";
 
 // -----------------------------
 // Safe Zone Helper
