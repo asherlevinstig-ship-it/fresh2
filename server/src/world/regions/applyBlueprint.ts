@@ -1,7 +1,7 @@
 // ============================================================
 // src/world/regions/applyBlueprint.ts
 // ------------------------------------------------------------
-// Town of Beginnings v2.1 (WALL FIX)
+// Town of Beginnings v2.2 (TERRAFORMED SLOPE + WATERTIGHT WALLS)
 //
 // Features:
 // - ASCII Prefab System: Draw buildings in text!
@@ -12,6 +12,8 @@
 // - Textural variation in roads
 // - EXPORTED inTownSafeZone helper (Required by MyRoom.ts)
 // - FIX: Diagonal walls are now watertight (no edge gaps)
+// - FIX: Added "Terraforming Skirt" to blend town into world
+// - FIX: Lowered town height slightly to match world average
 //
 // ============================================================
 
@@ -30,8 +32,12 @@ export const TOWN_SAFE_ZONE = {
   yMax: 256,
 };
 
-export const TOWN_GROUND_Y = 10;
-export const TOWN_STAMP_VERSION = "town_v3.1_watertight_walls";
+// LOWERED from 10 to 6 to align better with world generation
+export const TOWN_GROUND_Y = 6;
+// How far out to slope the terrain so it doesn't look like a cliff
+const TOWN_SLOPE_WIDTH = 24; 
+
+export const TOWN_STAMP_VERSION = "town_v3.2_terraformed_slope";
 
 // -----------------------------
 // Safe Zone Helper (Fix for TS2724)
@@ -375,33 +381,58 @@ export function stampTownOfBeginnings(world: WorldStore, opts?: { verbose?: bool
   const cx = TOWN_SAFE_ZONE.center.x;
   const cz = TOWN_SAFE_ZONE.center.z;
   const gy = TOWN_GROUND_Y;
-
-  // 1. Clear Air
-  // (Simplified clearing - assumes relatively flat world or we just overwrite)
-  // For a perfect clear, we'd loop x/z/y. Let's just build additively for performance 
-  // and ensure we overwrite the ground.
-
-  // 2. Base Ground (Grass Circle)
   const r = TOWN_SAFE_ZONE.radius;
-  for (let x = -r; x <= r; x++) {
-    for (let z = -r; z <= r; z++) {
-      if (x*x + z*z > r*r) continue;
-      
+
+  // 1. TERRAFORMING: Create a slope from the town edge down to the world
+  // We go from Radius 0 out to Radius + SlopeWidth
+  const totalR = r + TOWN_SLOPE_WIDTH;
+
+  for (let x = -totalR; x <= totalR; x++) {
+    for (let z = -totalR; z <= totalR; z++) {
+      const dist = Math.sqrt(x*x + z*z);
+      if (dist > totalR) continue;
+
       const wx = cx + x;
       const wz = cz + z;
-      
-      // Foundation to prevent floating
-      for (let y = -2; y < gy; y++) {
-        world.applyPlace(wx, y, wz, BLOCKS.DIRT);
+
+      let surfaceY = gy;
+
+      // If outside the flat town circle, slope it down
+      if (dist > r) {
+        const distanceFromEdge = dist - r;
+        // Slope formula: Linear drop off with some noise
+        // Approx 1 block down every 1.5 blocks out
+        const drop = Math.floor(distanceFromEdge * 0.7);
+        surfaceY = gy - drop;
       }
-      world.applyPlace(wx, gy, wz, BLOCKS.GRASS);
-      
-      // Clear up a bit
-      for(let y=1; y<=10; y++) world.applyBreak(wx, gy+y, wz);
+
+      // Don't modify if it goes too deep (let natural terrain handle deep caves)
+      if (surfaceY < -5) continue;
+
+      // FILL THE COLUMN
+      // We fill from bottom up to surfaceY to ensure it's solid
+      // We start at -10 (bedrock-ish) to ensure no floating islands
+      for (let y = -10; y <= surfaceY; y++) {
+        let block = BLOCKS.DIRT;
+        
+        // Visuals: Grass on top, Dirt below, Stone deep down
+        if (y === surfaceY) block = BLOCKS.GRASS;
+        else if (y < surfaceY - 3) block = BLOCKS.STONE;
+        
+        // Force placement to overwrite any air pockets or existing trees
+        world.applyPlace(wx, y, wz, block);
+      }
+
+      // Clear air above the surface (to remove trees buried in the slope)
+      // We clear a bit higher near the town
+      const clearHeight = (dist <= r) ? 20 : 5;
+      for (let y = surfaceY + 1; y <= surfaceY + clearHeight; y++) {
+        world.applyBreak(wx, y, wz);
+      }
     }
   }
 
-  // 3. Roads (Cross shape + Ring)
+  // 2. Roads (Cross shape + Ring)
   for (let x = -r + 2; x <= r - 2; x++) {
     for (let z = -r + 2; z <= r - 2; z++) {
       const dist = Math.sqrt(x*x + z*z);
@@ -416,10 +447,10 @@ export function stampTownOfBeginnings(world: WorldStore, opts?: { verbose?: bool
     }
   }
 
-  // 4. Centerpiece: Fountain
+  // 3. Centerpiece: Fountain
   pasteSchematic(world, cx - 3, gy + 1, cz - 3, FOUNTAIN);
 
-  // 5. Buildings
+  // 4. Buildings
   // North House
   pasteSchematic(world, cx - 15, gy + 1, cz + 28, HOUSE_SMALL, 2);
   // East House
@@ -431,7 +462,7 @@ export function stampTownOfBeginnings(world: WorldStore, opts?: { verbose?: bool
   pasteSchematic(world, cx + 15, gy + 1, cz + 15, MARKET_STALL, 0);
   pasteSchematic(world, cx + 24, gy + 1, cz + 15, MARKET_STALL, 1);
 
-  // 6. Outer Walls (Octagon-ish)
+  // 5. Outer Walls (Octagon-ish) with Watertight Fix
   const wallR = r - 2;
   // N
   drawWall(world, cx-10, cz+wallR, cx+10, cz+wallR, gy+1);
@@ -453,17 +484,19 @@ export function stampTownOfBeginnings(world: WorldStore, opts?: { verbose?: bool
   drawWall(world, cx-10, cz-wallR, cx-wallR, cz-10, gy+1);
 
 
-  // 7. Vegetation (Fill empty grass spots)
+  // 6. Vegetation (Fill empty grass spots inside town)
   for (let i = 0; i < 40; i++) {
     const rx = Math.floor((Math.random() - 0.5) * r * 1.5);
     const rz = Math.floor((Math.random() - 0.5) * r * 1.5);
     
-    // Check if we are on grass (not road, not house)
-    const floor = world.getBlock(cx+rx, gy, cz+rz);
-    const above = world.getBlock(cx+rx, gy+1, cz+rz);
-    
-    if (floor === BLOCKS.GRASS && above === BLOCKS.AIR) {
-      spawnTree(world, cx+rx, gy+1, cz+rz);
+    // Check if valid spot (flat grass)
+    if (inTownSafeZone(cx+rx, gy, cz+rz)) {
+        const floor = world.getBlock(cx+rx, gy, cz+rz);
+        const above = world.getBlock(cx+rx, gy+1, cz+rz);
+        
+        if (floor === BLOCKS.GRASS && above === BLOCKS.AIR) {
+            spawnTree(world, cx+rx, gy+1, cz+rz);
+        }
     }
   }
 
