@@ -14,8 +14,10 @@
 // - Prevent repeated world load / stamp / autosave config per process: WORLD_BOOTSTRAPPED guard
 // - Optional autoDispose control (default false for persistent world room)
 // - FORCE_TOWN_STAMP / FORCE_TOWN_SPAWN are env-driven (still defaults match your intent)
-// - Safer player save writes (atomic temp file + rename)
+// - Safer player save writes (atomic temp file + replace; Windows-safe)
 // - Extra robustness: inventory references cleaned if item missing
+// - FIX: Increase initial world patch limit so town perimeter doesn’t appear “half stamped”
+//      (was 8000, now 50000 by default)
 //
 // IMPORTANT:
 // - Colyseus v0.17+ Room generic is NOT Room<State>; extend Room without generics.
@@ -27,9 +29,7 @@ import * as fs from "fs";
 import * as path from "path";
 
 import { WorldStore, BLOCKS, type BlockId } from "../world/WorldStore.js";
-
 import { MyRoomState, PlayerState, ItemState } from "./schema/MyRoomState.js";
-
 import { CraftingSystem } from "../crafting/CraftingSystem.js";
 
 import {
@@ -104,14 +104,44 @@ function readJsonFileSafe(filePath: string): any | null {
   }
 }
 
+/**
+ * Atomic-ish JSON write with a Windows-safe replace strategy.
+ * - Writes a temp file in same directory.
+ * - Tries rename (atomic on POSIX).
+ * - If rename fails because target exists (common on Windows),
+ *   falls back to: copy -> unlink temp (or unlink target then rename).
+ */
 function writeJsonAtomic(filePath: string, data: any) {
   const dir = path.dirname(filePath);
   try {
     if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
   } catch {}
+
   const tmp = `${filePath}.tmp.${process.pid}.${Math.floor(Math.random() * 1e9)}`;
   fs.writeFileSync(tmp, JSON.stringify(data, null, 2));
-  fs.renameSync(tmp, filePath);
+
+  try {
+    // POSIX: rename will replace atomically. Windows: may throw if dest exists.
+    fs.renameSync(tmp, filePath);
+    return;
+  } catch (e) {
+    // Windows-safe fallback
+    try {
+      // Try copy over target (overwrites)
+      fs.copyFileSync(tmp, filePath);
+      try {
+        fs.unlinkSync(tmp);
+      } catch {}
+      return;
+    } catch {
+      // Last resort: remove target then rename
+      try {
+        fs.rmSync(filePath, { force: true });
+      } catch {}
+      fs.renameSync(tmp, filePath);
+      return;
+    }
+  }
 }
 
 // ------------------------------------------------------------
@@ -493,9 +523,12 @@ export class MyRoom extends Room {
   // - FORCE_TOWN_STAMP: restamp town even if meta says done (will overwrite town area)
   // - FORCE_TOWN_SPAWN: always spawn players at town center for visibility
   // - ROOM_AUTO_DISPOSE: set true if you want room to dispose when empty (default false)
-  private static FORCE_TOWN_STAMP = String(process.env.FORCE_TOWN_STAMP || "false").toLowerCase() === "true";
-  private static FORCE_TOWN_SPAWN = String(process.env.FORCE_TOWN_SPAWN || "true").toLowerCase() === "true";
-  private static ROOM_AUTO_DISPOSE = String(process.env.ROOM_AUTO_DISPOSE || "false").toLowerCase() === "true";
+  private static FORCE_TOWN_STAMP =
+    String(process.env.FORCE_TOWN_STAMP || "false").toLowerCase() === "true";
+  private static FORCE_TOWN_SPAWN =
+    String(process.env.FORCE_TOWN_SPAWN || "true").toLowerCase() === "true";
+  private static ROOM_AUTO_DISPOSE =
+    String(process.env.ROOM_AUTO_DISPOSE || "false").toLowerCase() === "true";
 
   // Persistence paths (resolved at runtime)
   private worldPath = path.join(process.cwd(), "world_data.json");
@@ -535,6 +568,9 @@ export class MyRoom extends Room {
       };
     });
 
+    const equipJson =
+      typeof (p.equip as any)?.toJSON === "function" ? (p.equip as any).toJSON() : p.equip;
+
     const saveData = {
       x: p.x,
       y: p.y,
@@ -546,7 +582,7 @@ export class MyRoom extends Room {
       hotbarIndex: p.hotbarIndex,
       inventory: Array.from(p.inventory.slots),
       items: itemsArray,
-      equip: p.equip.toJSON(),
+      equip: equipJson,
     };
 
     allData[distinctId] = saveData;
@@ -976,7 +1012,14 @@ export class MyRoom extends Room {
     };
 
     const withinWorld = (x: number, y: number, z: number) => {
-      return x >= -MAX_COORD && x <= MAX_COORD && y >= -MAX_COORD && y <= MAX_COORD && z >= -MAX_COORD && z <= MAX_COORD;
+      return (
+        x >= -MAX_COORD &&
+        x <= MAX_COORD &&
+        y >= -MAX_COORD &&
+        y <= MAX_COORD &&
+        z >= -MAX_COORD &&
+        z <= MAX_COORD
+      );
     };
 
     const reject = (client: Client, reason: string, extra?: any) => {
@@ -1200,7 +1243,8 @@ export class MyRoom extends Room {
 
     client.send("welcome", { roomId: this.roomId, sessionId: client.sessionId });
 
-    const patch = MyRoom.WORLD.encodePatchAround({ x: p.x, y: p.y, z: p.z }, 96, { limit: 8000 });
+    // FIX: Town stamp touches >8000 blocks. Use a higher limit so perimeter isn’t missing.
+    const patch = MyRoom.WORLD.encodePatchAround({ x: p.x, y: p.y, z: p.z }, 96, { limit: 50000 });
     client.send("world:patch", patch);
   }
 

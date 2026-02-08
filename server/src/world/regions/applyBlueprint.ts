@@ -16,6 +16,11 @@
 // - Explicit union types to avoid TS "never" inference errors.
 // - Uses WorldStore applyBreak/applyPlace for correctness.
 // - Bumps TOWN_STAMP_VERSION whenever blueprint changes.
+//
+// FIXES INCLUDED (no behavior removed):
+// - FIX: Gate arch clearing now clears UNDER the beam (not the beam itself)
+// - FIX: Stamp meta write is atomic (Windows-safe) to avoid corrupt meta + unwanted restamps
+// - Small clarity helpers for fill modes (overwrite vs onlyIfAir)
 // ============================================================
 
 import * as fs from "fs";
@@ -41,7 +46,7 @@ export type TownFillOp = {
   min: Vec3i;
   max: Vec3i;
   onlyIfAir?: boolean; // do not overwrite existing
-  overwrite?: boolean; // break then place
+  overwrite?: boolean; // break then place (authoritative)
 };
 
 export type TownClearOp = {
@@ -107,6 +112,40 @@ export function inTownSafeZone(x: number, y: number, z: number) {
 }
 
 // -----------------------------
+// Atomic write helper (Windows-safe)
+// -----------------------------
+
+function writeJsonAtomic(filePath: string, data: any) {
+  const dir = path.dirname(filePath);
+  try {
+    if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
+  } catch {}
+
+  const tmp = `${filePath}.tmp.${process.pid}.${Math.floor(Math.random() * 1e9)}`;
+  fs.writeFileSync(tmp, JSON.stringify(data, null, 2));
+
+  try {
+    // POSIX: rename replaces; Windows: rename can fail if dest exists.
+    fs.renameSync(tmp, filePath);
+    return;
+  } catch {
+    try {
+      fs.copyFileSync(tmp, filePath);
+      try {
+        fs.unlinkSync(tmp);
+      } catch {}
+      return;
+    } catch {
+      try {
+        fs.rmSync(filePath, { force: true });
+      } catch {}
+      fs.renameSync(tmp, filePath);
+      return;
+    }
+  }
+}
+
+// -----------------------------
 // World write helpers
 // -----------------------------
 
@@ -162,12 +201,19 @@ function volume(min: Vec3i, max: Vec3i) {
   return dx * dy * dz;
 }
 
+// Clear box
+function clearBox(min: Vec3i, max: Vec3i): TownClearOp {
+  return { kind: "clear", min, max };
+}
+
+// Fill box (authoritative overwrite by default)
 function fillBox(id: BlockId, min: Vec3i, max: Vec3i, overwrite = true): TownFillOp {
   return { kind: "fill", id, min, max, overwrite };
 }
 
-function clearBox(min: Vec3i, max: Vec3i): TownClearOp {
-  return { kind: "clear", min, max };
+// Fill box only into air (non-destructive)
+function fillBoxIfAir(id: BlockId, min: Vec3i, max: Vec3i): TownFillOp {
+  return { kind: "fill", id, min, max, onlyIfAir: true, overwrite: false };
 }
 
 // -----------------------------
@@ -194,42 +240,20 @@ function addWallRingSquare(
 
   // North strip
   ops.push(
-    fillBox(
-      id,
-      { x: minX, y: y0, z: maxZ - (thickness - 1) },
-      { x: maxX, y: y1, z: maxZ },
-      true
-    )
+    fillBox(id, { x: minX, y: y0, z: maxZ - (thickness - 1) }, { x: maxX, y: y1, z: maxZ }, true)
   );
 
   // South strip
-  ops.push(
-    fillBox(
-      id,
-      { x: minX, y: y0, z: minZ },
-      { x: maxX, y: y1, z: minZ + (thickness - 1) },
-      true
-    )
-  );
+  ops.push(fillBox(id, { x: minX, y: y0, z: minZ }, { x: maxX, y: y1, z: minZ + (thickness - 1) }, true));
 
   // West strip
   ops.push(
-    fillBox(
-      id,
-      { x: minX, y: y0, z: minZ },
-      { x: minX + (thickness - 1), y: y1, z: maxZ },
-      true
-    )
+    fillBox(id, { x: minX, y: y0, z: minZ }, { x: minX + (thickness - 1), y: y1, z: maxZ }, true)
   );
 
   // East strip
   ops.push(
-    fillBox(
-      id,
-      { x: maxX - (thickness - 1), y: y0, z: minZ },
-      { x: maxX, y: y1, z: maxZ },
-      true
-    )
+    fillBox(id, { x: maxX - (thickness - 1), y: y0, z: minZ }, { x: maxX, y: y1, z: maxZ }, true)
   );
 
   // Gate carve (clear opening)
@@ -282,13 +306,8 @@ function addTower(
 
   ops.push(fillBox(id, min, max, true));
 
-  if (hollow && size >= 3 && (y1 - y0) >= 2) {
-    ops.push(
-      clearBox(
-        { x: min.x + 1, y: y0 + 1, z: min.z + 1 },
-        { x: max.x - 1, y: y1 - 1, z: max.z - 1 }
-      )
-    );
+  if (hollow && size >= 3 && y1 - y0 >= 2) {
+    ops.push(clearBox({ x: min.x + 1, y: y0 + 1, z: min.z + 1 }, { x: max.x - 1, y: y1 - 1, z: max.z - 1 }));
   }
 }
 
@@ -301,40 +320,19 @@ function addArch(
   // Simple arch: a 2-thick slab above gate + 2 pillars on sides
   const yTop = yBase + height - 1;
 
-  // Top beam
-  ops.push(
-    fillBox(
-      id,
-      { x: x0, y: yTop, z },
-      { x: x1, y: yTop, z: z + (thickness - 1) },
-      true
-    )
-  );
+  // Top beam (solid)
+  ops.push(fillBox(id, { x: x0, y: yTop, z }, { x: x1, y: yTop, z: z + (thickness - 1) }, true));
 
   // Side pillars (2-wide ends)
-  ops.push(
-    fillBox(
-      id,
-      { x: x0, y: yBase, z },
-      { x: x0 + 1, y: yTop, z: z + (thickness - 1) },
-      true
-    )
-  );
-  ops.push(
-    fillBox(
-      id,
-      { x: x1 - 1, y: yBase, z },
-      { x: x1, y: yTop, z: z + (thickness - 1) },
-      true
-    )
-  );
+  ops.push(fillBox(id, { x: x0, y: yBase, z }, { x: x0 + 1, y: yTop, z: z + (thickness - 1) }, true));
+  ops.push(fillBox(id, { x: x1 - 1, y: yBase, z }, { x: x1, y: yTop, z: z + (thickness - 1) }, true));
 
-  // Make sure interior is open under the beam (clear)
-  if ((x1 - x0) >= 4) {
+  // FIX: Clear the opening UNDER the beam (not the beam itself)
+  if (x1 - x0 >= 4 && height >= 2) {
     ops.push(
       clearBox(
-        { x: x0 + 2, y: yTop, z },
-        { x: x1 - 2, y: yTop, z: z + (thickness - 1) }
+        { x: x0 + 2, y: yBase, z },
+        { x: x1 - 2, y: yTop - 1, z: z + (thickness - 1) }
       )
     );
   }
@@ -356,7 +354,7 @@ export function townOfBeginningsBlueprint(): TownOp[] {
   const minZ = cz - r;
   const maxZ = cz + r;
 
-  // Wall ring slightly outside safe radius
+  // Wall ring slightly inside the floor edge
   const wallInset = 4; // how far from edge of town floor to wall
   const wallMinX = minX + wallInset;
   const wallMaxX = maxX - wallInset;
@@ -385,40 +383,14 @@ export function townOfBeginningsBlueprint(): TownOp[] {
   const ops: TownOp[] = [];
 
   // 1) Clear everything above ground inside the whole town square
-  ops.push(
-    clearBox(
-      { x: minX, y: CLEAR_Y_MIN, z: minZ },
-      { x: maxX, y: CLEAR_Y_MAX, z: maxZ }
-    )
-  );
+  ops.push(clearBox({ x: minX, y: CLEAR_Y_MIN, z: minZ }, { x: maxX, y: CLEAR_Y_MAX, z: maxZ }));
 
   // 2) Flat grass floor (one layer)
-  ops.push(
-    fillBox(
-      GRASS,
-      { x: minX, y: groundY, z: minZ },
-      { x: maxX, y: groundY, z: maxZ },
-      true
-    )
-  );
+  ops.push(fillBox(GRASS, { x: minX, y: groundY, z: minZ }, { x: maxX, y: groundY, z: maxZ }, true));
 
   // 3) Giant stone cross marker at center (very visible)
-  ops.push(
-    fillBox(
-      STONE,
-      { x: cx - 28, y: groundY + 1, z: cz },
-      { x: cx + 28, y: groundY + 1, z: cz },
-      true
-    )
-  );
-  ops.push(
-    fillBox(
-      STONE,
-      { x: cx, y: groundY + 1, z: cz - 28 },
-      { x: cx, y: groundY + 1, z: cz + 28 },
-      true
-    )
-  );
+  ops.push(fillBox(STONE, { x: cx - 28, y: groundY + 1, z: cz }, { x: cx + 28, y: groundY + 1, z: cz }, true));
+  ops.push(fillBox(STONE, { x: cx, y: groundY + 1, z: cz - 28 }, { x: cx, y: groundY + 1, z: cz + 28 }, true));
 
   // 4) Outer stone walls with south gate opening
   const gateWidth = 5;
@@ -445,7 +417,7 @@ export function townOfBeginningsBlueprint(): TownOp[] {
     // South wall z location (outer edge)
     const z = wallMinZ; // start of south strip
     addArch(ops, {
-      x0: x0 - 2,          // slightly wider than opening
+      x0: x0 - 2, // slightly wider than opening
       x1: x1 + 2,
       z,
       yBase: wallY0,
@@ -485,39 +457,18 @@ export function townOfBeginningsBlueprint(): TownOp[] {
 
   // 8) Plaza at center (planks)
   const plazaR = 10;
-  ops.push(
-    fillBox(
-      PLANKS,
-      { x: cx - plazaR, y: groundY, z: cz - plazaR },
-      { x: cx + plazaR, y: groundY, z: cz + plazaR },
-      true
-    )
-  );
+  ops.push(fillBox(PLANKS, { x: cx - plazaR, y: groundY, z: cz - plazaR }, { x: cx + plazaR, y: groundY, z: cz + plazaR }, true));
 
   // 9) Spawn pillar (stone column)
-  ops.push(
-    fillBox(
-      STONE,
-      { x: cx, y: groundY + 1, z: cz },
-      { x: cx, y: groundY + 4, z: cz },
-      true
-    )
-  );
+  ops.push(fillBox(STONE, { x: cx, y: groundY + 1, z: cz }, { x: cx, y: groundY + 4, z: cz }, true));
 
   // 10) Path from south gate to plaza center (gravel)
   {
     const gateCenterX = (((wallMinX + wallMaxX) / 2) | 0);
     const startZ = wallMinZ - 2; // slightly outside the wall for approach
-    const endZ = cz + plazaR;    // into plaza
-    const pathHalf = 1;         // 3-wide path
-    ops.push(
-      fillBox(
-        GRAVEL,
-        { x: gateCenterX - pathHalf, y: groundY, z: startZ },
-        { x: gateCenterX + pathHalf, y: groundY, z: endZ },
-        true
-      )
-    );
+    const endZ = cz + plazaR; // into plaza
+    const pathHalf = 1; // 3-wide path
+    ops.push(fillBox(GRAVEL, { x: gateCenterX - pathHalf, y: groundY, z: startZ }, { x: gateCenterX + pathHalf, y: groundY, z: endZ }, true));
   }
 
   // 11) Starter hut near plaza (simple plank shell, hollow)
@@ -527,51 +478,20 @@ export function townOfBeginningsBlueprint(): TownOp[] {
   ops.push(fillBox(PLANKS, hutMin, hutMax, true));
 
   // Hollow interior
-  ops.push(
-    clearBox(
-      { x: hutMin.x + 1, y: hutMin.y + 1, z: hutMin.z + 1 },
-      { x: hutMax.x - 1, y: hutMax.y - 1, z: hutMax.z - 1 }
-    )
-  );
+  ops.push(clearBox({ x: hutMin.x + 1, y: hutMin.y + 1, z: hutMin.z + 1 }, { x: hutMax.x - 1, y: hutMax.y - 1, z: hutMax.z - 1 }));
 
   // Doorway facing plaza (west side of hut)
-  ops.push(
-    clearBox(
-      { x: hutMin.x, y: groundY + 1, z: cz },
-      { x: hutMin.x, y: groundY + 2, z: cz }
-    )
-  );
+  ops.push(clearBox({ x: hutMin.x, y: groundY + 1, z: cz }, { x: hutMin.x, y: groundY + 2, z: cz }));
 
   // Hut-to-plaza path (gravel)
-  ops.push(
-    fillBox(
-      GRAVEL,
-      { x: cx + 11, y: groundY, z: cz - 1 },
-      { x: cx + 14, y: groundY, z: cz + 1 },
-      true
-    )
-  );
+  ops.push(fillBox(GRAVEL, { x: cx + 11, y: groundY, z: cz - 1 }, { x: cx + 14, y: groundY, z: cz + 1 }, true));
 
-  // Optional interior blocks
+  // Optional interior blocks (non-destructive by default)
   if (CRAFTING_TABLE != null) {
-    ops.push(
-      fillBox(
-        CRAFTING_TABLE,
-        { x: hutMin.x + 2, y: groundY + 1, z: hutMin.z + 2 },
-        { x: hutMin.x + 2, y: groundY + 1, z: hutMin.z + 2 },
-        true
-      )
-    );
+    ops.push(fillBoxIfAir(CRAFTING_TABLE, { x: hutMin.x + 2, y: groundY + 1, z: hutMin.z + 2 }, { x: hutMin.x + 2, y: groundY + 1, z: hutMin.z + 2 }));
   }
   if (CHEST != null) {
-    ops.push(
-      fillBox(
-        CHEST,
-        { x: hutMin.x + 3, y: groundY + 1, z: hutMin.z + 2 },
-        { x: hutMin.x + 3, y: groundY + 1, z: hutMin.z + 2 },
-        true
-      )
-    );
+    ops.push(fillBoxIfAir(CHEST, { x: hutMin.x + 3, y: groundY + 1, z: hutMin.z + 2 }, { x: hutMin.x + 3, y: groundY + 1, z: hutMin.z + 2 }));
   }
 
   return ops;
@@ -640,7 +560,8 @@ function readStampMeta(metaPath: string): { version: string } | null {
 
 function writeStampMeta(metaPath: string, version: string) {
   try {
-    fs.writeFileSync(metaPath, JSON.stringify({ version, at: Date.now() }, null, 2));
+    // FIX: atomic meta write (Windows-safe)
+    writeJsonAtomic(metaPath, { version, at: Date.now() });
   } catch (e) {
     console.error("[TOWN] Failed to write stamp meta:", e);
   }
@@ -650,10 +571,7 @@ function writeStampMeta(metaPath: string, version: string) {
 // Public stamp entrypoint
 // -----------------------------
 
-export function stampTownOfBeginnings(
-  world: WorldStore,
-  opts?: { verbose?: boolean; force?: boolean }
-): StampResult {
+export function stampTownOfBeginnings(world: WorldStore, opts?: { verbose?: boolean; force?: boolean }): StampResult {
   const metaPath = stampMetaPath();
   const meta = readStampMeta(metaPath);
 

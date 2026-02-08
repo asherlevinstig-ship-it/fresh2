@@ -18,6 +18,10 @@
 // Notes:
 // - Uses BLOCKS + BlockId from WorldStore.ts (import path may differ)
 // - PLANKS / crafted blocks are accessed defensively via (BLOCKS as any)
+//
+// FIXES INCLUDED (no behavior removed):
+// - Adds Y-band to inTownSafeZone (matches other implementation style)
+// - Keeps all existing ops and structure generation logic intact
 // ============================================================
 
 import { BLOCKS, type BlockId } from "../WorldStore.js";
@@ -55,21 +59,21 @@ export type TownFillOp = {
   yMax: number;
 
   // stamping behavior hint
-  onlyIfAir?: boolean;      // for fills (usually false for flatten)
-  overwrite?: boolean;      // explicit: if true, set regardless
+  onlyIfAir?: boolean; // for fills (usually false for flatten)
+  overwrite?: boolean; // explicit: if true, set regardless
 };
 
 export type TownClearOp = {
   kind: "clear";
   shape: "cylinder" | "box";
-  id: BlockId;              // should be AIR
+  id: BlockId; // should be AIR
   center?: Vec3i;
   radius?: number;
   min?: Vec3i;
   max?: Vec3i;
   yMin: number;
   yMax: number;
-  overwrite?: boolean;      // usually true for clear
+  overwrite?: boolean; // usually true for clear
 };
 
 export type TownOp = TownPlaceOp | TownFillOp | TownClearOp;
@@ -79,7 +83,7 @@ export type TownPlan = {
   name: string;
   center: Vec3i;
   safeRadius: number;
-  baseY: number;            // “ground” level for town (flat surface at baseY)
+  baseY: number; // “ground” level for town (flat surface at baseY)
   ops: TownOp[];
 };
 
@@ -96,6 +100,11 @@ export const TOWN = {
 
   // Safe zone radius (no break/place)
   safeRadius: 48,
+
+  // Safe zone vertical band (optional; keeps protection sane underground/sky)
+  // If you don't want Y limits, set yMin=-Infinity / yMax=Infinity in your stamper.
+  safeYMin: -64,
+  safeYMax: 256,
 
   // Perfectly-flat "build area" radius (foundation + clear)
   // Usually a bit larger than safeRadius so the boundary feels clean
@@ -116,6 +125,9 @@ export const TOWN = {
 // ------------------------------------------------------------
 
 export function inTownSafeZone(x: number, y: number, z: number) {
+  // FIX: Y-band to match the other safe-zone implementation pattern
+  if (y < TOWN.safeYMin || y > TOWN.safeYMax) return false;
+
   const dx = x - TOWN.center.x;
   const dz = z - TOWN.center.z;
   return dx * dx + dz * dz <= TOWN.safeRadius * TOWN.safeRadius;
