@@ -1,5 +1,5 @@
 // ============================================================
-// rooms/MyRoom.ts  (FULL REWRITE - NO OMITS - WORLD BOOTSTRAP GUARD + TOWN STAMP + SAFE ZONE + DUP CRAFT GUARD + PATCH FIXES + SPAWN FIX + DEBUG)
+// rooms/MyRoom.ts  (FULL REWRITE - NO OMITS - WORLD BOOTSTRAP GUARD + TOWN STAMP + SAFE ZONE + DUP CRAFT GUARD + PATCH TUNING + SPAWN SYNC FIX + DEBUG)
 // ------------------------------------------------------------
 // Keeps ALL logic from your current server rewrite:
 // - movement, sprint/stamina tick, swing
@@ -14,12 +14,11 @@
 // - Prevent repeated world load / stamp / autosave config per process: WORLD_BOOTSTRAPPED guard
 // - Optional autoDispose control (default false for persistent world room)
 // - FORCE_TOWN_STAMP / FORCE_TOWN_SPAWN are env-driven
-// - Safer player save writes (atomic temp file + rename) + Windows-safe fallback
+// - Safer player save writes (atomic temp file + rename, with fallback)
 // - Extra robustness: inventory references cleaned if item missing
-// - PATCH FIX: initial patch limit raised (default 200k) so town doesn't stream partially
-// - PATCH FIX: world:patch:req defaults raised + max raised (up to 200k)
-// - SPAWN FIX: choose spawn Y by scanning WorldStore column to avoid spawning under map/under town
-// - DEBUG: join probes, patch diagnostics, periodic position logs
+// - PATCH: larger initial patch + configurable limits
+// - SPAWN SYNC FIX: spawn high, send town-centered patch first, then server+client teleport after delay
+// - DEBUG: join probes + patch diagnostics + periodic position logs
 //
 // IMPORTANT:
 // - Colyseus v0.17+ Room generic is NOT Room<State>; extend Room without generics.
@@ -120,25 +119,23 @@ function writeJsonAtomic(filePath: string, data: any) {
     fs.renameSync(tmp, filePath);
     return;
   } catch {
-    // Windows fallback
+    // fallback (cross-device / windows)
     try {
       fs.copyFileSync(tmp, filePath);
       try {
         fs.unlinkSync(tmp);
       } catch {}
       return;
-    } catch {
-      try {
-        fs.rmSync(filePath, { force: true });
-      } catch {}
-      fs.renameSync(tmp, filePath);
-      return;
-    }
+    } catch {}
+    // last resort
+    try {
+      fs.rmSync(filePath, { force: true });
+    } catch {}
+    fs.renameSync(tmp, filePath);
   }
 }
 
-// Spawn helper: find the top solid block at (x,z) and spawn above it.
-// Prevents spawning under the map or inside foundations.
+// Spawn helper: find top solid block at (x,z) and spawn above it
 function findSpawnYAt(world: WorldStore, x: number, z: number, preferredY: number) {
   const ix = Math.floor(x);
   const iz = Math.floor(z);
@@ -146,7 +143,6 @@ function findSpawnYAt(world: WorldStore, x: number, z: number, preferredY: numbe
   const MIN_Y = -64;
   const MAX_Y = 256;
 
-  // Search around preferredY first (fast path)
   const startDown = clamp(Math.floor(preferredY + 40), MIN_Y, MAX_Y);
   const endDown = clamp(Math.floor(preferredY - 80), MIN_Y, MAX_Y);
 
@@ -155,13 +151,24 @@ function findSpawnYAt(world: WorldStore, x: number, z: number, preferredY: numbe
     if (id !== BLOCKS.AIR) return y + 2;
   }
 
-  // Fallback: search entire column from top
   for (let y = MAX_Y; y >= MIN_Y; y--) {
     const id = world.getBlock(ix, y, iz);
     if (id !== BLOCKS.AIR) return y + 2;
   }
 
   return preferredY + 2;
+}
+
+// Patch diagnostics (best effort, supports different patch shapes)
+function patchCount(patch: any): number | null {
+  if (!patch || typeof patch !== "object") return null;
+  const p: any = patch;
+  if (Array.isArray(p.edits)) return p.edits.length;
+  if (Array.isArray(p.blocks)) return p.blocks.length;
+  if (Array.isArray(p.data)) return p.data.length;
+  if (typeof p.count === "number") return p.count;
+  if (typeof p.n === "number") return p.n;
+  return null;
 }
 
 // ------------------------------------------------------------
@@ -524,25 +531,6 @@ function isValidBlockCoord(n: any) {
 }
 
 // ------------------------------------------------------------
-// Patch diagnostics helpers
-// ------------------------------------------------------------
-
-function patchCount(patch: any): number | null {
-  if (!patch || typeof patch !== "object") return null;
-  const anyPatch: any = patch;
-
-  if (Array.isArray(anyPatch.edits)) return anyPatch.edits.length;
-  if (Array.isArray(anyPatch.blocks)) return anyPatch.blocks.length;
-
-  if (typeof anyPatch.count === "number") return anyPatch.count;
-  if (typeof anyPatch.n === "number") return anyPatch.n;
-
-  if (Array.isArray(anyPatch.data)) return anyPatch.data.length;
-
-  return null;
-}
-
-// ------------------------------------------------------------
 // Room Implementation
 // ------------------------------------------------------------
 
@@ -562,21 +550,16 @@ export class MyRoom extends Room {
   private static FORCE_TOWN_SPAWN = String(process.env.FORCE_TOWN_SPAWN || "true").toLowerCase() === "true";
   private static ROOM_AUTO_DISPOSE = String(process.env.ROOM_AUTO_DISPOSE || "false").toLowerCase() === "true";
 
-  // PATCH LIMIT TUNING (env override)
-  private static INITIAL_PATCH_LIMIT = clamp(
-    Math.floor(Number(process.env.INITIAL_PATCH_LIMIT ?? 200000)),
-    10000,
-    1000000
-  );
-  private static PATCH_REQ_DEFAULT_LIMIT = clamp(
-    Math.floor(Number(process.env.PATCH_REQ_DEFAULT_LIMIT ?? 30000)),
-    1000,
-    1000000
-  );
-  private static PATCH_REQ_MAX_LIMIT = clamp(
-    Math.floor(Number(process.env.PATCH_REQ_MAX_LIMIT ?? 200000)),
-    5000,
-    2000000
+  // Patch tuning (env override)
+  private static INITIAL_PATCH_LIMIT = clamp(Math.floor(Number(process.env.INITIAL_PATCH_LIMIT ?? 200000)), 10000, 2000000);
+  private static PATCH_REQ_DEFAULT_LIMIT = clamp(Math.floor(Number(process.env.PATCH_REQ_DEFAULT_LIMIT ?? 30000)), 1000, 2000000);
+  private static PATCH_REQ_MAX_LIMIT = clamp(Math.floor(Number(process.env.PATCH_REQ_MAX_LIMIT ?? 200000)), 5000, 4000000);
+
+  // Spawn sync tuning (env override)
+  private static SPAWN_TELEPORT_DELAY_MS = clamp(
+    Math.floor(Number(process.env.SPAWN_TELEPORT_DELAY_MS ?? 250)),
+    0,
+    2000
   );
 
   // Persistence paths (resolved at runtime)
@@ -664,6 +647,7 @@ export class MyRoom extends Room {
     this.setState(new MyRoomState());
     console.log("MyRoom created:", this.roomId, options);
 
+    // Persistent world room by default
     this.autoDispose = MyRoom.ROOM_AUTO_DISPOSE;
 
     // --------------------------------------------------------
@@ -686,7 +670,7 @@ export class MyRoom extends Room {
         console.log(`[PERSIST] No save file found at ${this.worldPath}. Starting fresh.`);
       }
 
-      // 2) Stamp Town of Beginnings (versioned)
+      // 2) Stamp Town of Beginnings
       try {
         const res = stampTownOfBeginnings(MyRoom.WORLD, {
           verbose: true,
@@ -702,17 +686,17 @@ export class MyRoom extends Room {
         console.error("[TOWN] stamp failed:", e);
       }
 
-      // 3) Configure Autosave (world-level)
+      // 3) Configure Autosave
       MyRoom.WORLD.configureAutosave({
         path: this.worldPath,
         minIntervalMs: 30000,
       });
 
       console.log(
-        `[PATCHCFG] INITIAL_PATCH_LIMIT=${MyRoom.INITIAL_PATCH_LIMIT} PATCH_REQ_DEFAULT_LIMIT=${MyRoom.PATCH_REQ_DEFAULT_LIMIT} PATCH_REQ_MAX_LIMIT=${MyRoom.PATCH_REQ_MAX_LIMIT}`
+        `[CFG] FORCE_TOWN_STAMP=${MyRoom.FORCE_TOWN_STAMP} FORCE_TOWN_SPAWN=${MyRoom.FORCE_TOWN_SPAWN} ROOM_AUTO_DISPOSE=${MyRoom.ROOM_AUTO_DISPOSE}`
       );
       console.log(
-        `[FLAGS] FORCE_TOWN_STAMP=${MyRoom.FORCE_TOWN_STAMP} FORCE_TOWN_SPAWN=${MyRoom.FORCE_TOWN_SPAWN} ROOM_AUTO_DISPOSE=${MyRoom.ROOM_AUTO_DISPOSE}`
+        `[CFG] INITIAL_PATCH_LIMIT=${MyRoom.INITIAL_PATCH_LIMIT} PATCH_REQ_DEFAULT_LIMIT=${MyRoom.PATCH_REQ_DEFAULT_LIMIT} PATCH_REQ_MAX_LIMIT=${MyRoom.PATCH_REQ_MAX_LIMIT} SPAWN_TELEPORT_DELAY_MS=${MyRoom.SPAWN_TELEPORT_DELAY_MS}`
       );
     }
 
@@ -1066,9 +1050,8 @@ export class MyRoom extends Room {
 
       const patch = MyRoom.WORLD.encodePatchAround({ x: cx, y: cy, z: cz }, r, { limit });
 
-      const c = patchCount(patch);
       console.log(
-        `[PATCH:req] -> ${client.sessionId} center=(${cx},${cy},${cz}) r=${r} limit=${limit} count=${c ?? "?"}`
+        `[PATCH:req] -> ${client.sessionId} center=(${cx},${cy},${cz}) r=${r} limit=${limit} count=${patchCount(patch) ?? "?"}`
       );
 
       client.send("world:patch", patch);
@@ -1296,46 +1279,81 @@ export class MyRoom extends Room {
       add("item:stick", 8, 4);
     }
 
-    // Safety: clamp weird Y values (prevents under-map persistence bugs)
+    // Safety clamp for persisted Y
     p.y = clamp(isFiniteNum(p.y) ? p.y : (TOWN_GROUND_Y + 2), -50, 250);
 
-    // Force spawn at town for visibility (overrides persistence) - env driven
+    // --------------------------------------------------------
+    // SPAWN SYNC FIX (forced town spawn)
+    // --------------------------------------------------------
+    let sentInitialPatchInForceSpawn = false;
+
     if (MyRoom.FORCE_TOWN_SPAWN) {
       const sx = TOWN_SAFE_ZONE.center.x;
       const sz = TOWN_SAFE_ZONE.center.z;
 
-      const sy = findSpawnYAt(MyRoom.WORLD, sx, sz, TOWN_GROUND_Y);
+      const finalY = findSpawnYAt(MyRoom.WORLD, sx, sz, TOWN_GROUND_Y);
 
+      // TEMP spawn high to avoid falling before patch arrives client-side
       p.x = sx;
-      p.y = sy;
+      p.y = TOWN_GROUND_Y + 80;
       p.z = sz;
       p.yaw = 0;
       p.pitch = 0;
 
-      try {
-        const ix = Math.floor(sx);
-        const iz = Math.floor(sz);
+      // Put player in state immediately (so client sees them), then patch+teleport
+      syncEquipToolToHotbar(p);
+      this.state.players.set(client.sessionId, p);
+
+      // Patch centered on town surface, not temp-y player
+      const patchCenter = { x: Math.floor(sx), y: TOWN_GROUND_Y, z: Math.floor(sz) };
+      const patchR = 128;
+      const patch = MyRoom.WORLD.encodePatchAround(patchCenter, patchR, { limit: MyRoom.INITIAL_PATCH_LIMIT });
+
+      console.log(
+        `[SPAWN] FORCE_TOWN_SPAWN temp=(${p.x},${p.y},${p.z}) finalY=${finalY} ` +
+          `probeGround@${TOWN_GROUND_Y}=${MyRoom.WORLD.getBlock(Math.floor(sx), TOWN_GROUND_Y, Math.floor(sz))}`
+      );
+      console.log(
+        `[PATCH:init-town] -> ${client.sessionId} center=(${patchCenter.x},${patchCenter.y},${patchCenter.z}) r=${patchR} limit=${MyRoom.INITIAL_PATCH_LIMIT} count=${patchCount(patch) ?? "?"}`
+      );
+
+      client.send("welcome", { roomId: this.roomId, sessionId: client.sessionId });
+      client.send("world:patch", patch);
+
+      sentInitialPatchInForceSpawn = true;
+
+      // Teleport after short delay (gives client time to apply patch)
+      this.clock.setTimeout(() => {
+        p.x = sx;
+        p.y = finalY;
+        p.z = sz;
+
+        // Client should handle this by setting position (and zeroing velocity)
+        client.send("spawn:teleport", { x: sx, y: finalY, z: sz });
+
         console.log(
-          `[SPAWN] FORCE_TOWN_SPAWN -> pos=(${p.x},${p.y},${p.z}) ` +
-            `probeGround@${TOWN_GROUND_Y}=${MyRoom.WORLD.getBlock(ix, TOWN_GROUND_Y, iz)} ` +
-            `below=${MyRoom.WORLD.getBlock(ix, Math.floor(p.y) - 2, iz)}`
+          `[SPAWN] TELEPORT -> ${client.sessionId} pos=(${sx},${finalY},${sz}) delayMs=${MyRoom.SPAWN_TELEPORT_DELAY_MS}`
         );
-      } catch {}
+      }, MyRoom.SPAWN_TELEPORT_DELAY_MS);
+
+      // Done (skip rest of onJoin flow that would re-add player / double patch)
+      return;
     }
 
+    // --------------------------------------------------------
+    // Normal join flow (non-forced spawn)
+    // --------------------------------------------------------
     syncEquipToolToHotbar(p);
     this.state.players.set(client.sessionId, p);
 
     client.send("welcome", { roomId: this.roomId, sessionId: client.sessionId });
 
-    // --------------------------------------------------------
-    // DEBUG: player + town probes
-    // --------------------------------------------------------
+    // Debug probes
     try {
       console.log(
         `[JOIN] sid=${client.sessionId} distinctId=${distinctId} name=${p.name} pos=(${p.x.toFixed(2)},${p.y.toFixed(
           2
-        )},${p.z.toFixed(2)}) hotbar=${p.hotbarIndex} FORCE_TOWN_SPAWN=${MyRoom.FORCE_TOWN_SPAWN}`
+        )},${p.z.toFixed(2)}) hotbar=${p.hotbarIndex}`
       );
 
       const cx = TOWN_SAFE_ZONE.center.x | 0;
@@ -1353,25 +1371,20 @@ export class MyRoom extends Room {
       probe(cx, gy + 1, cz, "town +1 marker");
       probe(cx + 28, gy + 1, cz, "cross +X");
       probe(cx, gy + 1, cz + 28, "cross +Z");
-    } catch (e) {
-      console.warn("[JOIN] debug logging failed:", e);
+    } catch {}
+
+    // Initial patch (normal)
+    if (!sentInitialPatchInForceSpawn) {
+      const patchCenter = { x: Math.floor(p.x), y: Math.floor(p.y), z: Math.floor(p.z) };
+      const patchR = 96;
+      const patch = MyRoom.WORLD.encodePatchAround(patchCenter, patchR, { limit: MyRoom.INITIAL_PATCH_LIMIT });
+
+      console.log(
+        `[PATCH:init] -> ${client.sessionId} center=(${patchCenter.x},${patchCenter.y},${patchCenter.z}) r=${patchR} limit=${MyRoom.INITIAL_PATCH_LIMIT} count=${patchCount(patch) ?? "?"}`
+      );
+
+      client.send("world:patch", patch);
     }
-
-    // --------------------------------------------------------
-    // Initial patch (PATCH FIX: big limit so town isn't partial)
-    // --------------------------------------------------------
-    const patchCenter = { x: Math.floor(p.x), y: Math.floor(p.y), z: Math.floor(p.z) };
-    const patchR = 96;
-    const patch = MyRoom.WORLD.encodePatchAround(patchCenter, patchR, { limit: MyRoom.INITIAL_PATCH_LIMIT });
-
-    const c = patchCount(patch);
-    console.log(
-      `[PATCH:init] -> ${client.sessionId} center=(${patchCenter.x},${patchCenter.y},${patchCenter.z}) r=${patchR} limit=${MyRoom.INITIAL_PATCH_LIMIT} count=${c ?? "?"} keys=${Object.keys(
-        patch || {}
-      ).join(",")}`
-    );
-
-    client.send("world:patch", patch);
   }
 
   public onLeave(client: Client, code: number) {

@@ -23,6 +23,15 @@
  * - Register room.onMessage handlers for "welcome" and "block:reject"
  *   to avoid @colyseus/sdk warnings.
  *
+ * ADDED (Spawn Under Town Fix + Logging):
+ * - Prevent "spawn under town" by freezing player physics until first world patch
+ *   is applied, then snapping to spawn and zeroing velocity.
+ * - Handle server "spawn:teleport" message (if server sends it).
+ * - Add logging for:
+ *   - Server spawn
+ *   - Player position
+ *   - Town center block ids after patch
+ *
  * IMPORTANT:
  * - This file mirrors the server's biome/height/layer/ore logic via shared Biomes.ts
  * - It does NOT change server rules; FPS improvements are client-only.
@@ -363,6 +372,15 @@ const STATE = {
   swingT: 999,
   swingDuration: 0.22,
   moveAccum: 0,
+
+  // ---- Spawn/patch safety ----
+  worldReady: false, // becomes true after first world patch is applied
+  spawnSnapDone: false,
+  pendingTeleport: null, // {x,y,z} if received before worldReady
+  desiredSpawn: { x: 0, y: TOWN.groundY + 2, z: 0 },
+  freezeUntil: performance.now() + 8000, // safety: freeze for a few seconds on boot
+  lastPosLogAt: 0,
+  logPos: false, // toggle via F8
 };
 
 /* ============================================================
@@ -1255,6 +1273,42 @@ function snapshotState(me) {
   hotbarUI.refresh();
 }
 
+/* ----------------------------
+ * Spawn safety helpers (NEW)
+ * ---------------------------- */
+
+function zeroPlayerVelocity() {
+  try {
+    const body = noa.entities.getPhysicsBody(noa.playerEntity);
+    if (!body) return;
+    body.velocity[0] = 0;
+    body.velocity[1] = 0;
+    body.velocity[2] = 0;
+    if (body.angularVelocity) {
+      body.angularVelocity[0] = 0;
+      body.angularVelocity[1] = 0;
+      body.angularVelocity[2] = 0;
+    }
+  } catch {}
+}
+
+function forcePlayerPosition(x, y, z, reason = "") {
+  try {
+    noa.entities.setPosition(noa.playerEntity, x, y, z);
+    zeroPlayerVelocity();
+    if (reason) UI_CONSOLE.log(`snap -> (${x.toFixed(2)},${y.toFixed(2)},${z.toFixed(2)}) ${reason}`);
+  } catch {}
+}
+
+function tryLogTownCenterBlocks() {
+  // This depends on chunk availability; we try and log if accessible.
+  try {
+    const g = noa.getBlock(TOWN.cx, TOWN.groundY, TOWN.cz);
+    const m = noa.getBlock(TOWN.cx, TOWN.groundY + 1, TOWN.cz);
+    UI_CONSOLE.log(`Town center blocks: ground@Y=${TOWN.groundY} id=${g}, marker@Y+1 id=${m}`);
+  } catch {}
+}
+
 // DYNAMIC ENDPOINT SWITCH (Vercel Frontend -> Colyseus Cloud Backend)
 const ENDPOINT = window.location.hostname.includes("localhost")
   ? "ws://localhost:2567"
@@ -1285,15 +1339,41 @@ client
     // Register handlers to avoid sdk warnings
     room.onMessage("welcome", (msg) => {
       uiLog(`Welcome: ${msg?.roomId || ""} (${msg?.sessionId || ""})`);
+
       // Immediately request patch around town center too (helps ensure you see town)
       try {
-        room.send("world:patch:req", { x: TOWN.cx, y: TOWN.groundY, z: TOWN.cz, r: 128, limit: 20000 });
+        room.send("world:patch:req", { x: TOWN.cx, y: TOWN.groundY, z: TOWN.cz, r: 160, limit: 30000 });
+      } catch {}
+
+      // Extra: also request patch around our *current* player position (best-effort)
+      try {
+        const p = noa.entities.getPosition(noa.playerEntity);
+        room.send("world:patch:req", { x: p[0] | 0, y: p[1] | 0, z: p[2] | 0, r: 128, limit: 20000 });
       } catch {}
     });
 
     room.onMessage("block:reject", (msg) => {
       const reason = msg?.reason || "reject";
       UI_CONSOLE.warn(`block:reject (${reason})`);
+    });
+
+    // NEW: if server sends authoritative teleport/spawn
+    room.onMessage("spawn:teleport", (msg) => {
+      const x = Number(msg?.x);
+      const y = Number(msg?.y);
+      const z = Number(msg?.z);
+      if (!Number.isFinite(x) || !Number.isFinite(y) || !Number.isFinite(z)) return;
+
+      STATE.desiredSpawn = { x, y, z };
+
+      // If patch not ready yet, store it and freeze; otherwise snap immediately.
+      if (!STATE.worldReady) {
+        STATE.pendingTeleport = { x, y, z };
+        UI_CONSOLE.log(`spawn:teleport received early -> pending (${x},${y},${z})`);
+      } else {
+        forcePlayerPosition(x, y, z, "(spawn:teleport)");
+        STATE.spawnSnapDone = true;
+      }
     });
 
     room.onStateChange((state) => {
@@ -1315,7 +1395,35 @@ client
     });
 
     room.onMessage("world:patch", (patch) => {
-      (patch.edits || []).forEach((e) => noa.setBlock(e.id, e.x, e.y, e.z));
+      const edits = patch?.edits || [];
+      for (let i = 0; i < edits.length; i++) {
+        const e = edits[i];
+        noa.setBlock(e.id, e.x, e.y, e.z);
+      }
+
+      // Mark world ready once we applied at least one patch.
+      if (!STATE.worldReady) {
+        STATE.worldReady = true;
+        UI_CONSOLE.log(`worldReady=true (patch edits=${edits.length})`);
+
+        // If we were given a teleport before patch, apply now.
+        if (STATE.pendingTeleport) {
+          const t = STATE.pendingTeleport;
+          STATE.pendingTeleport = null;
+          forcePlayerPosition(t.x, t.y, t.z, "(pending teleport)");
+          STATE.spawnSnapDone = true;
+        } else {
+          // Snap to default town spawn once patch exists to avoid falling under the town.
+          // (We only do this once; server still authoritatively tracks you.)
+          const s = STATE.desiredSpawn || { x: 0, y: TOWN.groundY + 2, z: 0 };
+          forcePlayerPosition(s.x, s.y, s.z, "(first patch snap)");
+          STATE.spawnSnapDone = true;
+        }
+
+        // Helpful logging: check town center blocks
+        setTimeout(() => tryLogTownCenterBlocks(), 250);
+        setTimeout(() => tryLogTownCenterBlocks(), 1200);
+      }
     });
 
     room.onMessage("block:update", (msg) => {
@@ -1432,7 +1540,8 @@ noa.inputs.down.on("alt-fire", () => {
     }
 
     if (id !== 0) {
-      if (colyRoom) colyRoom.send("block:place", { x: p[0], y: p[1], z: p[2], kind: it.kind, src: "client_alt_fire" });
+      if (colyRoom)
+        colyRoom.send("block:place", { x: p[0], y: p[1], z: p[2], kind: it.kind, src: "client_alt_fire" });
       noa.setBlock(id, p[0], p[1], p[2]); // Predict
     }
   }
@@ -1468,6 +1577,22 @@ window.addEventListener("keydown", (e) => {
       UI_CONSOLE.log("Requested town patch (F6)");
     } catch {}
   }
+
+  // Debug: toggle position logging
+  if (e.code === "F8") {
+    STATE.logPos = !STATE.logPos;
+    UI_CONSOLE.log(`pos logging: ${STATE.logPos ? "ON" : "OFF"} (F8)`);
+  }
+
+  // Debug: force snap to town top
+  if (e.code === "F9") {
+    forcePlayerPosition(TOWN.cx + 0.5, TOWN.groundY + 3, TOWN.cz + 0.5, "(F9 manual snap)");
+    if (colyRoom) {
+      try {
+        colyRoom.send("move", { x: TOWN.cx + 0.5, y: TOWN.groundY + 3, z: TOWN.cz + 0.5, yaw: noa.camera.heading, pitch: noa.camera.pitch });
+      } catch {}
+    }
+  }
 });
 
 // --- RENDER LOOP ---
@@ -1493,6 +1618,22 @@ noa.on("beforeRender", () => {
 
   if (dt > 0.1) return; // Skip giant lag spikes
 
+  // 2.5) Spawn/fall prevention (NEW)
+  // Freeze player until:
+  // - first world patch applied (STATE.worldReady)
+  // - and we've performed at least one spawn snap
+  //
+  // We keep this gentle: we zero velocity and re-place them at desired spawn
+  // for a short boot window, so they can't fall below the stamped town.
+  try {
+    const tNow = performance.now();
+    const shouldFreeze = !STATE.worldReady || !STATE.spawnSnapDone || tNow < STATE.freezeUntil;
+    if (shouldFreeze) {
+      const s = STATE.desiredSpawn || { x: 0, y: TOWN.groundY + 2, z: 0 };
+      forcePlayerPosition(s.x, s.y, s.z, "");
+    }
+  } catch {}
+
   // 3) Update Animations
   updateRigAnim(dt);
 
@@ -1515,6 +1656,18 @@ noa.on("beforeRender", () => {
     }
   } catch {}
 
+  // 4.5) Optional position logging (NEW)
+  if (STATE.logPos) {
+    const tNow = performance.now();
+    if (tNow - STATE.lastPosLogAt > 800) {
+      STATE.lastPosLogAt = tNow;
+      try {
+        const p = noa.entities.getPosition(noa.playerEntity);
+        UI_CONSOLE.log(`pos=(${p[0].toFixed(2)}, ${p[1].toFixed(2)}, ${p[2].toFixed(2)}) worldReady=${STATE.worldReady} snap=${STATE.spawnSnapDone}`);
+      } catch {}
+    }
+  }
+
   // 5) Network Interpolation
   for (const sid in remotePlayers) {
     const rp = remotePlayers[sid];
@@ -1528,8 +1681,11 @@ noa.on("beforeRender", () => {
   }
 
   // 6) Send Move (Throttle)
+  // IMPORTANT: don’t spam move while we are still freezing/spawn-snapping.
   STATE.moveAccum += dt;
-  if (colyRoom && !inventoryOpen && STATE.moveAccum > 0.05) {
+  const stillFreezing = !STATE.worldReady || !STATE.spawnSnapDone || performance.now() < STATE.freezeUntil;
+
+  if (colyRoom && !inventoryOpen && !stillFreezing && STATE.moveAccum > 0.05) {
     STATE.moveAccum = 0;
     try {
       const p = noa.entities.getPosition(noa.playerEntity);
@@ -1539,5 +1695,8 @@ noa.on("beforeRender", () => {
   }
 });
 
-// Initial spawn (server may override logically; this just avoids falling)
+// Initial spawn (client-side safety).
+// Server may override; we keep player near town so they don’t free-fall before patch.
 noa.entities.setPosition(noa.playerEntity, 0, TOWN.groundY + 2, 0);
+zeroPlayerVelocity();
+UI_CONSOLE.log(`Initial client spawn set to town top (0,${TOWN.groundY + 2},0)`);
