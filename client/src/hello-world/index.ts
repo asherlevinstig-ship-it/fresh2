@@ -40,7 +40,8 @@ import {
   getCactusHeight,
   buildDefaultOreTablesFromPalette,
   pickOreId,
-} from "../world/Biomes";
+} from "../../world/Biomes";
+
 
 
 /* ============================================================
