@@ -1,5 +1,5 @@
 // ============================================================
-// rooms/MyRoom.ts  (FULL REWRITE - NO OMITS - WORLD BOOTSTRAP GUARD + TOWN STAMP + SAFE ZONE + DUP CRAFT GUARD + PATCH FIXES + DEBUG)
+// rooms/MyRoom.ts  (FULL REWRITE - NO OMITS - WORLD BOOTSTRAP GUARD + TOWN STAMP + SAFE ZONE + DUP CRAFT GUARD + PATCH FIXES + SPAWN FIX + DEBUG)
 // ------------------------------------------------------------
 // Keeps ALL logic from your current server rewrite:
 // - movement, sprint/stamina tick, swing
@@ -13,11 +13,12 @@
 // ADDITIONS / FIXES INCLUDED (without removing any existing behaviour):
 // - Prevent repeated world load / stamp / autosave config per process: WORLD_BOOTSTRAPPED guard
 // - Optional autoDispose control (default false for persistent world room)
-// - FORCE_TOWN_STAMP / FORCE_TOWN_SPAWN are env-driven (still defaults match your intent)
+// - FORCE_TOWN_STAMP / FORCE_TOWN_SPAWN are env-driven
 // - Safer player save writes (atomic temp file + rename) + Windows-safe fallback
 // - Extra robustness: inventory references cleaned if item missing
 // - PATCH FIX: initial patch limit raised (default 200k) so town doesn't stream partially
 // - PATCH FIX: world:patch:req defaults raised + max raised (up to 200k)
+// - SPAWN FIX: choose spawn Y by scanning WorldStore column to avoid spawning under map/under town
 // - DEBUG: join probes, patch diagnostics, periodic position logs
 //
 // IMPORTANT:
@@ -134,6 +135,33 @@ function writeJsonAtomic(filePath: string, data: any) {
       return;
     }
   }
+}
+
+// Spawn helper: find the top solid block at (x,z) and spawn above it.
+// Prevents spawning under the map or inside foundations.
+function findSpawnYAt(world: WorldStore, x: number, z: number, preferredY: number) {
+  const ix = Math.floor(x);
+  const iz = Math.floor(z);
+
+  const MIN_Y = -64;
+  const MAX_Y = 256;
+
+  // Search around preferredY first (fast path)
+  const startDown = clamp(Math.floor(preferredY + 40), MIN_Y, MAX_Y);
+  const endDown = clamp(Math.floor(preferredY - 80), MIN_Y, MAX_Y);
+
+  for (let y = startDown; y >= endDown; y--) {
+    const id = world.getBlock(ix, y, iz);
+    if (id !== BLOCKS.AIR) return y + 2;
+  }
+
+  // Fallback: search entire column from top
+  for (let y = MAX_Y; y >= MIN_Y; y--) {
+    const id = world.getBlock(ix, y, iz);
+    if (id !== BLOCKS.AIR) return y + 2;
+  }
+
+  return preferredY + 2;
 }
 
 // ------------------------------------------------------------
@@ -509,7 +537,6 @@ function patchCount(patch: any): number | null {
   if (typeof anyPatch.count === "number") return anyPatch.count;
   if (typeof anyPatch.n === "number") return anyPatch.n;
 
-  // Some encoders use { data: [...] }
   if (Array.isArray(anyPatch.data)) return anyPatch.data.length;
 
   return null;
@@ -531,9 +558,6 @@ export class MyRoom extends Room {
   private static WORLD_BOOTSTRAPPED = false;
 
   // DEV toggles (env-driven, with safe defaults)
-  // - FORCE_TOWN_STAMP: restamp town even if meta says done (will overwrite town area)
-  // - FORCE_TOWN_SPAWN: always spawn players at town center for visibility
-  // - ROOM_AUTO_DISPOSE: set true if you want room to dispose when empty (default false)
   private static FORCE_TOWN_STAMP = String(process.env.FORCE_TOWN_STAMP || "false").toLowerCase() === "true";
   private static FORCE_TOWN_SPAWN = String(process.env.FORCE_TOWN_SPAWN || "true").toLowerCase() === "true";
   private static ROOM_AUTO_DISPOSE = String(process.env.ROOM_AUTO_DISPOSE || "false").toLowerCase() === "true";
@@ -620,14 +644,12 @@ export class MyRoom extends Room {
   private cleanupDanglingInventoryRefs(p: PlayerState) {
     ensureSlotsLength(p);
 
-    // If inventory contains a UID that isn't in items, clear it.
     for (let i = 0; i < p.inventory.slots.length; i++) {
       const uid = String(p.inventory.slots[i] || "");
       if (!uid) continue;
       if (!p.items.get(uid)) p.inventory.slots[i] = "";
     }
 
-    // If equip references missing items, clear those too.
     (["tool", "head", "chest", "legs", "feet", "offhand"] as EquipKey[]).forEach((k) => {
       const uid = String((p.equip as any)[k] || "");
       if (uid && !p.items.get(uid)) (p.equip as any)[k] = "";
@@ -642,7 +664,6 @@ export class MyRoom extends Room {
     this.setState(new MyRoomState());
     console.log("MyRoom created:", this.roomId, options);
 
-    // Persistent world room by default (avoids constant create/dispose churn)
     this.autoDispose = MyRoom.ROOM_AUTO_DISPOSE;
 
     // --------------------------------------------------------
@@ -673,7 +694,6 @@ export class MyRoom extends Room {
         });
         console.log("[TOWN] stamp result:", res);
 
-        // Extra sanity logs (helps prove stamp is in WorldStore)
         try {
           console.log("[TOWN] center ground id =", MyRoom.WORLD.getBlock(0, TOWN_GROUND_Y, 0));
           console.log("[TOWN] center marker id =", MyRoom.WORLD.getBlock(0, TOWN_GROUND_Y + 1, 0));
@@ -690,6 +710,9 @@ export class MyRoom extends Room {
 
       console.log(
         `[PATCHCFG] INITIAL_PATCH_LIMIT=${MyRoom.INITIAL_PATCH_LIMIT} PATCH_REQ_DEFAULT_LIMIT=${MyRoom.PATCH_REQ_DEFAULT_LIMIT} PATCH_REQ_MAX_LIMIT=${MyRoom.PATCH_REQ_MAX_LIMIT}`
+      );
+      console.log(
+        `[FLAGS] FORCE_TOWN_STAMP=${MyRoom.FORCE_TOWN_STAMP} FORCE_TOWN_SPAWN=${MyRoom.FORCE_TOWN_SPAWN} ROOM_AUTO_DISPOSE=${MyRoom.ROOM_AUTO_DISPOSE}`
       );
     }
 
@@ -741,7 +764,11 @@ export class MyRoom extends Room {
         const last = lastPosLogAt.get(sid) || 0;
         if (t - last > 2000) {
           lastPosLogAt.set(sid, t);
-          console.log(`[POS] ${sid} pos=(${p.x.toFixed(1)},${p.y.toFixed(1)},${p.z.toFixed(1)}) sprint=${!!p.sprinting} stam=${(p.stamina || 0).toFixed(1)}`);
+          console.log(
+            `[POS] ${sid} pos=(${p.x.toFixed(1)},${p.y.toFixed(1)},${p.z.toFixed(
+              1
+            )}) sprint=${!!p.sprinting} stam=${(p.stamina || 0).toFixed(1)}`
+          );
         }
       });
 
@@ -1060,14 +1087,7 @@ export class MyRoom extends Room {
     };
 
     const withinWorld = (x: number, y: number, z: number) => {
-      return (
-        x >= -MAX_COORD &&
-        x <= MAX_COORD &&
-        y >= -MAX_COORD &&
-        y <= MAX_COORD &&
-        z >= -MAX_COORD &&
-        z <= MAX_COORD
-      );
+      return x >= -MAX_COORD && x <= MAX_COORD && y >= -MAX_COORD && y <= MAX_COORD && z >= -MAX_COORD && z <= MAX_COORD;
     };
 
     const reject = (client: Client, reason: string, extra?: any) => {
@@ -1237,7 +1257,6 @@ export class MyRoom extends Room {
         p.equip.offhand = saved.equip.offhand || "";
       }
 
-      // Robustness: clear any inventory/equip references that point to missing items.
       this.cleanupDanglingInventoryRefs(p);
     } else {
       console.log(`[PERSIST] New player ${distinctId}, giving starter gear.`);
@@ -1277,13 +1296,31 @@ export class MyRoom extends Room {
       add("item:stick", 8, 4);
     }
 
+    // Safety: clamp weird Y values (prevents under-map persistence bugs)
+    p.y = clamp(isFiniteNum(p.y) ? p.y : (TOWN_GROUND_Y + 2), -50, 250);
+
     // Force spawn at town for visibility (overrides persistence) - env driven
     if (MyRoom.FORCE_TOWN_SPAWN) {
-      p.x = TOWN_SAFE_ZONE.center.x;
-      p.y = TOWN_GROUND_Y + 2;
-      p.z = TOWN_SAFE_ZONE.center.z;
+      const sx = TOWN_SAFE_ZONE.center.x;
+      const sz = TOWN_SAFE_ZONE.center.z;
+
+      const sy = findSpawnYAt(MyRoom.WORLD, sx, sz, TOWN_GROUND_Y);
+
+      p.x = sx;
+      p.y = sy;
+      p.z = sz;
       p.yaw = 0;
       p.pitch = 0;
+
+      try {
+        const ix = Math.floor(sx);
+        const iz = Math.floor(sz);
+        console.log(
+          `[SPAWN] FORCE_TOWN_SPAWN -> pos=(${p.x},${p.y},${p.z}) ` +
+            `probeGround@${TOWN_GROUND_Y}=${MyRoom.WORLD.getBlock(ix, TOWN_GROUND_Y, iz)} ` +
+            `below=${MyRoom.WORLD.getBlock(ix, Math.floor(p.y) - 2, iz)}`
+        );
+      } catch {}
     }
 
     syncEquipToolToHotbar(p);
