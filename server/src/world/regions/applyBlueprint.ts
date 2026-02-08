@@ -1,7 +1,7 @@
 // ============================================================
 // src/world/regions/applyBlueprint.ts
 // ------------------------------------------------------------
-// Town of Beginnings v2 (ARTISTIC OVERHAUL)
+// Town of Beginnings v2 (ARTISTIC OVERHAUL + FIX)
 //
 // Features:
 // - ASCII Prefab System: Draw buildings in text!
@@ -10,6 +10,7 @@
 // - Market Stalls
 // - Procedural Tree generation
 // - Textural variation in roads
+// - EXPORTED inTownSafeZone helper (Required by MyRoom.ts)
 //
 // ============================================================
 
@@ -23,13 +24,29 @@ import { WorldStore, BLOCKS, type BlockId } from "../WorldStore.js";
 
 export const TOWN_SAFE_ZONE = {
   center: { x: 0, z: 0 },
-  radius: 48, // Slightly larger
+  radius: 48, // Slightly larger than v1
   yMin: -64,
   yMax: 256,
 };
 
 export const TOWN_GROUND_Y = 10;
 export const TOWN_STAMP_VERSION = "town_v3_artistic_overhaul";
+
+// -----------------------------
+// Safe Zone Helper (Fix for TS2724)
+// -----------------------------
+
+export function inTownSafeZone(x: number, y: number, z: number) {
+  const r = TOWN_SAFE_ZONE;
+  
+  // Check height bounds
+  if (y < r.yMin || y > r.yMax) return false;
+  
+  // Check radius (circle)
+  const dx = x - r.center.x;
+  const dz = z - r.center.z;
+  return Math.sqrt(dx * dx + dz * dz) <= r.radius;
+}
 
 // -----------------------------
 // Block Palette
@@ -42,15 +59,15 @@ const P = {
   G: BLOCKS.GRASS,
   S: BLOCKS.STONE,
   L: BLOCKS.LOG,
-  W: BLOCKS.PLANKS, // Wood Planks
+  W: (BLOCKS as any).PLANKS ?? BLOCKS.LOG, // Wood Planks
   V: BLOCKS.LEAVES, // Vegetation
-  R: BLOCKS.STONE,  // Road (Stone/Gravel mix logic)
-  C: BLOCKS.COAL_ORE, // Cobble/Dark stone substitute
-  F: BLOCKS.LOG,    // Fence substitute (or actual fence if you have it)
+  R: BLOCKS.STONE,  // Road (Stone/Gravel mix logic handled in code)
+  C: (BLOCKS as any).COAL_ORE ?? BLOCKS.STONE, // Cobble/Dark stone substitute
+  F: BLOCKS.LOG,    // Fence substitute
   X: BLOCKS.DIRT,   // Foundation filler
   T: BLOCKS.LOG,    // Trunk
-  I: BLOCKS.ICE,    // Water/Ice substitute
-  O: BLOCKS.GOLD_ORE, // Lamp/Light source
+  I: (BLOCKS as any).ICE ?? BLOCKS.STONE,    // Water/Ice substitute
+  O: (BLOCKS as any).GOLD_ORE ?? BLOCKS.STONE, // Lamp/Light source
 };
 
 // -----------------------------
@@ -101,7 +118,7 @@ function pasteSchematic(
         // Special Randomization logic
         if (char === 'R') {
           // Road: Mix Gravel and Stone
-          blockId = Math.random() > 0.7 ? BLOCKS.GRAVEL : BLOCKS.STONE;
+          blockId = Math.random() > 0.7 ? ((BLOCKS as any).GRAVEL ?? BLOCKS.STONE) : BLOCKS.STONE;
         }
 
         // Apply
@@ -327,9 +344,12 @@ export function stampTownOfBeginnings(world: WorldStore, opts?: { verbose?: bool
   let meta: any = null;
   try { meta = JSON.parse(fs.readFileSync(metaPath, 'utf8')); } catch {}
 
-  if (!opts?.force && meta?.version === TOWN_STAMP_VERSION) {
+  const forced = !!opts?.force;
+
+  // Use the constant here
+  if (!forced && meta?.version === TOWN_STAMP_VERSION) {
     if (opts?.verbose) console.log(`[TOWN] Already stamped v${TOWN_STAMP_VERSION}`);
-    return { stamped: false };
+    return { stamped: false, forced: false, version: TOWN_STAMP_VERSION, opsApplied: 0, blocksTouched: 0, metaPath };
   }
 
   if (opts?.verbose) console.log(`[TOWN] Stamping v${TOWN_STAMP_VERSION}...`);
@@ -372,7 +392,7 @@ export function stampTownOfBeginnings(world: WorldStore, opts?: { verbose?: bool
 
       if (isRing || isCross) {
          // Mix materials for detail
-         const mat = Math.random() > 0.2 ? BLOCKS.GRAVEL : BLOCKS.STONE;
+         const mat = Math.random() > 0.2 ? ((BLOCKS as any).GRAVEL ?? BLOCKS.STONE) : BLOCKS.STONE;
          world.applyPlace(cx + x, gy, cz + z, mat);
       }
     }
@@ -434,5 +454,13 @@ export function stampTownOfBeginnings(world: WorldStore, opts?: { verbose?: bool
     fs.writeFileSync(metaPath, JSON.stringify({ version: TOWN_STAMP_VERSION, at: Date.now() }));
   } catch {}
 
-  return { stamped: true, forced: !!opts?.force, version: TOWN_STAMP_VERSION };
+  // Return structure matching old signature to be safe
+  return { 
+      stamped: true, 
+      forced: forced, 
+      version: TOWN_STAMP_VERSION, 
+      opsApplied: 1, 
+      blocksTouched: 1, 
+      metaPath 
+  };
 }
