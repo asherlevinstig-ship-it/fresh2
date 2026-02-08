@@ -1,12 +1,15 @@
 // ============================================================
 // src/world/regions/applyBlueprint.ts
 // ------------------------------------------------------------
-// Town of Beginnings (PHASE 1 UPGRADE):
-// - Perfectly flat town ground + FOUNDATION (Option A: no floating town)
+// Town of Beginnings (PHASE 1 UPGRADE + FOUNDATION OPTION A + DEBUG PROBES)
+//
+// Features:
+// - Perfectly flat town ground at TOWN_GROUND_Y
+// - Foundation fill beneath town to prevent "floating town"
 // - Outer stone walls (2-thick, 8-high)
-// - 4 corner towers (5x5, taller)
+// - 4 corner towers (5x5, taller, hollow)
 // - South gate opening + simple arch
-// - Inner ring path + spawn-to-hut path
+// - Inner ring path + spawn-to-plaza path
 // - Plaza + hut (starter building)
 // - Giant cross marker for immediate visibility
 // - Stamp meta (versioned) + optional force restamp
@@ -16,12 +19,8 @@
 // - Explicit union types to avoid TS "never" inference errors.
 // - Uses WorldStore applyBreak/applyPlace for correctness.
 // - Bumps TOWN_STAMP_VERSION whenever blueprint changes.
+// - Option A here: add a guaranteed foundation under the town so it’s not in the air.
 //
-// FIXES INCLUDED (no behavior removed):
-// - Option A: Adds solid foundation under town (stone+dirt) so it doesn't float
-// - Clear starts at groundY+1 (doesn't nuke the ground layer unnecessarily)
-// - Gate arch clearing clears UNDER the beam (not the beam itself)
-// - Stamp meta write is atomic (Windows-safe) to avoid corrupt meta + unwanted restamps
 // ============================================================
 
 import * as fs from "fs";
@@ -47,7 +46,7 @@ export type TownFillOp = {
   min: Vec3i;
   max: Vec3i;
   onlyIfAir?: boolean; // do not overwrite existing
-  overwrite?: boolean; // break then place (authoritative)
+  overwrite?: boolean; // break then place if needed
 };
 
 export type TownClearOp = {
@@ -82,7 +81,7 @@ export const TOWN_SAFE_ZONE: TownRegion = {
 export const TOWN_GROUND_Y = 10;
 
 // Bump when blueprint changes
-// NOTE: If you change the blueprint (like foundation depth), bump this string
+// NOTE: bumped to include foundation to prevent floating town
 export const TOWN_STAMP_VERSION = "town_v2_walls_towers_gate_paths_foundation_002";
 
 // -----------------------------
@@ -111,40 +110,6 @@ export function inTownSafeZone(x: number, y: number, z: number) {
   const r = TOWN_SAFE_ZONE;
   if (!inRange(y, r.yMin, r.yMax)) return false;
   return distXZ(x, z, r.center.x, r.center.z) <= r.radius;
-}
-
-// -----------------------------
-// Atomic write helper (Windows-safe)
-// -----------------------------
-
-function writeJsonAtomic(filePath: string, data: any) {
-  const dir = path.dirname(filePath);
-  try {
-    if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
-  } catch {}
-
-  const tmp = `${filePath}.tmp.${process.pid}.${Math.floor(Math.random() * 1e9)}`;
-  fs.writeFileSync(tmp, JSON.stringify(data, null, 2));
-
-  try {
-    // POSIX: rename replaces; Windows: rename can fail if dest exists.
-    fs.renameSync(tmp, filePath);
-    return;
-  } catch {
-    try {
-      fs.copyFileSync(tmp, filePath);
-      try {
-        fs.unlinkSync(tmp);
-      } catch {}
-      return;
-    } catch {
-      try {
-        fs.rmSync(filePath, { force: true });
-      } catch {}
-      fs.renameSync(tmp, filePath);
-      return;
-    }
-  }
 }
 
 // -----------------------------
@@ -203,19 +168,12 @@ function volume(min: Vec3i, max: Vec3i) {
   return dx * dy * dz;
 }
 
-// Clear box
+function fillBox(id: BlockId, min: Vec3i, max: Vec3i, overwrite = true, onlyIfAir = false): TownFillOp {
+  return { kind: "fill", id, min, max, overwrite, onlyIfAir };
+}
+
 function clearBox(min: Vec3i, max: Vec3i): TownClearOp {
   return { kind: "clear", min, max };
-}
-
-// Fill box (authoritative overwrite by default)
-function fillBox(id: BlockId, min: Vec3i, max: Vec3i, overwrite = true): TownFillOp {
-  return { kind: "fill", id, min, max, overwrite };
-}
-
-// Fill box only into air (non-destructive)
-function fillBoxIfAir(id: BlockId, min: Vec3i, max: Vec3i): TownFillOp {
-  return { kind: "fill", id, min, max, onlyIfAir: true, overwrite: false };
 }
 
 // -----------------------------
@@ -239,19 +197,36 @@ function addWallRingSquare(
   const { minX, maxX, minZ, maxZ, y0, y1, thickness, id, gate } = opts;
 
   // North strip
-  ops.push(fillBox(id, { x: minX, y: y0, z: maxZ - (thickness - 1) }, { x: maxX, y: y1, z: maxZ }, true));
+  ops.push(
+    fillBox(
+      id,
+      { x: minX, y: y0, z: maxZ - (thickness - 1) },
+      { x: maxX, y: y1, z: maxZ },
+      true
+    )
+  );
 
   // South strip
-  ops.push(fillBox(id, { x: minX, y: y0, z: minZ }, { x: maxX, y: y1, z: minZ + (thickness - 1) }, true));
+  ops.push(
+    fillBox(
+      id,
+      { x: minX, y: y0, z: minZ },
+      { x: maxX, y: y1, z: minZ + (thickness - 1) },
+      true
+    )
+  );
 
   // West strip
-  ops.push(
-    fillBox(id, { x: minX, y: y0, z: minZ }, { x: minX + (thickness - 1), y: y1, z: maxZ }, true)
-  );
+  ops.push(fillBox(id, { x: minX, y: y0, z: minZ }, { x: minX + (thickness - 1), y: y1, z: maxZ }, true));
 
   // East strip
   ops.push(
-    fillBox(id, { x: maxX - (thickness - 1), y: y0, z: minZ }, { x: maxX, y: y1, z: maxZ }, true)
+    fillBox(
+      id,
+      { x: maxX - (thickness - 1), y: y0, z: minZ },
+      { x: maxX, y: y1, z: maxZ },
+      true
+    )
   );
 
   // Gate carve (clear opening)
@@ -305,12 +280,7 @@ function addTower(
   ops.push(fillBox(id, min, max, true));
 
   if (hollow && size >= 3 && y1 - y0 >= 2) {
-    ops.push(
-      clearBox(
-        { x: min.x + 1, y: y0 + 1, z: min.z + 1 },
-        { x: max.x - 1, y: y1 - 1, z: max.z - 1 }
-      )
-    );
+    ops.push(clearBox({ x: min.x + 1, y: y0 + 1, z: min.z + 1 }, { x: max.x - 1, y: y1 - 1, z: max.z - 1 }));
   }
 }
 
@@ -320,23 +290,19 @@ function addArch(
 ) {
   const { x0, x1, z, yBase, thickness, height, id } = opts;
 
+  // Simple arch: a 2-thick slab above gate + 2 pillars on sides
   const yTop = yBase + height - 1;
 
-  // Top beam (solid)
+  // Top beam
   ops.push(fillBox(id, { x: x0, y: yTop, z }, { x: x1, y: yTop, z: z + (thickness - 1) }, true));
 
   // Side pillars (2-wide ends)
   ops.push(fillBox(id, { x: x0, y: yBase, z }, { x: x0 + 1, y: yTop, z: z + (thickness - 1) }, true));
   ops.push(fillBox(id, { x: x1 - 1, y: yBase, z }, { x: x1, y: yTop, z: z + (thickness - 1) }, true));
 
-  // Clear opening UNDER the beam
-  if (x1 - x0 >= 4 && height >= 2) {
-    ops.push(
-      clearBox(
-        { x: x0 + 2, y: yBase, z },
-        { x: x1 - 2, y: yTop - 1, z: z + (thickness - 1) }
-      )
-    );
+  // Clear under beam interior (keep opening)
+  if (x1 - x0 >= 4) {
+    ops.push(clearBox({ x: x0 + 2, y: yBase, z }, { x: x1 - 2, y: yTop - 1, z: z + (thickness - 1) }));
   }
 }
 
@@ -356,18 +322,18 @@ export function townOfBeginningsBlueprint(): TownOp[] {
   const minZ = cz - r;
   const maxZ = cz + r;
 
-  // Wall ring slightly inside the floor edge
-  const wallInset = 4;
-  const wallMinX = minX + wallInset;
-  const wallMaxX = maxX - wallInset;
-  const wallMinZ = minZ + wallInset;
-  const wallMaxZ = maxZ - wallInset;
-
   const groundY = TOWN_GROUND_Y;
 
-  // FIX: clear starts above the ground layer so the stamped ground/foundation isn't constantly rewritten
+  // We clear ABOVE the surface, not including the surface itself.
   const CLEAR_Y_MIN = groundY + 1;
   const CLEAR_Y_MAX = groundY + 90;
+
+  // ---- Option A: FOUNDATION ----
+  // Fill from y=-2 up to y=groundY-1 with stone/dirt.
+  // This ensures the town does not "float" if the natural terrain is below groundY.
+  const FOUNDATION_Y_MIN = -2;
+  const FOUNDATION_STONE_TOP = groundY - 3; // stone up to here
+  const FOUNDATION_DIRT_TOP = groundY - 1;  // dirt up to here (just under grass)
 
   const WALL_THICK = 2;
   const WALL_H = 8;
@@ -386,34 +352,50 @@ export function townOfBeginningsBlueprint(): TownOp[] {
 
   const ops: TownOp[] = [];
 
-  // 1) Clear everything above ground inside the whole town square
+  // 0) Clear everything above ground inside the whole town square
   ops.push(clearBox({ x: minX, y: CLEAR_Y_MIN, z: minZ }, { x: maxX, y: CLEAR_Y_MAX, z: maxZ }));
 
-  // 1.5) OPTION A: Solid foundation under the town so it doesn't float
-  // Tune depth based on how low your natural terrain is at (0,0). 12 is a good start.
-  const FOUNDATION_DEPTH = 12;
+  // 0.5) Foundation fill (stone then dirt), overwriting to guarantee support under the surface.
+  // Stone layer (deeper)
+  if (FOUNDATION_Y_MIN <= FOUNDATION_STONE_TOP) {
+    ops.push(
+      fillBox(
+        STONE,
+        { x: minX, y: FOUNDATION_Y_MIN, z: minZ },
+        { x: maxX, y: FOUNDATION_STONE_TOP, z: maxZ },
+        true,
+        false
+      )
+    );
+  }
+  // Dirt layer (upper)
+  if (FOUNDATION_STONE_TOP + 1 <= FOUNDATION_DIRT_TOP) {
+    ops.push(
+      fillBox(
+        DIRT,
+        { x: minX, y: FOUNDATION_STONE_TOP + 1, z: minZ },
+        { x: maxX, y: FOUNDATION_DIRT_TOP, z: maxZ },
+        true,
+        false
+      )
+    );
+  }
 
-  // Deep foundation (stone) up to groundY-3
-  ops.push(
-    fillBox(
-      STONE,
-      { x: minX, y: groundY - FOUNDATION_DEPTH, z: minZ },
-      { x: maxX, y: groundY - 3, z: maxZ },
-      true
-    )
-  );
+  // 1) Flat grass floor (one layer) - overwriting so it becomes perfectly flat
+  ops.push(fillBox(GRASS, { x: minX, y: groundY, z: minZ }, { x: maxX, y: groundY, z: maxZ }, true, false));
 
-  // Upper foundation (dirt) at groundY-2..groundY-1
-  ops.push(fillBox(DIRT, { x: minX, y: groundY - 2, z: minZ }, { x: maxX, y: groundY - 1, z: maxZ }, true));
-
-  // 2) Flat grass floor (one layer)
-  ops.push(fillBox(GRASS, { x: minX, y: groundY, z: minZ }, { x: maxX, y: groundY, z: maxZ }, true));
-
-  // 3) Giant stone cross marker at center (very visible)
+  // 2) Giant stone cross marker at center (very visible)
   ops.push(fillBox(STONE, { x: cx - 28, y: groundY + 1, z: cz }, { x: cx + 28, y: groundY + 1, z: cz }, true));
   ops.push(fillBox(STONE, { x: cx, y: groundY + 1, z: cz - 28 }, { x: cx, y: groundY + 1, z: cz + 28 }, true));
 
-  // 4) Outer stone walls with south gate opening
+  // 3) Outer stone walls with south gate opening
+  // Wall ring slightly inside safe radius
+  const wallInset = 4;
+  const wallMinX = minX + wallInset;
+  const wallMaxX = maxX - wallInset;
+  const wallMinZ = minZ + wallInset;
+  const wallMaxZ = maxZ - wallInset;
+
   const gateWidth = 5;
   const gateHeight = 4;
 
@@ -429,13 +411,13 @@ export function townOfBeginningsBlueprint(): TownOp[] {
     gate: { side: "south", width: gateWidth, height: gateHeight, centerOffset: 0 },
   });
 
-  // 5) Gate arch just above the opening (south side)
+  // 4) Gate arch just above the opening (south side)
   {
-    const gateCenterX = (((wallMinX + wallMaxX) / 2) | 0);
+    const gateCenterX = ((wallMinX + wallMaxX) / 2) | 0;
     const x0 = gateCenterX - ((gateWidth / 2) | 0);
     const x1 = x0 + gateWidth - 1;
 
-    const z = wallMinZ;
+    const z = wallMinZ; // south wall strip start z
     addArch(ops, {
       x0: x0 - 2,
       x1: x1 + 2,
@@ -447,7 +429,7 @@ export function townOfBeginningsBlueprint(): TownOp[] {
     });
   }
 
-  // 6) Corner towers (5x5, taller), hollow inside
+  // 5) Corner towers (5x5, taller), hollow inside
   const towerSize = 5;
   const towerY1 = wallY1 + 4;
 
@@ -456,83 +438,73 @@ export function townOfBeginningsBlueprint(): TownOp[] {
   addTower(ops, { cx: wallMinX, cz: wallMaxZ, size: towerSize, y0: wallY0, y1: towerY1, id: STONE, hollow: true });
   addTower(ops, { cx: wallMaxX, cz: wallMaxZ, size: towerSize, y0: wallY0, y1: towerY1, id: STONE, hollow: true });
 
-  // 7) Inner perimeter path ring (gravel) just inside the walls
+  // 6) Inner perimeter path ring (gravel) just inside the walls
+  // First fill a big gravel square
   ops.push(
     fillBox(
       GRAVEL,
       { x: wallMinX + WALL_THICK, y: groundY, z: wallMinZ + WALL_THICK },
       { x: wallMaxX - WALL_THICK, y: groundY, z: wallMaxZ - WALL_THICK },
-      true
+      true,
+      false
     )
   );
-  // Hollow middle back to grass (so it's a ring, not full fill)
+  // Then re-fill the interior to grass to make it a ring
   ops.push(
     fillBox(
       GRASS,
       { x: wallMinX + WALL_THICK + 2, y: groundY, z: wallMinZ + WALL_THICK + 2 },
       { x: wallMaxX - WALL_THICK - 2, y: groundY, z: wallMaxZ - WALL_THICK - 2 },
-      true
+      true,
+      false
     )
   );
 
-  // 8) Plaza at center (planks)
+  // 7) Plaza at center (planks)
   const plazaR = 10;
-  ops.push(
-    fillBox(PLANKS, { x: cx - plazaR, y: groundY, z: cz - plazaR }, { x: cx + plazaR, y: groundY, z: cz + plazaR }, true)
-  );
+  ops.push(fillBox(PLANKS, { x: cx - plazaR, y: groundY, z: cz - plazaR }, { x: cx + plazaR, y: groundY, z: cz + plazaR }, true, false));
 
-  // 9) Spawn pillar (stone column)
+  // 8) Spawn pillar (stone column)
   ops.push(fillBox(STONE, { x: cx, y: groundY + 1, z: cz }, { x: cx, y: groundY + 4, z: cz }, true));
 
-  // 10) Path from south gate to plaza center (gravel)
+  // 9) Path from south gate to plaza center (gravel)
   {
-    const gateCenterX = (((wallMinX + wallMaxX) / 2) | 0);
-    const startZ = wallMinZ - 2;
-    const endZ = cz + plazaR;
-    const pathHalf = 1;
+    const gateCenterX = ((wallMinX + wallMaxX) / 2) | 0;
+    const startZ = wallMinZ - 2; // approach outside wall
+    const endZ = cz + plazaR;    // into plaza
+    const pathHalf = 1;         // 3-wide
     ops.push(
-      fillBox(GRAVEL, { x: gateCenterX - pathHalf, y: groundY, z: startZ }, { x: gateCenterX + pathHalf, y: groundY, z: endZ }, true)
+      fillBox(
+        GRAVEL,
+        { x: gateCenterX - pathHalf, y: groundY, z: startZ },
+        { x: gateCenterX + pathHalf, y: groundY, z: endZ },
+        true,
+        false
+      )
     );
   }
 
-  // 11) Starter hut near plaza (simple plank shell, hollow)
+  // 10) Starter hut near plaza (simple plank shell, hollow)
   const hutMin = { x: cx + 14, y: groundY + 1, z: cz - 6 };
   const hutMax = { x: cx + 22, y: groundY + 5, z: cz + 6 };
 
   ops.push(fillBox(PLANKS, hutMin, hutMax, true));
 
   // Hollow interior
-  ops.push(
-    clearBox(
-      { x: hutMin.x + 1, y: hutMin.y + 1, z: hutMin.z + 1 },
-      { x: hutMax.x - 1, y: hutMax.y - 1, z: hutMax.z - 1 }
-    )
-  );
+  ops.push(clearBox({ x: hutMin.x + 1, y: hutMin.y + 1, z: hutMin.z + 1 }, { x: hutMax.x - 1, y: hutMax.y - 1, z: hutMax.z - 1 }));
 
   // Doorway facing plaza (west side of hut)
   ops.push(clearBox({ x: hutMin.x, y: groundY + 1, z: cz }, { x: hutMin.x, y: groundY + 2, z: cz }));
 
   // Hut-to-plaza path (gravel)
-  ops.push(fillBox(GRAVEL, { x: cx + 11, y: groundY, z: cz - 1 }, { x: cx + 14, y: groundY, z: cz + 1 }, true));
+  ops.push(fillBox(GRAVEL, { x: cx + 11, y: groundY, z: cz - 1 }, { x: cx + 14, y: groundY, z: cz + 1 }, true, false));
 
-  // Optional interior blocks (non-destructive by default)
+  // Optional interior blocks
   if (CRAFTING_TABLE != null) {
-    ops.push(
-      fillBoxIfAir(
-        CRAFTING_TABLE,
-        { x: hutMin.x + 2, y: groundY + 1, z: hutMin.z + 2 },
-        { x: hutMin.x + 2, y: groundY + 1, z: hutMin.z + 2 }
-      )
-    );
+    ops.push(fillBox(CRAFTING_TABLE, { x: hutMin.x + 2, y: groundY + 1, z: hutMin.z + 2 }, { x: hutMin.x + 2, y: groundY + 1, z: hutMin.z + 2 }, true));
   }
   if (CHEST != null) {
-    ops.push(
-      fillBoxIfAir(
-        CHEST,
-        { x: hutMin.x + 3, y: groundY + 1, z: hutMin.z + 2 },
-        { x: hutMin.x + 3, y: groundY + 1, z: hutMin.z + 2 }
-      )
-    );
+    ops.push(fillBox(CHEST, { x: hutMin.x + 3, y: groundY + 1, z: hutMin.z + 2 }, { x: hutMin.x + 3, y: groundY + 1, z: hutMin.z + 2 }, true));
   }
 
   return ops;
@@ -561,7 +533,7 @@ export function applyTownOps(world: WorldStore, ops: TownOp[], opts?: { verbose?
       for (let x = b.minX; x <= b.maxX; x++) {
         for (let y = b.minY; y <= b.maxY; y++) {
           for (let z = b.minZ; z <= b.maxZ; z++) {
-            blocksTouched += setBlockForce(world, x, y, z, BLOCKS.AIR);
+            blocksTouched += setBlockForce(world, x, y, z, BLOCKS.AIR, { overwrite: true });
           }
         }
       }
@@ -601,9 +573,53 @@ function readStampMeta(metaPath: string): { version: string } | null {
 
 function writeStampMeta(metaPath: string, version: string) {
   try {
-    writeJsonAtomic(metaPath, { version, at: Date.now() });
+    fs.writeFileSync(metaPath, JSON.stringify({ version, at: Date.now() }, null, 2));
   } catch (e) {
     console.error("[TOWN] Failed to write stamp meta:", e);
+  }
+}
+
+// -----------------------------
+// Debug probes
+// -----------------------------
+
+function debugTownProbes(world: WorldStore) {
+  try {
+    const cx = TOWN_SAFE_ZONE.center.x | 0;
+    const cz = TOWN_SAFE_ZONE.center.z | 0;
+    const gy = TOWN_GROUND_Y | 0;
+
+    const probe = (x: number, y: number, z: number, label: string) => {
+      const id = world.getBlock(x, y, z);
+      console.log(`[TOWN][PROBE] ${label} @ ${x},${y},${z} => id=${id}`);
+    };
+
+    console.log(`[TOWN][PROBE] center=(${cx},${gy},${cz}) r=${TOWN_SAFE_ZONE.radius}`);
+
+    probe(cx, gy, cz, "ground");
+    probe(cx, gy + 1, cz, "marker");
+    probe(cx + 28, gy + 1, cz, "cross +X");
+    probe(cx, gy + 1, cz + 28, "cross +Z");
+
+    // approximate wall corners (since wallInset=4 and thickness=2)
+    const r = TOWN_SAFE_ZONE.radius | 0;
+    const minX = cx - r;
+    const maxX = cx + r;
+    const minZ = cz - r;
+    const maxZ = cz + r;
+    const wallInset = 4;
+
+    const wallMinX = minX + wallInset;
+    const wallMaxX = maxX - wallInset;
+    const wallMinZ = minZ + wallInset;
+    const wallMaxZ = maxZ - wallInset;
+
+    probe(wallMinX, gy + 1, wallMinZ, "wall corner SW");
+    probe(wallMaxX, gy + 1, wallMinZ, "wall corner SE");
+    probe(wallMinX, gy + 1, wallMaxZ, "wall corner NW");
+    probe(wallMaxX, gy + 1, wallMaxZ, "wall corner NE");
+  } catch (e) {
+    console.warn("[TOWN][PROBE] failed:", e);
   }
 }
 
@@ -621,6 +637,9 @@ export function stampTownOfBeginnings(world: WorldStore, opts?: { verbose?: bool
     if (opts?.verbose) {
       console.log(`[TOWN] stamp skipped (already stamped) version=${TOWN_STAMP_VERSION} meta=${metaPath}`);
     }
+    // Even on skip, probes are useful to confirm world still contains town
+    if (opts?.verbose) debugTownProbes(world);
+
     return {
       stamped: false,
       forced,
@@ -641,6 +660,8 @@ export function stampTownOfBeginnings(world: WorldStore, opts?: { verbose?: bool
   const applied = applyTownOps(world, ops, { verbose: opts?.verbose });
 
   writeStampMeta(metaPath, TOWN_STAMP_VERSION);
+
+  if (opts?.verbose) debugTownProbes(world);
 
   return {
     stamped: true,
