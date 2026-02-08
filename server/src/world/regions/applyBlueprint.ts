@@ -72,7 +72,8 @@ export const TOWN_GROUND_Y = 10;
 
 // Stamp version: bump this string whenever you change the blueprint.
 // (It will stamp again when version changes.)
-export const TOWN_STAMP_VERSION = "town_v1_flat_001";
+export const TOWN_STAMP_VERSION = "town_v1_flat_002";
+
 
 // Where we store whether it’s already stamped (in server cwd)
 function stampMetaPath() {
