@@ -1,7 +1,7 @@
 // ============================================================
 // src/world/regions/applyBlueprint.ts
 // ------------------------------------------------------------
-// Town of Beginnings v2 (ARTISTIC OVERHAUL + FIX)
+// Town of Beginnings v2.1 (WALL FIX)
 //
 // Features:
 // - ASCII Prefab System: Draw buildings in text!
@@ -11,6 +11,7 @@
 // - Procedural Tree generation
 // - Textural variation in roads
 // - EXPORTED inTownSafeZone helper (Required by MyRoom.ts)
+// - FIX: Diagonal walls are now watertight (no edge gaps)
 //
 // ============================================================
 
@@ -30,7 +31,7 @@ export const TOWN_SAFE_ZONE = {
 };
 
 export const TOWN_GROUND_Y = 10;
-export const TOWN_STAMP_VERSION = "town_v3_artistic_overhaul";
+export const TOWN_STAMP_VERSION = "town_v3.1_watertight_walls";
 
 // -----------------------------
 // Safe Zone Helper (Fix for TS2724)
@@ -322,17 +323,34 @@ function drawWall(world: WorldStore, x1: number, z1: number, x2: number, z2: num
   
   const len = Math.max(Math.abs(x2 - x1), Math.abs(z2 - z1));
 
+  // If both dx and dz are non-zero, it's a diagonal wall.
+  // We need to fill the gap to make it watertight (no edge-only connections).
+  const isDiagonal = (dx !== 0 && dz !== 0);
+
   for (let i = 0; i <= len; i++) {
-    // Foundation
-    for (let y = -2; y < yBase; y++) world.applyPlace(cx, y, cz, BLOCKS.STONE);
-    // Wall
-    for (let y = yBase; y < yBase + 5; y++) world.applyPlace(cx, y, cz, BLOCKS.STONE);
-    // Crenellations (every other block)
-    if (i % 2 === 0) world.applyPlace(cx, yBase + 5, cz, BLOCKS.STONE);
+    // 1. Draw the primary column at (cx, cz)
+    drawColumn(world, cx, cz, yBase, i % 2 === 0);
+
+    // 2. If diagonal, draw a filler column to seal the gap
+    // We place it at (cx + dx, cz) which is the "step" in X before the step in Z.
+    // This creates a solid stair-step pattern.
+    if (isDiagonal && i < len) {
+        drawColumn(world, cx + dx, cz, yBase, (i+1) % 2 === 0);
+    }
 
     cx += dx;
     cz += dz;
   }
+}
+
+// Helper to draw a single vertical slice of the wall
+function drawColumn(world: WorldStore, x: number, z: number, yBase: number, crenellation: boolean) {
+    // Foundation (ensure it hits ground)
+    for (let y = -2; y < yBase; y++) world.applyPlace(x, y, z, BLOCKS.STONE);
+    // Main Wall Body (5 blocks high)
+    for (let y = yBase; y < yBase + 5; y++) world.applyPlace(x, y, z, BLOCKS.STONE);
+    // Crenellations (Battlements) on top
+    if (crenellation) world.applyPlace(x, yBase + 5, z, BLOCKS.STONE);
 }
 
 // -----------------------------
