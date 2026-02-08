@@ -316,7 +316,7 @@ const opts = {
   chunkAddDistance: RENDER_PRESET_OUTSIDE.chunkAddDistance,
   chunkRemoveDistance: RENDER_PRESET_OUTSIDE.chunkRemoveDistance,
   stickyPointerLock: true,
-  dragCamera outsidePointerLock: true,
+  dragCameraOutsidePointerLock: true, // Fixed Typo
   initialZoom: 0,
   zoomSpeed: 0.25,
 };
@@ -1374,6 +1374,10 @@ client
         forcePlayerPosition(x, y, z, "(spawn:teleport)");
         STATE.spawnSnapDone = true;
       }
+
+      // HIDE LOADING SCREEN
+      const loadingScreen = document.getElementById("loading-screen");
+      if (loadingScreen) loadingScreen.style.display = "none";
     });
 
     room.onStateChange((state) => {
@@ -1412,6 +1416,11 @@ client
           STATE.pendingTeleport = null;
           forcePlayerPosition(t.x, t.y, t.z, "(pending teleport)");
           STATE.spawnSnapDone = true;
+          
+          // HIDE LOADING SCREEN
+          const loadingScreen = document.getElementById("loading-screen");
+          if (loadingScreen) loadingScreen.style.display = "none";
+
         } else {
           // Snap to default town spawn once patch exists to avoid falling under the town.
           // (We only do this once; server still authoritatively tracks you.)
