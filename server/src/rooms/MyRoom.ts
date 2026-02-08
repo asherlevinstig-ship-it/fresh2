@@ -1,41 +1,50 @@
 // ============================================================
-// rooms/MyRoom.ts  (FULL REWRITE - NO OMITS - BIOMES + TOWN SAFE ZONE)
+// rooms/MyRoom.ts  (FULL REWRITE - NO OMITS - TOWN SAFE ZONE + BLUEPRINT STAMP)
 // ------------------------------------------------------------
-// Keeps all logic:
-// - movement, sprint/stamina, swing, hotbar/equip sync
+// Keeps ALL original logic from your rewrite:
+// - movement, sprint/stamina tick, swing
+// - hotbar/equip sync
 // - inventory move/split/add/consume
-// - legacy craft:commit (index mapping) with DUPLICATE INDEX REJECT (anti-exploit)
+// - legacy craft:commit (Option A virtual mapping)
 // - world patching
 // - break/place with reach + rate limit
-// - persistence + autosave + shutdown save
+// - persistence + autosave
 //
-// Adds:
-// - Town of Beginnings: perfectly-flat stamped blueprint + AIR clearing
-// - Safe zone enforcement: disallow break/place inside town radius
+// ADDITIONS:
+// - stamps "Town of Beginnings" blueprint once per version on server startup
+// - safe zone enforcement: rejects break/place inside town radius
+// - sends block:reject to client with reason "safe_zone"
+// - (optional) force spawn to town center for quick testing (toggle constant)
 //
-// Improvements included (server-authoritative hardening):
-// - Persistent identity: PlayerState.id = distinctId (not sessionId)
-// - UID generation uses persistent id (so items remain stable across reconnects)
-// - block:place ignores msg.kind (derives from hotbar item server-side)
-//
-// Notes:
-// - Colyseus v0.17+ Room generic is NOT "Room<State>"
-// - We extend Room without generics and declare state for typing
+// NOTES:
+// - Colyseus v0.17+ Room generic is NOT "Room<State>".
+//   We extend `Room` without generics and declare state.
+// - Imports use .js extensions for Node16/NodeNext.
 // ============================================================
 
 import { Room, Client } from "colyseus";
 import * as fs from "fs";
 import * as path from "path";
 
-// Imports with .js extensions for Node16/NodeNext resolution
+// World / blocks
 import { WorldStore, BLOCKS, type BlockId } from "../world/WorldStore.js";
-import { MyRoomState, PlayerState, ItemState } from "./schema/MyRoomState.js";
 
-// Legacy crafting (kept)
+// State schema
+import {
+  MyRoomState,
+  PlayerState,
+  ItemState,
+} from "./schema/MyRoomState.js";
+
+// Crafting (legacy commit handler)
 import { CraftingSystem } from "../crafting/CraftingSystem.js";
 
-// Town stamp + safe zone
-import { stampTownOfBeginnings, inTownSafeZone } from "../world/regions/applyBlueprint.js";
+// Town / Blueprint stamp
+import {
+  stampTownOfBeginnings,
+  inTownSafeZone,
+  TOWN_GROUND_Y,
+} from "../world/regions/applyBlueprint.js";
 
 // ------------------------------------------------------------
 // Message Types
@@ -62,10 +71,10 @@ type InvSplitMsg = { slot: string };
 type InvConsumeHotbarMsg = { qty?: number };
 type InvAddMsg = { kind: string; qty?: number };
 
-type CraftCommitMsg = { srcIndices: number[] }; // Array of 9 inventory slot indices
+type CraftCommitMsg = { srcIndices: number[] }; // legacy virtual mapping
 
 type BlockBreakMsg = { x: number; y: number; z: number; src?: string };
-type BlockPlaceMsg = { x: number; y: number; z: number; kind?: string; src?: string };
+type BlockPlaceMsg = { x: number; y: number; z: number; kind: string; src?: string };
 
 type WorldPatchReqMsg = { x: number; y: number; z: number; r?: number; limit?: number };
 
@@ -97,7 +106,6 @@ function dist3(ax: number, ay: number, az: number, bx: number, by: number, bz: n
 // ------------------------------------------------------------
 
 type EquipKey = "head" | "chest" | "legs" | "feet" | "tool" | "offhand";
-
 type SlotRef = { kind: "inv"; index: number } | { kind: "eq"; key: EquipKey };
 
 function parseSlotRef(s: any): SlotRef | null {
@@ -186,7 +194,6 @@ function isEquipSlotCompatible(slotKey: EquipKey, itemKind: string) {
 function maxStackForKind(kind: string) {
   const k = (kind || "").toLowerCase();
   if (!k) return 64;
-
   if (
     k.startsWith("tool:") ||
     k.includes("pickaxe") ||
@@ -195,10 +202,8 @@ function maxStackForKind(kind: string) {
     k.includes("shovel") ||
     k.includes("wand") ||
     k.includes("club")
-  ) {
+  )
     return 1;
-  }
-
   return 64;
 }
 
@@ -245,8 +250,8 @@ function syncEquipToolToHotbar(p: PlayerState) {
 // Inventory Add/Consume Helpers
 // ------------------------------------------------------------
 
-function makeUid(ownerId: string, tag: string) {
-  return `${ownerId}:${tag}:${nowMs()}:${Math.floor(Math.random() * 1e9)}`;
+function makeUid(sessionId: string, tag: string) {
+  return `${sessionId}:${tag}:${nowMs()}:${Math.floor(Math.random() * 1e9)}`;
 }
 
 function firstEmptyInvIndex(p: PlayerState) {
@@ -281,6 +286,7 @@ function findStackableUid(p: PlayerState, kind: string) {
 
 function addKindToInventory(p: PlayerState, kind: string, qty: number) {
   ensureSlotsLength(p);
+
   if (!kind || qty <= 0) return 0;
 
   const maxStack = maxStackForKind(kind);
@@ -303,7 +309,7 @@ function addKindToInventory(p: PlayerState, kind: string, qty: number) {
     remaining -= add;
   }
 
-  // 2) New stacks in empty slots
+  // 2) New stacks
   while (remaining > 0) {
     const idx = firstEmptyInvIndex(p);
     if (idx === -1) break;
@@ -311,9 +317,7 @@ function addKindToInventory(p: PlayerState, kind: string, qty: number) {
     const add = Math.min(maxStack, remaining);
     remaining -= add;
 
-    const owner = String(p.id || "player");
-    const uid = makeUid(owner, "loot");
-
+    const uid = makeUid(p.id || "player", "loot");
     const it2 = new ItemState();
     it2.uid = uid;
     it2.kind = kind;
@@ -350,7 +354,7 @@ function consumeFromHotbar(p: PlayerState, qty: number) {
   const take = Math.min(cur, qty);
   it.qty = cur - take;
 
-  if ((it.qty || 0) <= 0) {
+  if (it.qty <= 0) {
     p.inventory.slots[idx] = "";
     p.items.delete(uid);
   }
@@ -358,16 +362,8 @@ function consumeFromHotbar(p: PlayerState, qty: number) {
   return take;
 }
 
-function getHotbarBlockKind(p: PlayerState): string {
-  ensureSlotsLength(p);
-  const idx = normalizeHotbarIndex(p.hotbarIndex);
-  const uid = String(p.inventory.slots[idx] || "");
-  const it = uid ? p.items.get(uid) : null;
-  return String(it?.kind || "");
-}
-
 // ------------------------------------------------------------
-// Block Mapping (UPDATED: Biomes + Ores + Crafted Blocks)
+// Block Mapping (Biomes + Ores + Crafted Blocks)
 // ------------------------------------------------------------
 
 function kindToBlockId(kind: string): BlockId {
@@ -381,12 +377,12 @@ function kindToBlockId(kind: string): BlockId {
   if (kind === "block:log") return BLOCKS.LOG;
   if (kind === "block:leaves") return BLOCKS.LEAVES;
 
-  // Crafted building
-  if (kind === "block:plank") return (BLOCKS as any).PLANKS ?? (BLOCKS as any).PLANK ?? BLOCKS.LOG;
+  // Crafted
+  if (kind === "block:plank") return (BLOCKS as any).PLANKS ?? BLOCKS.LOG;
 
   // Biome surfaces
   if (kind === "block:sand") return (BLOCKS as any).SAND ?? BLOCKS.DIRT;
-  if (kind === "block:snow") return (BLOCKS as any).SNOW ?? BLOCKS.DIRT;
+  if (kind === "block:snow") return (BLOCKS as any).SNOW ?? BLOCKS.GRASS;
   if (kind === "block:clay") return (BLOCKS as any).CLAY ?? BLOCKS.DIRT;
   if (kind === "block:gravel") return (BLOCKS as any).GRAVEL ?? BLOCKS.STONE;
   if (kind === "block:mud") return (BLOCKS as any).MUD ?? BLOCKS.DIRT;
@@ -415,20 +411,16 @@ function kindToBlockId(kind: string): BlockId {
 }
 
 function blockIdToKind(id: BlockId): string {
-  // Core terrain
   if (id === BLOCKS.DIRT) return "block:dirt";
   if (id === BLOCKS.GRASS) return "block:grass";
   if (id === BLOCKS.STONE) return "block:stone";
   if (id === BLOCKS.BEDROCK) return "block:bedrock";
 
-  // Trees
   if (id === BLOCKS.LOG) return "block:log";
   if (id === BLOCKS.LEAVES) return "block:leaves";
 
-  // Crafted building
   if (id === (BLOCKS as any).PLANKS) return "block:plank";
 
-  // Biome surfaces
   if (id === (BLOCKS as any).SAND) return "block:sand";
   if (id === (BLOCKS as any).SNOW) return "block:snow";
   if (id === (BLOCKS as any).CLAY) return "block:clay";
@@ -436,7 +428,6 @@ function blockIdToKind(id: BlockId): string {
   if (id === (BLOCKS as any).MUD) return "block:mud";
   if (id === (BLOCKS as any).ICE) return "block:ice";
 
-  // Ores / valuables
   if (id === (BLOCKS as any).COAL_ORE) return "block:coal_ore";
   if (id === (BLOCKS as any).COPPER_ORE) return "block:copper_ore";
   if (id === (BLOCKS as any).IRON_ORE) return "block:iron_ore";
@@ -448,7 +439,6 @@ function blockIdToKind(id: BlockId): string {
   if (id === (BLOCKS as any).MYTHRIL_ORE) return "block:mythril_ore";
   if (id === (BLOCKS as any).DRAGONSTONE) return "block:dragonstone";
 
-  // Crafted functional blocks
   if (id === (BLOCKS as any).CRAFTING_TABLE) return "block:crafting_table";
   if (id === (BLOCKS as any).CHEST) return "block:chest";
   if (id === (BLOCKS as any).SLAB_PLANK) return "block:slab_plank";
@@ -473,9 +463,9 @@ function isValidBlockCoord(n: any) {
   return Number.isFinite(v) && Math.floor(v) === v;
 }
 
-// ============================================================
+// ------------------------------------------------------------
 // Room Implementation
-// ============================================================
+// ------------------------------------------------------------
 
 export class MyRoom extends Room {
   declare state: MyRoomState;
@@ -491,6 +481,9 @@ export class MyRoom extends Room {
 
   // Rate limiting
   private lastBlockOpAt = new Map<string, number>();
+
+  // Toggle: force everyone to spawn at town for testing/visibility
+  private static FORCE_TOWN_SPAWN = true;
 
   // --------------------------------------------------------
   // Persistence Helpers
@@ -569,21 +562,21 @@ export class MyRoom extends Room {
       console.log(`[PERSIST] No save file found at ${this.worldPath}. Starting fresh.`);
     }
 
-    // 2) Configure Autosave
+    // 2) Stamp Town of Beginnings (once per stamp version)
+    try {
+      const res = stampTownOfBeginnings(MyRoom.WORLD, { verbose: true });
+      console.log("[TOWN] stamp result:", res);
+    } catch (e) {
+      console.error("[TOWN] stamp failed:", e);
+    }
+
+    // 3) Configure Autosave
     MyRoom.WORLD.configureAutosave({
       path: this.worldPath,
       minIntervalMs: 30000,
     });
 
-    // 2.5) Stamp Town of Beginnings (version-gated by town_stamp.json)
-    try {
-      const res = stampTownOfBeginnings(MyRoom.WORLD, { verbose: true });
-      console.log(`[TOWN] stamp result:`, res);
-    } catch (e) {
-      console.error(`[TOWN] stamp failed:`, e);
-    }
-
-    // 3) Simulation Tick
+    // 4) Simulation Tick
     const TICK_MS = 50; // 20 Hz
     const STAMINA_DRAIN_PER_SEC = 18;
     const STAMINA_REGEN_PER_SEC = 12;
@@ -622,6 +615,7 @@ export class MyRoom extends Room {
         syncEquipToolToHotbar(p);
       });
 
+      // Autosave triggered internally by WorldStore logic on dirty + time check
       MyRoom.WORLD.maybeAutosave();
     }, TICK_MS);
 
@@ -687,10 +681,8 @@ export class MyRoom extends Room {
     this.onMessage("inv:add", (client: Client, msg: InvAddMsg) => {
       const p = this.state.players.get(client.sessionId);
       if (!p) return;
-
       const kind = String(msg?.kind || "");
       if (!isBlockKind(kind)) return;
-
       const qtyReq = clamp(Math.floor(Number(msg?.qty ?? 1)), 1, 64);
       addKindToInventory(p, kind, qtyReq);
       syncEquipToolToHotbar(p);
@@ -725,7 +717,7 @@ export class MyRoom extends Room {
         if (toItem && !isEquipSlotCompatible(to.key, String(toItem.kind || ""))) return;
       }
 
-      // Move into empty
+      // Swap into empty
       if (!toUid) {
         setSlotUid(p, to, fromUid);
         setSlotUid(p, from, "");
@@ -794,9 +786,7 @@ export class MyRoom extends Room {
 
       it.qty = remain;
 
-      const owner = String(p.id || client.sessionId);
-      const newUid = makeUid(owner, "split");
-
+      const newUid = makeUid(client.sessionId, "split");
       const it2 = new ItemState();
       it2.uid = newUid;
       it2.kind = String(it.kind || "");
@@ -812,7 +802,7 @@ export class MyRoom extends Room {
     });
 
     // --------------------------------------------------------
-    // Crafting Handler (LEGACY craft:commit) + DUP INDEX REJECT
+    // Crafting Handler (LEGACY craft:commit)
     // --------------------------------------------------------
 
     this.onMessage("craft:commit", (client: Client, msg: CraftCommitMsg) => {
@@ -822,32 +812,26 @@ export class MyRoom extends Room {
       const indices = msg?.srcIndices;
       if (!Array.isArray(indices) || indices.length !== 9) {
         console.log(`[CRAFT] Invalid indices from ${client.sessionId}`);
+        client.send("craft:reject", { reason: "invalid_indices" });
         return;
       }
 
-      // Reject duplicate inv indices (anti-exploit)
-      {
-        const seen = new Set<number>();
-        for (let i = 0; i < 9; i++) {
-          const slotIdx = indices[i];
-          if (slotIdx === -1) continue;
-
-          if (!Number.isInteger(slotIdx)) {
-            console.log(`[CRAFT] Non-integer slot index: ${slotIdx}`);
-            client.send("craft:reject", { reason: "bad_index" });
-            return;
-          }
-
-          if (seen.has(slotIdx)) {
-            console.log(`[CRAFT] Duplicate slot index rejected: ${slotIdx} (${client.sessionId})`);
-            client.send("craft:reject", { reason: "duplicate_indices" });
-            return;
-          }
-          seen.add(slotIdx);
+      // Reject duplicate indices (prevents duping exploit)
+      const seen = new Set<number>();
+      for (const idx of indices) {
+        if (idx === -1) continue;
+        if (typeof idx !== "number" || !Number.isInteger(idx)) {
+          client.send("craft:reject", { reason: "non_integer_index" });
+          return;
         }
+        if (seen.has(idx)) {
+          client.send("craft:reject", { reason: "duplicate_indices" });
+          return;
+        }
+        seen.add(idx);
       }
 
-      // 1) Resolve items from 3x3 grid
+      // 1) Resolve kinds from grid
       const kinds: string[] = [];
       const validSlotIndices: number[] = [];
 
@@ -855,7 +839,6 @@ export class MyRoom extends Room {
 
       for (let i = 0; i < 9; i++) {
         const slotIdx = indices[i];
-
         if (slotIdx === -1) {
           kinds.push("");
           continue;
@@ -863,7 +846,7 @@ export class MyRoom extends Room {
 
         if (slotIdx < 0 || slotIdx >= p.inventory.slots.length) {
           console.log(`[CRAFT] Index out of bounds: ${slotIdx}`);
-          client.send("craft:reject", { reason: "out_of_bounds" });
+          client.send("craft:reject", { reason: "index_oob" });
           return;
         }
 
@@ -876,11 +859,11 @@ export class MyRoom extends Room {
           return;
         }
 
-        kinds.push(String(item.kind || ""));
+        kinds.push(item.kind);
         validSlotIndices.push(slotIdx);
       }
 
-      // 2) Check match
+      // 2) Match recipe
       const match = CraftingSystem.findMatch(kinds);
       if (!match) {
         console.log(`[CRAFT] No match for ${client.sessionId}`);
@@ -888,13 +871,13 @@ export class MyRoom extends Room {
         return;
       }
 
-      // 3) Consume ingredients (1 from each used slot)
+      // 3) Consume ingredients (1 each used slot)
       for (const slotIdx of validSlotIndices) {
         const uid = p.inventory.slots[slotIdx];
-        const it = uid ? p.items.get(uid) : null;
+        const it = p.items.get(uid);
         if (it) {
           it.qty -= 1;
-          if ((it.qty || 0) <= 0) {
+          if (it.qty <= 0) {
             p.inventory.slots[slotIdx] = "";
             p.items.delete(uid);
           }
@@ -902,7 +885,7 @@ export class MyRoom extends Room {
       }
 
       // 4) Add result
-      addKindToInventory(p, String(match.result.kind || ""), Number(match.result.qty || 1));
+      addKindToInventory(p, match.result.kind, match.result.qty);
       syncEquipToolToHotbar(p);
 
       console.log(`[CRAFT] ${client.sessionId} crafted ${match.result.kind} x${match.result.qty}`);
@@ -942,12 +925,9 @@ export class MyRoom extends Room {
 
     const withinWorld = (x: number, y: number, z: number) => {
       return (
-        x >= -MAX_COORD &&
-        x <= MAX_COORD &&
-        y >= -MAX_COORD &&
-        y <= MAX_COORD &&
-        z >= -MAX_COORD &&
-        z <= MAX_COORD
+        x >= -MAX_COORD && x <= MAX_COORD &&
+        y >= -MAX_COORD && y <= MAX_COORD &&
+        z >= -MAX_COORD && z <= MAX_COORD
       );
     };
 
@@ -975,9 +955,9 @@ export class MyRoom extends Room {
         return;
       }
 
-      // Town safe zone enforcement
+      // Safe zone enforcement
       if (inTownSafeZone(x, y, z)) {
-        reject(client, "safe_zone", { op: "break", src, x, y, z });
+        reject(client, "safe_zone", { op: "break", src });
         return;
       }
 
@@ -996,7 +976,7 @@ export class MyRoom extends Room {
       // Apply break
       const { newId } = MyRoom.WORLD.applyBreak(x, y, z);
 
-      // Drop the broken block kind (simple drop model)
+      // Drop the broken block as an item (if we can map it)
       const kind = blockIdToKind(prevId);
       if (kind) addKindToInventory(p, kind, 1);
 
@@ -1014,6 +994,12 @@ export class MyRoom extends Room {
         return;
       }
 
+      const kind = String(msg?.kind || "");
+      if (!isBlockKind(kind)) {
+        reject(client, "not_a_block_item", { op: "place", src, kind });
+        return;
+      }
+
       if (!isValidBlockCoord(msg?.x) || !isValidBlockCoord(msg?.y) || !isValidBlockCoord(msg?.z)) return;
       const x = sanitizeInt(msg.x, 0);
       const y = sanitizeInt(msg.y, 0);
@@ -1024,9 +1010,9 @@ export class MyRoom extends Room {
         return;
       }
 
-      // Town safe zone enforcement
+      // Safe zone enforcement
       if (inTownSafeZone(x, y, z)) {
-        reject(client, "safe_zone", { op: "place", src, x, y, z });
+        reject(client, "safe_zone", { op: "place", src });
         return;
       }
 
@@ -1042,20 +1028,13 @@ export class MyRoom extends Room {
         return;
       }
 
-      // SERVER-AUTHORITATIVE: derive placed block kind from hotbar, ignore msg.kind
-      const hotbarKind = getHotbarBlockKind(p);
-      if (!isBlockKind(hotbarKind)) {
-        reject(client, "no_blocks_in_hotbar", { op: "place", src });
-        return;
-      }
-
-      const blockId = kindToBlockId(hotbarKind);
+      const blockId = kindToBlockId(kind);
       if (blockId === BLOCKS.AIR) {
-        reject(client, "unknown_block_kind", { op: "place", src, kind: hotbarKind });
+        reject(client, "unknown_block_kind", { op: "place", src, kind });
         return;
       }
 
-      // Consume from hotbar AFTER validation
+      // Consume from hotbar
       const took = consumeFromHotbar(p, 1);
       if (took <= 0) {
         reject(client, "no_blocks_in_hotbar", { op: "place", src });
@@ -1065,7 +1044,7 @@ export class MyRoom extends Room {
       // Apply place
       const { newId } = MyRoom.WORLD.applyPlace(x, y, z, blockId);
       this.broadcast("block:update", { x, y, z, id: newId });
-      console.log(`[WORLD] place by ${client.sessionId} at ${x},${y},${z} (${hotbarKind})`);
+      console.log(`[WORLD] place by ${client.sessionId} at ${x},${y},${z}`);
     });
 
     this.onMessage("hello", (client: Client, _message: any) => {
@@ -1076,19 +1055,15 @@ export class MyRoom extends Room {
   public onJoin(client: Client, options: JoinOptions) {
     console.log(client.sessionId, "joined!", "options:", options);
 
-    // 1) Identify user (persistent)
-    const distinctId = String(options.distinctId || client.sessionId);
-
-    // Store distinctId on client for onLeave save
+    // Identify user (persistent distinctId)
+    const distinctId = options.distinctId || client.sessionId;
     (client as any).auth = { distinctId };
 
     const p = new PlayerState();
+    p.id = client.sessionId;
+    p.name = (options.name || "Steve").trim().substring(0, 16);
 
-    // IMPORTANT: PlayerState.id = persistent distinctId (NOT sessionId)
-    p.id = distinctId;
-    p.name = String(options.name || "Steve").trim().substring(0, 16);
-
-    // 2) Try to load saved data
+    // Try load saved
     const saved = this.loadPlayerData(distinctId);
 
     if (saved) {
@@ -1100,41 +1075,39 @@ export class MyRoom extends Room {
       p.pitch = isFiniteNum(saved.pitch) ? saved.pitch : 0;
       p.hp = isFiniteNum(saved.hp) ? saved.hp : 20;
       p.stamina = isFiniteNum(saved.stamina) ? saved.stamina : 100;
-      p.hotbarIndex = Number.isFinite(saved.hotbarIndex) ? saved.hotbarIndex : 0;
+      p.hotbarIndex = saved.hotbarIndex || 0;
 
       // Restore items
       (saved.items || []).forEach((savedItem: any) => {
         const it = new ItemState();
-        it.uid = String(savedItem.uid || "");
-        it.kind = String(savedItem.kind || "");
-        it.qty = Number(savedItem.qty || 0);
-        it.durability = Number(savedItem.durability || 0);
-        it.maxDurability = Number(
-          savedItem.maxDurability || (String(savedItem.kind || "").startsWith("tool:") ? 100 : 0)
-        );
-        it.meta = String(savedItem.meta || "");
-        if (it.uid) p.items.set(it.uid, it);
+        it.uid = savedItem.uid;
+        it.kind = savedItem.kind;
+        it.qty = savedItem.qty;
+        it.durability = savedItem.durability || 0;
+        it.maxDurability = savedItem.maxDurability || (savedItem.kind?.startsWith("tool:") ? 100 : 0);
+        it.meta = savedItem.meta || "";
+        p.items.set(it.uid, it);
       });
 
-      // Restore inventory grid
+      // Restore inventory
       p.inventory.cols = 9;
       p.inventory.rows = 4;
       ensureSlotsLength(p);
       (saved.inventory || []).forEach((uid: string, idx: number) => {
-        if (idx < p.inventory.slots.length) p.inventory.slots[idx] = String(uid || "");
+        if (idx < p.inventory.slots.length) p.inventory.slots[idx] = uid;
       });
 
       // Restore equip
       if (saved.equip) {
-        p.equip.tool = String(saved.equip.tool || "");
-        p.equip.head = String(saved.equip.head || "");
-        p.equip.chest = String(saved.equip.chest || "");
-        p.equip.legs = String(saved.equip.legs || "");
-        p.equip.feet = String(saved.equip.feet || "");
-        p.equip.offhand = String(saved.equip.offhand || "");
+        p.equip.tool = saved.equip.tool || "";
+        p.equip.head = saved.equip.head || "";
+        p.equip.chest = saved.equip.chest || "";
+        p.equip.legs = saved.equip.legs || "";
+        p.equip.feet = saved.equip.feet || "";
+        p.equip.offhand = saved.equip.offhand || "";
       }
     } else {
-      // 3) New player setup (starter gear)
+      // New player starter gear
       console.log(`[PERSIST] New player ${distinctId}, giving starter gear.`);
       p.x = 0;
       p.y = 10;
@@ -1152,7 +1125,7 @@ export class MyRoom extends Room {
       p.hotbarIndex = 0;
 
       const add = (kind: string, qty: number, slotIdx: number) => {
-        const uid = makeUid(distinctId, kind.split(":")[1] || "item");
+        const uid = makeUid(client.sessionId, kind.split(":")[1] || "item");
         const it = new ItemState();
         it.uid = uid;
         it.kind = kind;
@@ -1168,27 +1141,27 @@ export class MyRoom extends Room {
       add("tool:pickaxe_wood", 1, 0);
       add("block:dirt", 32, 1);
       add("block:grass", 16, 2);
-
-      // Bonus starter: planks + sticks for crafting tests
       add("block:plank", 8, 3);
       add("item:stick", 8, 4);
     }
 
-    // Sync equip -> hotbar tool
-    syncEquipToolToHotbar(p);
+    // Force spawn at town for testing/visibility
+    if (MyRoom.FORCE_TOWN_SPAWN) {
+      p.x = 0;
+      p.y = TOWN_GROUND_Y + 2;
+      p.z = 0;
+      p.yaw = 0;
+      p.pitch = 0;
+    }
 
-    // Attach to room by sessionId
+    syncEquipToolToHotbar(p);
     this.state.players.set(client.sessionId, p);
 
-    // Welcome (client can register handler)
+    // Welcome message (client must register handler)
     client.send("welcome", { roomId: this.roomId, sessionId: client.sessionId });
 
-    // Initial patch around player (ints safer)
-    const patch = MyRoom.WORLD.encodePatchAround(
-      { x: Math.floor(p.x), y: Math.floor(p.y), z: Math.floor(p.z) },
-      96,
-      { limit: 8000 }
-    );
+    // Initial patch around spawn
+    const patch = MyRoom.WORLD.encodePatchAround({ x: p.x, y: p.y, z: p.z }, 96, { limit: 8000 });
     client.send("world:patch", patch);
   }
 
@@ -1199,7 +1172,7 @@ export class MyRoom extends Room {
     const distinctId = (client as any).auth?.distinctId;
 
     if (p && distinctId) {
-      this.savePlayerData(String(distinctId), p);
+      this.savePlayerData(distinctId, p);
     }
 
     this.state.players.delete(client.sessionId);
