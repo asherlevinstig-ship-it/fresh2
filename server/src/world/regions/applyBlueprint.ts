@@ -81,10 +81,16 @@ type SchematicLayer = string[];
 type Schematic = SchematicLayer[];
 
 /**
- * Rotation is intentionally a union type to prevent TS literal narrowing bugs
- * (like "Type '2' is not assignable to type '1'").
+ * Rotation is intentionally a union type to prevent TS literal narrowing bugs.
+ * Renamed to SchematicRotation to ensure no naming collisions.
  */
-type Rotation = 0 | 1 | 2 | 3;
+type SchematicRotation = 0 | 1 | 2 | 3;
+
+// Rotation constants to avoid TS literal narrowing issues
+const ROT_0: SchematicRotation = 0;
+const ROT_1: SchematicRotation = 1;
+const ROT_2: SchematicRotation = 2;
+const ROT_3: SchematicRotation = 3;
 
 /**
  * Pastes a 3D ASCII schematic into the world.
@@ -99,7 +105,7 @@ function pasteStructure(
   oy: number,
   oz: number,
   schematic: Schematic,
-  rotation: Rotation = 0
+  rotation: SchematicRotation = ROT_0
 ) {
   let blocksTouched = 0;
 
@@ -120,14 +126,14 @@ function pasteStructure(
 
         // Rotation Logic (0, 1, 2, 3)
         // 0 = 0 deg, 1 = 90 deg, 2 = 180 deg, 3 = 270 deg
-        if (rotation === 1) {
+        if (rotation === ROT_1) {
           const t = x;
           x = depth - 1 - z;
           z = t;
-        } else if (rotation === 2) {
+        } else if (rotation === ROT_2) {
           x = width - 1 - x;
           z = depth - 1 - z;
-        } else if (rotation === 3) {
+        } else if (rotation === ROT_3) {
           const t = x;
           x = z;
           z = width - 1 - t;
@@ -331,7 +337,7 @@ export function stampTownOfBeginnings(
 
       // fill up to surface
       for (let y = -10; y <= surfaceY; y++) {
-        let block = BLOCKS.DIRT;
+        let block: number = BLOCKS.DIRT;
         if (y === surfaceY) block = BLOCKS.GRASS;
         else if (y < surfaceY - 3) block = BLOCKS.STONE;
         world.applyPlace(wx, y, wz, block);
@@ -368,17 +374,18 @@ export function stampTownOfBeginnings(
   // ----------------------------------------------------------
   // 3) CENTERPIECE
   // ----------------------------------------------------------
-  pasteStructure(world, cx - 3, gy + 1, cz - 3, FOUNTAIN, 0);
+  pasteStructure(world, cx - 3, gy + 1, cz - 3, FOUNTAIN, ROT_0);
 
   // ----------------------------------------------------------
   // 4) BUILDINGS
   // ----------------------------------------------------------
-  pasteStructure(world, cx - 15, gy + 1, cz + 28, HOUSE_SMALL, 2);
-  pasteStructure(world, cx + 28, gy + 1, cz - 15, HOUSE_SMALL, 3);
-  pasteStructure(world, cx - 28, gy + 1, cz + 10, HOUSE_SMALL, 1);
+  // Fixed literal narrowing using constants
+  pasteStructure(world, cx - 15, gy + 1, cz + 28, HOUSE_SMALL, ROT_2);
+  pasteStructure(world, cx + 28, gy + 1, cz - 15, HOUSE_SMALL, ROT_3);
+  pasteStructure(world, cx - 28, gy + 1, cz + 10, HOUSE_SMALL, ROT_1);
 
-  pasteStructure(world, cx + 15, gy + 1, cz + 15, MARKET_STALL, 0);
-  pasteStructure(world, cx + 24, gy + 1, cz + 15, MARKET_STALL, 1);
+  pasteStructure(world, cx + 15, gy + 1, cz + 15, MARKET_STALL, ROT_0);
+  pasteStructure(world, cx + 24, gy + 1, cz + 15, MARKET_STALL, ROT_1);
 
   // ----------------------------------------------------------
   // 5) WALLS (square + diagonals)
@@ -425,8 +432,6 @@ export function stampTownOfBeginnings(
     // ignore write errors
   }
 
-  // Note: If you want true counts, you can accumulate from pasteStructure / terraforming etc.
-  // Keeping return shape stable with your existing caller expectations.
   return {
     stamped: true,
     forced,
