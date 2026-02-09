@@ -1,22 +1,24 @@
 // ============================================================
-// Biomes.ts  (FULL REWRITE - NO OMITS - NO BREVITY)
-// ============================================================
-// PURPOSE
-// - Deterministic biome selection from (x,z) only.
-// - Deterministic height function from (x,z) and biome.
-// - Deterministic surface/subsurface layering rules per biome.
-// - Deterministic vegetation: trees + cactus (and hooks for future flora).
-// - Deterministic ore selection: replaces some underground stone blocks.
-// - Designed to be DUPLICATED byte-for-byte:
-//     client/src/world/Biomes.ts
-//     server/src/world/Biomes.ts (or server/world/Biomes.ts)
-// - No Math.random() usage anywhere.
+// src/world/Biomes.ts
+// ------------------------------------------------------------
+// FULL REWRITE - NO OMITS - ALL LOGIC INCLUDED
 //
-// IMPORTANT
-// - This file intentionally avoids engine-specific imports.
-// - WorldStore/index provide a "palette" object (block ID constants).
-// - Keep block IDs consistent on client + server.
+// PURPOSE:
+// - Deterministic biome selection from (x,z) coordinates.
+// - Deterministic height map generation.
+// - Deterministic surface/subsurface block layering.
+// - Deterministic vegetation (Trees, Cacti) placement.
+// - Deterministic ore generation based on depth and biome.
+//
+// DESIGN:
+// - Pure functions where possible.
+// - No imports from 'WorldStore' to avoid circular dependencies.
+// - Relies on a 'palette' object passed in for block IDs.
 // ============================================================
+
+// ------------------------------------------------------------
+// 1. Types & Interfaces
+// ------------------------------------------------------------
 
 export type BiomeId =
   | "plains"
@@ -26,85 +28,80 @@ export type BiomeId =
   | "mountains"
   | "swamp";
 
-export type BiomeSample = {
+export interface BiomeSample {
   biome: BiomeId;
-  height: number;        // integer column height
-  humidity: number;      // 0..1
-  temperature: number;   // 0..1
-  mountains: number;     // 0..1 (mountain mask)
-  swampiness: number;    // 0..1 (swamp mask)
-};
+  height: number;        // The integer y-level of the surface
+  humidity: number;      // 0.0 to 1.0
+  temperature: number;   // 0.0 to 1.0
+  mountains: number;     // 0.0 to 1.0 (Mountain intensity mask)
+  swampiness: number;    // 0.0 to 1.0 (Swamp intensity mask)
+}
 
 export type TreeType = "oak" | "pine";
 
-export type TreeSpec = {
+export interface TreeSpec {
   type: TreeType;
   trunkHeight: number;
+  canopyRadius: number;  // Horizontal radius of leaves
+  canopyHeight: number;  // Vertical height of leaves
+  leafDensity: number;   // 0.0 to 1.0 (Probability of a leaf block spawning)
+}
 
-  // Leaf canopy controls (WorldStore expects canopyRadius)
-  canopyRadius: number;   // radius in blocks (approx)
-  canopyHeight: number;   // vertical thickness
-
-  // Optional shape params you can use later (client visuals etc.)
-  // These are deterministic but not required by WorldStore.
-  // leafDensity can control how "full" a canopy is.
-  leafDensity: number;    // 0..1
-};
-
-export type OreTables = {
+export interface OreTables {
   common: number[];
   uncommon: number[];
   rare: number[];
   epic: number[];
-};
+}
 
 // ------------------------------------------------------------
-// Math Helpers (Deterministic)
+// 2. Deterministic Math & Noise Helpers
 // ------------------------------------------------------------
 
-function frac(n: number) {
+/** Returns the fractional part of a number (e.g. 1.25 -> 0.25) */
+function frac(n: number): number {
   return n - Math.floor(n);
 }
 
-function clamp01(v: number) {
-  return Math.max(0, Math.min(1, v));
-}
-
-function lerp(a: number, b: number, t: number) {
+/** Linear interpolation between a and b by t */
+function lerp(a: number, b: number, t: number): number {
   return a + (b - a) * t;
 }
 
-function smoothstep(t: number) {
-  // 0..1 -> 0..1
+/** Clamps a value between 0 and 1 */
+function clamp01(v: number): number {
+  return Math.max(0, Math.min(1, v));
+}
+
+/** Smooth Hermite interpolation (0..1 -> 0..1), smooths edges */
+function smoothstep(t: number): number {
   return t * t * (3 - 2 * t);
 }
 
-// ------------------------------------------------------------
-// Hash / Noise (Deterministic)
-// ------------------------------------------------------------
-//
-// All noise below is deterministic and depends only on input coords.
-// DO NOT change these lightly once worlds exist, unless you want a new world.
-//
-// hash2: stable pseudo-random 0..1 from integer-ish coords
-// valueNoise2: continuous-ish 2D noise using grid corner hashing
-// fbm2: fractal noise using multiple octaves
-// ------------------------------------------------------------
-
-function hash2(x: number, z: number) {
-  // Deterministic 0..1
+/**
+ * 2D Pseudo-random hash.
+ * Returns a deterministic value between 0 and 1 based on x, z.
+ */
+function hash2(x: number, z: number): number {
+  // Large primes for mixing
   const n = Math.sin(x * 127.1 + z * 311.7) * 43758.5453123;
   return frac(n);
 }
 
-function hash3(x: number, y: number, z: number) {
-  // Deterministic 0..1
+/**
+ * 3D Pseudo-random hash.
+ * Returns a deterministic value between 0 and 1 based on x, y, z.
+ */
+function hash3(x: number, y: number, z: number): number {
   const n = Math.sin(x * 127.1 + y * 269.5 + z * 311.7) * 43758.5453123;
   return frac(n);
 }
 
-function valueNoise2(x: number, z: number) {
-  // Grid-based value noise with smooth interpolation
+/**
+ * 2D Value Noise.
+ * Generates smooth noise by interpolating between random values at integer grid points.
+ */
+function valueNoise2(x: number, z: number): number {
   const x0 = Math.floor(x);
   const z0 = Math.floor(z);
   const x1 = x0 + 1;
@@ -127,8 +124,14 @@ function valueNoise2(x: number, z: number) {
   return lerp(ix0, ix1, sz);
 }
 
-function fbm2(x: number, z: number, octaves = 4, lacunarity = 2, gain = 0.5) {
-  // Fractal Brownian Motion: sum of valueNoise2 at multiple frequencies
+/**
+ * Fractal Brownian Motion (FBM) - 2D.
+ * layers multiple octaves of noise to create detail.
+ * @param octaves Number of layers (more = more detail/roughness)
+ * @param lacunarity How much frequency increases per octave (usually 2.0)
+ * @param gain How much amplitude decreases per octave (usually 0.5)
+ */
+function fbm2(x: number, z: number, octaves = 4, lacunarity = 2, gain = 0.5): number {
   let amp = 1;
   let freq = 1;
   let sum = 0;
@@ -145,92 +148,80 @@ function fbm2(x: number, z: number, octaves = 4, lacunarity = 2, gain = 0.5) {
 }
 
 // ------------------------------------------------------------
-// Biome Sampling
-// ------------------------------------------------------------
-//
-// sampleBiome(x,z):
-// - temperature/humidity are broad-scale fields (low frequency)
-// - mountains is a separate mask
-// - swampiness is a separate mask
-// - returns chosen biome + final computed height
-//
-// HEIGHT STRATEGY
-// - keep your old “sin/cos base height” vibe
-// - add biome-specific noise modulation
-// - keep integer output
+// 3. Biome Selection & Height Generation
 // ------------------------------------------------------------
 
+/**
+ * Main function to query the environment at a specific column.
+ * Calculates climate, selects biome, and computes surface height.
+ */
 export function sampleBiome(x: number, z: number): BiomeSample {
-  // Scale down for large coherent regions
+  // Scale coordinates down for broad, coherent regions
   const sx = x / 180;
   const sz = z / 180;
 
-  // Broad climate fields
+  // 1. Generate Climate Fields
+  // Temperature: 0 = Cold, 1 = Hot
   const temperature = clamp01(fbm2(sx + 10, sz - 20, 4, 2, 0.55));
+  
+  // Humidity: 0 = Dry, 1 = Wet
   const humidity = clamp01(fbm2(sx - 40, sz + 30, 4, 2, 0.55));
 
-  // Mountain mask (higher = more mountainous)
+  // Mountain Mask: 0 = Flat, 1 = Mountainous
   const mountains = clamp01(fbm2(sx + 200, sz + 200, 5, 2, 0.5));
 
-  // Swamp mask (humid lowlands)
+  // Swamp Mask: Specific check for low, wet areas
   const swampiness = clamp01(fbm2(sx - 120, sz + 90, 4, 2, 0.55));
 
+  // 2. Determine Biome
   let biome: BiomeId = "plains";
 
-  // Biome decision
-  // Priority:
-  // 1) big mountain areas
-  // 2) hot+dry desert
-  // 3) cold tundra
-  // 4) swampy wet lowlands
-  // 5) humid forest
-  // 6) otherwise plains
+  // Priority Decision Tree
   if (mountains > 0.72) {
     biome = "mountains";
   } else if (temperature > 0.70 && humidity < 0.35) {
-    biome = "desert";
+    biome = "desert"; // Hot and Dry
   } else if (temperature < 0.30) {
-    biome = "tundra";
+    biome = "tundra"; // Cold
   } else if (humidity > 0.65 && swampiness > 0.60) {
-    biome = "swamp";
+    biome = "swamp";  // Wet and swampy
   } else if (humidity > 0.55) {
-    biome = "forest";
+    biome = "forest"; // Wet but not swampy
   } else {
-    biome = "plains";
+    biome = "plains"; // Default moderate
   }
 
-  // Original-ish base height (your current world vibe)
-  const base = Math.floor(4 * Math.sin(x / 15) + 4 * Math.cos(z / 20));
+  // 3. Compute Terrain Height
+  // Start with a base rolling wave (preserving original world feel)
+  let h = Math.floor(4 * Math.sin(x / 15) + 4 * Math.cos(z / 20));
 
-  // Additional height noise
-  const n1 = fbm2(x / 90, z / 90, 4, 2, 0.55);  // 0..1 (medium)
-  const n2 = fbm2(x / 32, z / 32, 3, 2, 0.50);  // 0..1 (smaller)
-
-  let h = base;
+  // Add biome-specific noise details
+  const n1 = fbm2(x / 90, z / 90, 4, 2, 0.55); // Large scale features
+  const n2 = fbm2(x / 32, z / 32, 3, 2, 0.50); // Small scale roughness
 
   if (biome === "plains") {
-    // gentle rolling
+    // Gentle rolling hills
     h += Math.floor((n1 - 0.5) * 4);
   } else if (biome === "forest") {
-    // slightly more variation
+    // Slightly hillier than plains
     h += Math.floor((n1 - 0.5) * 6);
   } else if (biome === "desert") {
-    // dunes (medium scale)
+    // Dunes
     h += Math.floor((n1 - 0.5) * 5);
   } else if (biome === "tundra") {
-    // fairly flat with occasional bumps
+    // Mostly flat, some roughness
     h += Math.floor((n1 - 0.5) * 4);
   } else if (biome === "swamp") {
-    // lowlands / subtle noise
+    // Lowlands, often near or below sea level, slightly messy
     h += Math.floor((n2 - 0.5) * 3);
   } else if (biome === "mountains") {
-    // high variance
-    h += Math.floor((n1 - 0.3) * 18);
+    // Extreme variance, tall peaks
+    h += Math.floor((n1 - 0.3) * 18); 
   }
 
   return {
     biome,
-    height: h | 0,
+    height: h | 0, // Ensure integer
     humidity,
     temperature,
     mountains,
@@ -239,27 +230,21 @@ export function sampleBiome(x: number, z: number): BiomeSample {
 }
 
 // ------------------------------------------------------------
-// Terrain Layer Rules
-// ------------------------------------------------------------
-//
-// getTerrainLayerBlockId(palette, biome, depth):
-// - palette is an object containing numeric IDs for blocks.
-// - depth = height - y:
-//   depth 0 = surface
-//   depth 1..2 = subsurface
-//   depth >=3 = stone
-//
-// Palette must include at least:
-//   AIR, DIRT, GRASS, STONE, BEDROCK, LOG, LEAVES
-// Optional biome blocks:
-//   SAND, SNOW, CLAY, GRAVEL, MUD, ICE
+// 4. Terrain Layering (Surface Blocks)
 // ------------------------------------------------------------
 
+/**
+ * Determines which block to place at a specific depth below the surface.
+ * @param palette Object containing block IDs (e.g. BLOCKS from WorldStore)
+ * @param biome The current biome
+ * @param depth Distance from surface (0 = surface block)
+ */
 export function getTerrainLayerBlockId(
   palette: any,
   biome: BiomeId,
   depth: number
 ): number {
+  // Default fallback IDs (if palette is missing keys)
   const AIR = palette.AIR ?? 0;
   const DIRT = palette.DIRT ?? 1;
   const GRASS = palette.GRASS ?? 2;
@@ -272,140 +257,120 @@ export function getTerrainLayerBlockId(
   const MUD = palette.MUD ?? DIRT;
   const ICE = palette.ICE ?? SNOW;
 
-  // Always stone deeper down
+  // Deep underground is always stone
   if (depth >= 3) return STONE;
 
-  // Desert: sand top + sand subsurface
+  // --- Biome Specific Rules ---
+
+  // Desert: Sand on top, sand below, then stone
   if (biome === "desert") {
     return SAND;
   }
 
-  // Tundra: snow top, dirt under
+  // Tundra: Snow on top, dirt below
   if (biome === "tundra") {
     return depth === 0 ? SNOW : DIRT;
   }
 
-  // Swamp: mud top, clay below, then dirt
+  // Swamp: Mud on top, Clay underneath, then Dirt
   if (biome === "swamp") {
     if (depth === 0) return MUD;
     if (depth === 1) return CLAY;
     return DIRT;
   }
 
-  // Mountains: stone surface and subsurface (rugged)
+  // Mountains: Exposed Stone (rugged look)
   if (biome === "mountains") {
     return STONE;
   }
 
-  // Plains / Forest: grass top, dirt below
+  // Plains & Forest: Standard Grass on top, Dirt below
   return depth === 0 ? GRASS : DIRT;
 }
 
 // ------------------------------------------------------------
-// Vegetation: Trees
-// ------------------------------------------------------------
-//
-// The world generator (server + client) typically calls:
-// - shouldSpawnTree(x,z, biome) for tree root columns.
-// - getTreeSpec(x,z, biome) for deterministic parameters.
-//
-// IMPORTANT:
-// - This must be deterministic from x,z,biome only.
-// - It should not depend on y or runtime randomness.
+// 5. Vegetation: Trees
 // ------------------------------------------------------------
 
-export function shouldSpawnTree(x: number, z: number, biome: BiomeId) {
+/**
+ * Determines if a tree should spawn at this (x, z) location.
+ * Purely probabilistic based on biome density.
+ */
+export function shouldSpawnTree(x: number, z: number, biome: BiomeId): boolean {
   const r = hash2(x, z);
 
-  // Forest: common trees
-  if (biome === "forest") return r > 0.965; // ~3.5%
-
-  // Plains: rare trees
-  if (biome === "plains") return r > 0.985; // ~1.5%
-
-  // Swamp: moderate (gnarly trees later)
-  if (biome === "swamp") return r > 0.972; // ~2.8%
-
-  // Tundra: rare pines
-  if (biome === "tundra") return r > 0.982; // ~1.8%
-
-  // Mountains: optional rare pines
-  if (biome === "mountains") return r > 0.988; // ~1.2%
-
-  // Desert: no trees here (use cactus)
+  if (biome === "forest") return r > 0.965;     // ~3.5% chance (Dense)
+  if (biome === "plains") return r > 0.985;     // ~1.5% chance (Sparse)
+  if (biome === "swamp") return r > 0.972;      // ~2.8% chance
+  if (biome === "tundra") return r > 0.982;     // ~1.8% chance
+  if (biome === "mountains") return r > 0.988;  // ~1.2% chance
+  
+  // Desert: No trees (Cacti handled separately)
   return false;
 }
 
+/**
+ * Generates the specifications for a tree at (x, z).
+ * Returns height, type, and canopy shape.
+ */
 export function getTreeSpec(x: number, z: number, biome: BiomeId): TreeSpec {
-  const r = hash2(x * 2 + 11, z * 2 - 7); // 0..1
-  const r2 = hash2(x * 3 - 19, z * 3 + 31); // 0..1 (extra variation)
+  const r = hash2(x * 2 + 11, z * 2 - 7);       // 0..1 random
+  const r2 = hash2(x * 3 - 19, z * 3 + 31);     // 0..1 random (variation)
 
+  // Pine Trees (Tundra & Mountains)
   if (biome === "tundra" || biome === "mountains") {
-    const trunkHeight = 5 + Math.floor(r * 3); // 5..7
+    const trunkHeight = 5 + Math.floor(r * 3); // 5 to 7 blocks
 
-    // Pine canopy: narrower, taller
-    const canopyRadius = 2 + Math.floor(r2 * 2); // 2..3
-    const canopyHeight = 3 + Math.floor(r * 2);  // 3..4
+    // Pine canopy is tall and narrow
+    const canopyRadius = 2 + Math.floor(r2 * 2); // 2 to 3
+    const canopyHeight = 3 + Math.floor(r * 2);  // 3 to 4
 
     return {
       type: "pine",
       trunkHeight,
       canopyRadius,
       canopyHeight,
-      leafDensity: 0.75 + 0.20 * r2, // 0.75..0.95
+      leafDensity: 0.75 + 0.20 * r2, // 0.75 to 0.95 density
     };
   }
 
-  // Oak-like
-  const trunkHeight = 4 + Math.floor(r * 2); // 4..5
-  const canopyRadius = 2 + Math.floor(r2 * 2); // 2..3
-  const canopyHeight = 3 + Math.floor(r * 2);  // 3..4
+  // Oak Trees (Forest, Plains, Swamp)
+  const trunkHeight = 4 + Math.floor(r * 2); // 4 to 5 blocks
+  const canopyRadius = 2 + Math.floor(r2 * 2); // 2 to 3
+  const canopyHeight = 3 + Math.floor(r * 2);  // 3 to 4
 
   return {
     type: "oak",
     trunkHeight,
     canopyRadius,
     canopyHeight,
-    leafDensity: 0.80 + 0.15 * r2, // 0.80..0.95
+    leafDensity: 0.80 + 0.15 * r2, // 0.80 to 0.95 density
   };
 }
 
 // ------------------------------------------------------------
-// Vegetation: Cactus (Desert)
-// ------------------------------------------------------------
-//
-// shouldSpawnCactus(x,z, biome):
-// - only in desert
-// - deterministic chance
-//
-// getCactusHeight(x,z):
-// - deterministic height 2..4
+// 6. Vegetation: Cacti (Deserts)
 // ------------------------------------------------------------
 
-export function shouldSpawnCactus(x: number, z: number, biome: BiomeId) {
+export function shouldSpawnCactus(x: number, z: number, biome: BiomeId): boolean {
   if (biome !== "desert") return false;
   const r = hash2(x + 999, z - 999);
-  return r > 0.988; // ~1.2%
+  return r > 0.988; // ~1.2% chance
 }
 
-export function getCactusHeight(x: number, z: number) {
+export function getCactusHeight(x: number, z: number): number {
   const r = hash2(x * 3 + 5, z * 3 + 9);
-  return 2 + Math.floor(r * 3); // 2..4
+  return 2 + Math.floor(r * 3); // Height 2 to 4
 }
 
 // ------------------------------------------------------------
-// Ore Tables
-// ------------------------------------------------------------
-//
-// buildDefaultOreTablesFromPalette(palette):
-// - takes a palette of numeric IDs
-// - returns tier arrays for ore selection
-//
-// pickOreId(...):
-// - chooses an ore ID based on depth + biome bias
-// - returns 0 to indicate "no ore, keep stone"
+// 7. Ore Generation
 // ------------------------------------------------------------
 
+/**
+ * helper to build ore tables from the palette.
+ * Filters out 0/undefined values safely.
+ */
 export function buildDefaultOreTablesFromPalette(palette: any): OreTables {
   const COAL = palette.COAL_ORE ?? 0;
   const COPPER = palette.COPPER_ORE ?? 0;
@@ -418,21 +383,33 @@ export function buildDefaultOreTablesFromPalette(palette: any): OreTables {
   const MYTHRIL = palette.MYTHRIL_ORE ?? 0;
   const DRAGONSTONE = palette.DRAGONSTONE ?? 0;
 
-  // Filter out zeros (if a block doesn't exist in palette, skip)
-  const common = [COAL, COPPER, IRON].filter(Boolean);
-  const uncommon = [IRON, SILVER, GOLD].filter(Boolean);
-  const rare = [GOLD, RUBY, SAPPHIRE].filter(Boolean);
-  const epic = [MYTHRIL, DRAGONSTONE].filter(Boolean);
-
-  return { common, uncommon, rare, epic };
+  return {
+    common: [COAL, COPPER, IRON].filter((id) => id !== 0),
+    uncommon: [IRON, SILVER, GOLD].filter((id) => id !== 0),
+    rare: [GOLD, RUBY, SAPPHIRE].filter((id) => id !== 0),
+    epic: [MYTHRIL, DRAGONSTONE].filter((id) => id !== 0),
+  };
 }
 
-function pickFrom(arr: number[], t: number) {
+/**
+ * Safely picks an item from an array using a normalized t value (0..1)
+ */
+function pickFrom(arr: number[], t: number): number {
   if (!arr || arr.length === 0) return 0;
   const idx = Math.floor(t * arr.length);
   return arr[Math.max(0, Math.min(arr.length - 1, idx))] || 0;
 }
 
+/**
+ * Determines if a stone block should be replaced by ore.
+ * @param x World X
+ * @param y World Y (depth check)
+ * @param z World Z
+ * @param biome Biome context
+ * @param surfaceHeight The surface Y at this column (used to calc depth)
+ * @param tables The ore tables
+ * @returns Block ID of the ore, or 0 if no ore.
+ */
 export function pickOreId(
   x: number,
   y: number,
@@ -441,35 +418,47 @@ export function pickOreId(
   surfaceHeight: number,
   tables: OreTables
 ): number {
-  // Only underground (below some depth)
+  // 1. Depth Check
   const depthBelowSurface = surfaceHeight - y;
+  
+  // No ores immediately at surface (must be at least 4 blocks down)
   if (depthBelowSurface < 4) return 0;
 
-  // Deterministic roll (ore placement chance)
+  // 2. Base Chance Roll
   const r = hash3(x, y, z);
 
-  // Depth-based rarity bias:
-  // deeper => more likely ore, and more likely rare/epic tiers
-  const deep = clamp01((depthBelowSurface - 8) / 40); // 0..1
+  // Depth Scaler: Deeper = Higher chance of ore
+  const deepFactor = clamp01((depthBelowSurface - 8) / 40);
 
-  // Biome bias:
-  // mountains slightly richer, swamp slightly poorer
+  // Biome Modifiers
   const biomeBonus = biome === "mountains" ? 0.08 : biome === "swamp" ? -0.02 : 0;
 
-  // Overall chance that STONE becomes an ore block
-  const baseChance = 0.08 + deep * 0.10 + biomeBonus; // ~8% to ~28% typically
-  if (r > baseChance) return 0;
+  // Calculate probability threshold
+  // Ranges from ~8% (shallow) to ~28% (deep/mountains)
+  const chanceThreshold = 0.08 + deepFactor * 0.10 + biomeBonus;
 
-  // Second roll for tier selection
+  if (r > chanceThreshold) return 0; // No ore here
+
+  // 3. Tier Selection
+  // We use a second hash to determine WHICH ore
   const r2 = hash3(x + 99, y - 77, z + 33);
 
-  // Tier thresholds shift with depth
-  const epicT = 0.02 + deep * 0.08;   // up to ~10%
-  const rareT = 0.10 + deep * 0.18;   // up to ~28%
-  const uncoT = 0.35 + deep * 0.25;   // up to ~60%
+  // Tier Thresholds (Dynamic based on depth)
+  const epicThreshold = 0.02 + deepFactor * 0.08;   // Up to ~10% chance
+  const rareThreshold = 0.10 + deepFactor * 0.18;   // Up to ~28% chance
+  const uncommonThreshold = 0.35 + deepFactor * 0.25; // Up to ~60% chance
 
-  if (r2 < epicT) return pickFrom(tables.epic, hash3(x + 7, y + 7, z + 7));
-  if (r2 < rareT) return pickFrom(tables.rare, hash3(x + 8, y + 8, z + 8));
-  if (r2 < uncoT) return pickFrom(tables.uncommon, hash3(x + 9, y + 9, z + 9));
+  // Use distinct hash seeds for the specific pick to avoid patterns
+  if (r2 < epicThreshold) {
+    return pickFrom(tables.epic, hash3(x + 7, y + 7, z + 7));
+  }
+  if (r2 < rareThreshold) {
+    return pickFrom(tables.rare, hash3(x + 8, y + 8, z + 8));
+  }
+  if (r2 < uncommonThreshold) {
+    return pickFrom(tables.uncommon, hash3(x + 9, y + 9, z + 9));
+  }
+  
+  // Fallback to common
   return pickFrom(tables.common, hash3(x + 10, y + 10, z + 10));
 }

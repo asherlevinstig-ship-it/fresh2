@@ -1,16 +1,17 @@
 // ============================================================
-// rooms/MyRoom.ts
+// src/rooms/MyRoom.ts
 // ------------------------------------------------------------
 // FULL REWRITE - PRODUCTION READY - NO OMITS
 //
 // Features Included:
-// - World Persistence & Autosave
+// - World Persistence & Autosave (JSON)
 // - "Town of Beginnings" Artistic Stamp (Safe Zone & Spawn)
+// - Procedural Terrain Generation (Biomes, Ores, Trees)
 // - Optimized Initial Patch (Radius 48 for fast loading)
 // - Loading Screen Signal (spawn:teleport delay)
 // - Inventory (Move, Split, Stack, Consume, Equip Sync)
 // - Crafting System (Legacy craft:commit)
-// - Anti-Cheat (Reach, Rate Limits, Wall-Clip checks)
+// - Anti-Cheat (Reach, Rate Limits, Area Protection)
 // - Stamina/Sprint/Health Systems
 // ============================================================
 
@@ -18,16 +19,27 @@ import { Room, Client } from "colyseus";
 import * as fs from "fs";
 import * as path from "path";
 
+// World & State Imports
 import { WorldStore, BLOCKS, type BlockId } from "../world/WorldStore.js";
 import { MyRoomState, PlayerState, ItemState } from "./schema/MyRoomState.js";
 import { CraftingSystem } from "../crafting/CraftingSystem.js";
 
+// Town Stamp Logic
 import {
   stampTownOfBeginnings,
   inTownSafeZone,
   TOWN_GROUND_Y,
   TOWN_SAFE_ZONE,
 } from "../world/regions/applyBlueprint.js";
+
+// Biome & Generation Logic
+import {
+  sampleBiome,
+  getTerrainLayerBlockId,
+  pickOreId,
+  buildDefaultOreTablesFromPalette,
+  type OreTables
+} from "../world/Biomes.js";
 
 // ------------------------------------------------------------
 // Message Data Types
@@ -102,25 +114,22 @@ function writeJsonAtomic(filePath: string, data: any) {
   } catch {}
 
   const tmp = `${filePath}.tmp.${process.pid}.${Math.floor(Math.random() * 1e9)}`;
-  fs.writeFileSync(tmp, JSON.stringify(data, null, 2));
-
   try {
-    fs.renameSync(tmp, filePath);
-    return;
-  } catch {
-    // Fallback for different drives/OS
+    fs.writeFileSync(tmp, JSON.stringify(data, null, 2));
+    // Atomic rename
     try {
+      fs.renameSync(tmp, filePath);
+    } catch {
+      // Cross-device fallback
       fs.copyFileSync(tmp, filePath);
-      try { fs.unlinkSync(tmp); } catch {}
-      return;
-    } catch {}
-    // Last resort
-    try { fs.rmSync(filePath, { force: true }); } catch {}
-    fs.renameSync(tmp, filePath);
+      fs.unlinkSync(tmp);
+    }
+  } catch (e) {
+    console.error(`[PERSIST] Write atomic failed for ${filePath}`, e);
   }
 }
 
-// Find a safe spawn Y (highest block + 2)
+/** Finds a safe spawn Y (highest block + 2) */
 function findSpawnYAt(world: WorldStore, x: number, z: number, preferredY: number) {
   const ix = Math.floor(x);
   const iz = Math.floor(z);
@@ -146,7 +155,6 @@ function patchCount(patch: any): number | null {
   if (Array.isArray(p.blocks)) return p.blocks.length;
   if (Array.isArray(p.data)) return p.data.length;
   if (typeof p.count === "number") return p.count;
-  if (typeof p.n === "number") return p.n;
   return null;
 }
 
@@ -365,31 +373,33 @@ function kindToBlockId(kind: string): BlockId {
   if (kind === "block:bedrock") return BLOCKS.BEDROCK;
   if (kind === "block:log") return BLOCKS.LOG;
   if (kind === "block:leaves") return BLOCKS.LEAVES;
+  if (kind === "block:plank") return BLOCKS.PLANKS;
 
-  // Handles aliases for block properties (planets, wood, ore)
-  if (kind === "block:plank") return (BLOCKS as any).PLANKS ?? BLOCKS.LOG;
-  if (kind === "block:sand") return (BLOCKS as any).SAND ?? BLOCKS.DIRT;
-  if (kind === "block:snow") return (BLOCKS as any).SNOW ?? BLOCKS.GRASS;
-  if (kind === "block:clay") return (BLOCKS as any).CLAY ?? BLOCKS.DIRT;
-  if (kind === "block:gravel") return (BLOCKS as any).GRAVEL ?? BLOCKS.STONE;
-  if (kind === "block:mud") return (BLOCKS as any).MUD ?? BLOCKS.DIRT;
-  if (kind === "block:ice") return (BLOCKS as any).ICE ?? BLOCKS.STONE;
+  // Biome blocks
+  if (kind === "block:sand") return BLOCKS.SAND;
+  if (kind === "block:snow") return BLOCKS.SNOW;
+  if (kind === "block:clay") return BLOCKS.CLAY;
+  if (kind === "block:gravel") return BLOCKS.GRAVEL;
+  if (kind === "block:mud") return BLOCKS.MUD;
+  if (kind === "block:ice") return BLOCKS.ICE;
 
-  if (kind === "block:coal_ore") return (BLOCKS as any).COAL_ORE ?? BLOCKS.STONE;
-  if (kind === "block:copper_ore") return (BLOCKS as any).COPPER_ORE ?? BLOCKS.STONE;
-  if (kind === "block:iron_ore") return (BLOCKS as any).IRON_ORE ?? BLOCKS.STONE;
-  if (kind === "block:silver_ore") return (BLOCKS as any).SILVER_ORE ?? BLOCKS.STONE;
-  if (kind === "block:gold_ore") return (BLOCKS as any).GOLD_ORE ?? BLOCKS.STONE;
-  if (kind === "block:ruby_ore") return (BLOCKS as any).RUBY_ORE ?? BLOCKS.STONE;
-  if (kind === "block:sapphire_ore") return (BLOCKS as any).SAPPHIRE_ORE ?? BLOCKS.STONE;
-  if (kind === "block:mythril_ore") return (BLOCKS as any).MYTHRIL_ORE ?? BLOCKS.STONE;
-  if (kind === "block:dragonstone") return (BLOCKS as any).DRAGONSTONE ?? BLOCKS.STONE;
+  // Ores
+  if (kind === "block:coal_ore") return BLOCKS.COAL_ORE;
+  if (kind === "block:copper_ore") return BLOCKS.COPPER_ORE;
+  if (kind === "block:iron_ore") return BLOCKS.IRON_ORE;
+  if (kind === "block:silver_ore") return BLOCKS.SILVER_ORE;
+  if (kind === "block:gold_ore") return BLOCKS.GOLD_ORE;
+  if (kind === "block:ruby_ore") return BLOCKS.RUBY_ORE;
+  if (kind === "block:sapphire_ore") return BLOCKS.SAPPHIRE_ORE;
+  if (kind === "block:mythril_ore") return BLOCKS.MYTHRIL_ORE;
+  if (kind === "block:dragonstone") return BLOCKS.DRAGONSTONE;
 
-  if (kind === "block:crafting_table") return (BLOCKS as any).CRAFTING_TABLE ?? (BLOCKS as any).PLANKS ?? BLOCKS.LOG;
-  if (kind === "block:chest") return (BLOCKS as any).CHEST ?? (BLOCKS as any).PLANKS ?? BLOCKS.LOG;
-  if (kind === "block:slab_plank") return (BLOCKS as any).SLAB_PLANK ?? (BLOCKS as any).PLANKS ?? BLOCKS.LOG;
-  if (kind === "block:stairs_plank") return (BLOCKS as any).STAIRS_PLANK ?? (BLOCKS as any).PLANKS ?? BLOCKS.LOG;
-  if (kind === "block:door_wood") return (BLOCKS as any).DOOR_WOOD ?? (BLOCKS as any).PLANKS ?? BLOCKS.LOG;
+  // Buildables
+  if (kind === "block:crafting_table") return BLOCKS.CRAFTING_TABLE;
+  if (kind === "block:chest") return BLOCKS.CHEST;
+  if (kind === "block:slab_plank") return BLOCKS.SLAB_PLANK;
+  if (kind === "block:stairs_plank") return BLOCKS.STAIRS_PLANK;
+  if (kind === "block:door_wood") return BLOCKS.DOOR_WOOD;
 
   return BLOCKS.AIR;
 }
@@ -401,30 +411,30 @@ function blockIdToKind(id: BlockId): string {
   if (id === BLOCKS.BEDROCK) return "block:bedrock";
   if (id === BLOCKS.LOG) return "block:log";
   if (id === BLOCKS.LEAVES) return "block:leaves";
-  if (id === (BLOCKS as any).PLANKS) return "block:plank";
+  if (id === BLOCKS.PLANKS) return "block:plank";
 
-  if (id === (BLOCKS as any).SAND) return "block:sand";
-  if (id === (BLOCKS as any).SNOW) return "block:snow";
-  if (id === (BLOCKS as any).CLAY) return "block:clay";
-  if (id === (BLOCKS as any).GRAVEL) return "block:gravel";
-  if (id === (BLOCKS as any).MUD) return "block:mud";
-  if (id === (BLOCKS as any).ICE) return "block:ice";
+  if (id === BLOCKS.SAND) return "block:sand";
+  if (id === BLOCKS.SNOW) return "block:snow";
+  if (id === BLOCKS.CLAY) return "block:clay";
+  if (id === BLOCKS.GRAVEL) return "block:gravel";
+  if (id === BLOCKS.MUD) return "block:mud";
+  if (id === BLOCKS.ICE) return "block:ice";
 
-  if (id === (BLOCKS as any).COAL_ORE) return "block:coal_ore";
-  if (id === (BLOCKS as any).COPPER_ORE) return "block:copper_ore";
-  if (id === (BLOCKS as any).IRON_ORE) return "block:iron_ore";
-  if (id === (BLOCKS as any).SILVER_ORE) return "block:silver_ore";
-  if (id === (BLOCKS as any).GOLD_ORE) return "block:gold_ore";
-  if (id === (BLOCKS as any).RUBY_ORE) return "block:ruby_ore";
-  if (id === (BLOCKS as any).SAPPHIRE_ORE) return "block:sapphire_ore";
-  if (id === (BLOCKS as any).MYTHRIL_ORE) return "block:mythril_ore";
-  if (id === (BLOCKS as any).DRAGONSTONE) return "block:dragonstone";
+  if (id === BLOCKS.COAL_ORE) return "block:coal_ore";
+  if (id === BLOCKS.COPPER_ORE) return "block:copper_ore";
+  if (id === BLOCKS.IRON_ORE) return "block:iron_ore";
+  if (id === BLOCKS.SILVER_ORE) return "block:silver_ore";
+  if (id === BLOCKS.GOLD_ORE) return "block:gold_ore";
+  if (id === BLOCKS.RUBY_ORE) return "block:ruby_ore";
+  if (id === BLOCKS.SAPPHIRE_ORE) return "block:sapphire_ore";
+  if (id === BLOCKS.MYTHRIL_ORE) return "block:mythril_ore";
+  if (id === BLOCKS.DRAGONSTONE) return "block:dragonstone";
 
-  if (id === (BLOCKS as any).CRAFTING_TABLE) return "block:crafting_table";
-  if (id === (BLOCKS as any).CHEST) return "block:chest";
-  if (id === (BLOCKS as any).SLAB_PLANK) return "block:slab_plank";
-  if (id === (BLOCKS as any).STAIRS_PLANK) return "block:stairs_plank";
-  if (id === (BLOCKS as any).DOOR_WOOD) return "block:door_wood";
+  if (id === BLOCKS.CRAFTING_TABLE) return "block:crafting_table";
+  if (id === BLOCKS.CHEST) return "block:chest";
+  if (id === BLOCKS.SLAB_PLANK) return "block:slab_plank";
+  if (id === BLOCKS.STAIRS_PLANK) return "block:stairs_plank";
+  if (id === BLOCKS.DOOR_WOOD) return "block:door_wood";
 
   return "";
 }
@@ -441,6 +451,36 @@ function isValidBlockCoord(n: any) {
 }
 
 // ------------------------------------------------------------
+// Procedural Generation Adapter
+// ------------------------------------------------------------
+
+// Initialize Ore Tables once from the Palette
+const ORE_TABLES: OreTables = buildDefaultOreTablesFromPalette(BLOCKS);
+
+/**
+ * The callback function passed to WorldStore.
+ * It ties the deterministic Biomes.ts logic to the WorldStore's queries.
+ */
+function proceduralTerrainGenerator(x: number, y: number, z: number): number {
+  // 1. Get Biome & Surface Height at this (x,z)
+  const { biome, height } = sampleBiome(x, z);
+
+  // 2. Air above surface
+  if (y > height) return BLOCKS.AIR;
+
+  // 3. Bedrock at the absolute bottom
+  if (y <= -63) return BLOCKS.BEDROCK;
+
+  // 4. Ores (Underground)
+  const oreId = pickOreId(x, y, z, biome, height, ORE_TABLES);
+  if (oreId !== 0) return oreId;
+
+  // 5. Terrain Layers (Grass, Dirt, Stone, Sand, etc.)
+  const depth = height - y;
+  return getTerrainLayerBlockId(BLOCKS, biome, depth);
+}
+
+// ------------------------------------------------------------
 // Room Implementation
 // ------------------------------------------------------------
 
@@ -450,7 +490,13 @@ export class MyRoom extends Room {
   public maxClients = 16;
 
   // Shared world per server process
-  private static WORLD = new WorldStore({ minCoord: -100000, maxCoord: 100000 });
+  // We attach the procedural generator here.
+  private static WORLD = new WorldStore({ 
+    minCoord: -100000, 
+    maxCoord: 100000,
+    generator: proceduralTerrainGenerator
+  });
+
   private static WORLD_BOOTSTRAPPED = false;
 
   // Environment Toggles & Tuning
@@ -469,6 +515,7 @@ export class MyRoom extends Room {
   private worldPath = path.join(process.cwd(), "world_data.json");
   private playersPath = path.join(process.cwd(), "players.json");
 
+  // Anti-Cheat / Rate Limiting
   private lastBlockOpAt = new Map<string, number>();
 
   // Persistence Helpers
@@ -641,7 +688,7 @@ export class MyRoom extends Room {
       syncEquipToolToHotbar(p);
     });
 
-    // Inventory
+    // Inventory Ops
     this.onMessage("inv:consumeHotbar", (client: Client, msg: InvConsumeHotbarMsg) => {
       const p = this.state.players.get(client.sessionId);
       if (!p) return;
@@ -815,10 +862,12 @@ export class MyRoom extends Room {
       const cz = sanitizeInt(msg?.z, Math.floor(p.z));
       const r = clamp(Math.floor(Number(msg?.r ?? 96)), 8, 512);
       const limit = clamp(Math.floor(Number(msg?.limit ?? MyRoom.PATCH_REQ_DEFAULT_LIMIT)), 100, MyRoom.PATCH_REQ_MAX_LIMIT);
+      
       const patch = MyRoom.WORLD.encodePatchAround({ x: cx, y: cy, z: cz }, r, { limit });
       client.send("world:patch", patch);
     });
 
+    // Anti-Cheat Constants
     const BLOCK_REACH = 7.5;
     const BLOCK_OP_COOLDOWN_MS = 90;
     const MAX_COORD = 100000;
@@ -830,28 +879,40 @@ export class MyRoom extends Room {
       this.lastBlockOpAt.set(sid, t);
       return true;
     };
-    const withinWorld = (x: number, y: number, z: number) => x >= -MAX_COORD && x <= MAX_COORD && y >= -MAX_COORD && y <= MAX_COORD && z >= -MAX_COORD && z <= MAX_COORD;
-    const reject = (client: Client, reason: string, extra?: any) => { client.send("block:reject", { reason, ...(extra || {}) }); };
+    
+    const withinWorld = (x: number, y: number, z: number) => 
+      x >= -MAX_COORD && x <= MAX_COORD && 
+      y >= -MAX_COORD && y <= MAX_COORD && 
+      z >= -MAX_COORD && z <= MAX_COORD;
+    
+    const reject = (client: Client, reason: string, extra?: any) => { 
+      client.send("block:reject", { reason, ...(extra || {}) }); 
+    };
 
     this.onMessage("block:break", (client: Client, msg: BlockBreakMsg) => {
       const p = this.state.players.get(client.sessionId);
       if (!p) return;
       const src = String(msg?.src || "unknown");
+      
       if (!canOpNow(client.sessionId)) { reject(client, "rate_limited", { op: "break", src }); return; }
       if (!isValidBlockCoord(msg?.x) || !isValidBlockCoord(msg?.y) || !isValidBlockCoord(msg?.z)) return;
+      
       const x = sanitizeInt(msg.x, 0), y = sanitizeInt(msg.y, 0), z = sanitizeInt(msg.z, 0);
       
       if (!withinWorld(x, y, z)) return;
       if (inTownSafeZone(x, y, z)) { reject(client, "safe_zone", { op: "break", src }); return; }
       
+      // Distance Check
       const d = dist3(p.x, p.y + 1.6, p.z, x + 0.5, y + 0.5, z + 0.5);
       if (d > BLOCK_REACH) return;
 
       const prevId = MyRoom.WORLD.getBlock(x, y, z);
       if (prevId === BLOCKS.AIR) return;
+      
       const { newId } = MyRoom.WORLD.applyBreak(x, y, z);
       const kind = blockIdToKind(prevId);
       if (kind) addKindToInventory(p, kind, 1);
+      
       this.broadcast("block:update", { x, y, z, id: newId });
     });
 
@@ -859,10 +920,12 @@ export class MyRoom extends Room {
       const p = this.state.players.get(client.sessionId);
       if (!p) return;
       const src = String(msg?.src || "unknown");
+      
       if (!canOpNow(client.sessionId)) return;
       const kind = String(msg?.kind || "");
       if (!isBlockKind(kind)) return;
       if (!isValidBlockCoord(msg?.x) || !isValidBlockCoord(msg?.y) || !isValidBlockCoord(msg?.z)) return;
+      
       const x = sanitizeInt(msg.x, 0), y = sanitizeInt(msg.y, 0), z = sanitizeInt(msg.z, 0);
 
       if (!withinWorld(x, y, z)) return;
@@ -870,12 +933,16 @@ export class MyRoom extends Room {
 
       const d = dist3(p.x, p.y + 1.6, p.z, x + 0.5, y + 0.5, z + 0.5);
       if (d > BLOCK_REACH) return;
+      
       const existing = MyRoom.WORLD.getBlock(x, y, z);
       if (existing !== BLOCKS.AIR) return;
+      
       const blockId = kindToBlockId(kind);
       if (blockId === BLOCKS.AIR) return;
+      
       const took = consumeFromHotbar(p, 1);
       if (took <= 0) return;
+      
       const { newId } = MyRoom.WORLD.applyPlace(x, y, z, blockId);
       this.broadcast("block:update", { x, y, z, id: newId });
     });
@@ -951,15 +1018,13 @@ export class MyRoom extends Room {
       add("item:stick", 8, 4);
     }
 
-    // Force Spawn Logic
-    let isForceSpawn = false;
+    // Town Spawn / Safe Zone Logic
     if (MyRoom.FORCE_TOWN_SPAWN) {
-      isForceSpawn = true;
       const sx = TOWN_SAFE_ZONE.center.x;
-      const sz = TOWN_SAFE_ZONE.center.z + 8; // Offset to avoid fountain
+      const sz = TOWN_SAFE_ZONE.center.z + 8; // Offset to avoid spawning inside fountain
       const finalY = findSpawnYAt(MyRoom.WORLD, sx, sz, TOWN_GROUND_Y);
 
-      // Temp position high in air
+      // Temp position high in air prevents clipping before teleport
       p.x = sx; p.y = TOWN_GROUND_Y + 80; p.z = sz;
       p.yaw = 0; p.pitch = 0;
 
@@ -970,12 +1035,12 @@ export class MyRoom extends Room {
 
       // Send smaller patch for fast load
       const patchCenter = { x: Math.floor(sx), y: TOWN_GROUND_Y, z: Math.floor(sz) };
-      const patchR = 48; // Reduce radius
+      const patchR = 48; // Smaller initial radius
       const patch = MyRoom.WORLD.encodePatchAround(patchCenter, patchR, { limit: MyRoom.INITIAL_PATCH_LIMIT });
       console.log(`[SPAWN] Initial Patch -> ${client.sessionId} r=${patchR} count=${patchCount(patch)}`);
       client.send("world:patch", patch);
 
-      // Delay Teleport Signal (Hide Loading Screen)
+      // Delay Teleport Signal (Hide Loading Screen after assets load)
       this.clock.setTimeout(() => {
         p.x = sx; p.y = finalY; p.z = sz;
         client.send("spawn:teleport", { x: sx, y: finalY, z: sz });
@@ -984,16 +1049,17 @@ export class MyRoom extends Room {
       return;
     }
 
-    // Normal Persistence Join
+    // Standard Persistence Join (Non-Town)
     syncEquipToolToHotbar(p);
     this.state.players.set(client.sessionId, p);
     client.send("welcome", { roomId: this.roomId, sessionId: client.sessionId });
 
+    // Send Patch around player
     const patchCenter = { x: Math.floor(p.x), y: Math.floor(p.y), z: Math.floor(p.z) };
     const patch = MyRoom.WORLD.encodePatchAround(patchCenter, 48, { limit: MyRoom.INITIAL_PATCH_LIMIT });
     client.send("world:patch", patch);
     
-    // Also send teleport signal immediately for consistent client handling
+    // Immediate teleport signal
     client.send("spawn:teleport", { x: p.x, y: p.y, z: p.z });
   }
 

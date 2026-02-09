@@ -1,66 +1,36 @@
 // ============================================================
-// server/world/WorldStore.ts  (FULL REWRITE - NO OMITS - BIOMES)
-// ============================================================
-// Purpose:
-// - Server-authoritative voxel world.
-// - Deterministic base terrain (biomes + height + vegetation + ores).
-// - Stores ONLY edits (deltas) to save memory.
-// - Full persistence support (JSON file I/O).
-// - Autosave support.
-// - Patch encoding (edits only) for syncing with clients.
+// src/world/WorldStore.ts
+// ------------------------------------------------------------
+// The Source of Truth for the Voxel World
 //
-// IMPORTANT:
-// - This file expects a sibling file: ./Biomes.ts (compiled import as ./Biomes.js)
-// - Your client has a DUPLICATED Biomes.ts with same logic.
+// Features:
+// - Stores player edits (sparse map) to save memory.
+// - Generates terrain procedurally via a generator callback.
+// - Handles persistence (load/save JSON) with atomic writes.
+// - Generates network patches (radius scans) for clients.
 // ============================================================
 
 import * as fs from "fs";
 import * as path from "path";
 
-// Biomes (server copy) — NodeNext/Node16 wants .js in compiled output imports
-import {
-  sampleBiome,
-  getTerrainLayerBlockId,
-  shouldSpawnTree,
-  getTreeSpec,
-  shouldSpawnCactus,
-  getCactusHeight,
-  buildDefaultOreTablesFromPalette,
-  pickOreId,
-  type BiomeId,
-  type TreeSpec,
-  type OreTables,
-} from "./Biomes.js";
+// ------------------------------------------------------------
+// Block ID Palette
+// ------------------------------------------------------------
+// This must match the IDs expected by the client and MyRoom.ts.
 
 export type BlockId = number;
 
-// ------------------------------------------------------------
-// Block IDs (MUST MATCH CLIENT REGISTRY)
-// ------------------------------------------------------------
-//
-// Keep these numeric IDs stable once you publish a world,
-// because existing saved edits store numbers.
-//
-// If you add new blocks later, append new IDs — do NOT reorder.
-// ------------------------------------------------------------
-
 export const BLOCKS = {
   AIR: 0,
-
-  // Core terrain
   DIRT: 1,
   GRASS: 2,
   STONE: 3,
   BEDROCK: 4,
-
-  // Trees
   LOG: 5,
   LEAVES: 6,
-
-  // Crafted/building
   PLANKS: 7,
 
-  // Biome surfaces
+  // Terrain / Biome Specific
   SAND: 8,
   SNOW: 9,
   CLAY: 10,
@@ -68,228 +38,48 @@ export const BLOCKS = {
   MUD: 12,
   ICE: 13,
 
-  // Desert vegetation
-  CACTUS: 14,
+  // Ores
+  COAL_ORE: 14,
+  COPPER_ORE: 15,
+  IRON_ORE: 16,
+  SILVER_ORE: 17,
+  GOLD_ORE: 18,
+  RUBY_ORE: 19,
+  SAPPHIRE_ORE: 20,
+  MYTHRIL_ORE: 21,
+  DRAGONSTONE: 22,
 
-  // Ores / valuables
-  COAL_ORE: 15,
-  COPPER_ORE: 16,
-  IRON_ORE: 17,
-  SILVER_ORE: 18,
-  GOLD_ORE: 19,
+  // Buildables / Interactables
+  CRAFTING_TABLE: 30,
+  CHEST: 31,
+  SLAB_PLANK: 32,
+  STAIRS_PLANK: 33,
+  DOOR_WOOD: 34,
 
-  // Fantasy tiers
-  RUBY_ORE: 20,
-  SAPPHIRE_ORE: 21,
-  MYTHRIL_ORE: 22,
-  DRAGONSTONE: 23,
-
-  // Optional functional blocks (safe to include now)
-  CRAFTING_TABLE: 24,
-  CHEST: 25,
-  SLAB_PLANK: 26,
-  STAIRS_PLANK: 27,
-  DOOR_WOOD: 28,
+  // Utility / Fallbacks
+  WATER: 90,
+  LAVA: 91,
 } as const;
 
-// “palette” type used by biome helpers
-export type BlockPalette = typeof BLOCKS & Record<string, number>;
-
-export type WorldEdit = { x: number; y: number; z: number; id: BlockId };
-
-type SerializedWorld = {
-  version: number;
-  edits: WorldEdit[];
-};
-
 // ------------------------------------------------------------
-// Utils
+// Types & Config
 // ------------------------------------------------------------
-
-function isFiniteNum(n: any): n is number {
-  return typeof n === "number" && Number.isFinite(n);
-}
-
-function clamp(n: number, a: number, b: number) {
-  return Math.max(a, Math.min(b, n));
-}
-
-function i32(n: any, fallback = 0) {
-  const v = Number(n);
-  if (!Number.isFinite(v)) return fallback;
-  return v | 0;
-}
-
-/** String key for Map storage "x|y|z" */
-function keyOf(x: number, y: number, z: number) {
-  return `${x}|${y}|${z}`;
-}
-
-/** Inverse key parser */
-function parseKey(k: string): { x: number; y: number; z: number } | null {
-  if (typeof k !== "string") return null;
-  const parts = k.split("|");
-  if (parts.length !== 3) return null;
-  const x = Number(parts[0]);
-  const y = Number(parts[1]);
-  const z = Number(parts[2]);
-  if (!Number.isFinite(x) || !Number.isFinite(y) || !Number.isFinite(z)) return null;
-  return { x: x | 0, y: y | 0, z: z | 0 };
-}
-
-// ------------------------------------------------------------
-// Deterministic Base Terrain (Biomes + Ores + Vegetation)
-// ------------------------------------------------------------
-//
-// This MUST match the client’s deterministic generation logic
-// (same Biomes.ts math + same block IDs).
-//
-// WorldStore only stores edits; base terrain is computed here.
-// ------------------------------------------------------------
-
-const PALETTE: BlockPalette = BLOCKS as any;
-const ORE_TABLES: OreTables = buildDefaultOreTablesFromPalette(PALETTE);
 
 /**
- * Determine base block at world coordinate (x,y,z) WITHOUT edits.
- * - Bedrock floor at y < -10.
- * - Biome height from sampleBiome(x,z).
- * - Surface layers from getTerrainLayerBlockId.
- * - Vegetation: trees + cactus (deterministic).
- * - Ores: replace some stone underground (deterministic).
+ * A function that determines the natural block at (x, y, z).
+ * Used to generate terrain on the fly if no player edit exists.
  */
-export function getBaseVoxelID(x: number, y: number, z: number): BlockId {
-  x |= 0;
-  y |= 0;
-  z |= 0;
+export type WorldGenerator = (x: number, y: number, z: number) => number;
 
-  // 1) Bedrock floor
-  if (y < -10) return BLOCKS.BEDROCK;
+export interface WorldStoreConfig {
+  minCoord?: number;
+  maxCoord?: number;
+  generator?: WorldGenerator;
+}
 
-  // 2) Biome + height at this column
-  const b = sampleBiome(x, z);
-  const biome = b.biome;
-  const height = b.height;
-
-  // 3) Above ground: AIR unless vegetation places something
-  if (y > height) {
-    // Trees (forest/plains/swamp/tundra)
-    if (shouldSpawnTree(x, z, biome)) {
-      const spec = getTreeSpec(x, z, biome);
-
-      // Trunk base starts one above ground
-      const trunkBaseY = height + 1;
-      const trunkTopY = trunkBaseY + Math.max(1, spec.trunkHeight) - 1;
-
-      // Trunk
-      if (y >= trunkBaseY && y <= trunkTopY) {
-        return BLOCKS.LOG;
-      }
-
-      // Canopy:
-      // - Use spec.canopyRadius and spec.canopyHeight
-      // - Canopy centered around trunkTopY
-      const canopyRadius = Math.max(1, Math.floor(Number((spec as any).canopyRadius ?? 2)));
-      const canopyHeight = Math.max(2, Math.floor(Number((spec as any).canopyHeight ?? 3)));
-
-      const canopyBottom = trunkTopY - 1;
-      const canopyTop = canopyBottom + canopyHeight;
-
-      if (y >= canopyBottom && y <= canopyTop) {
-        const dy = y - canopyBottom; // 0..canopyHeight
-        // taper radius slightly with height
-        const taper = 1 - dy / (canopyHeight + 0.001);
-        const r = Math.max(1, Math.floor(canopyRadius * (0.7 + 0.3 * taper)));
-
-        // circular-ish canopy
-        const dx = x - x; // 0 in this function, but we still need offsets
-        const dz = z - z; // 0
-        // We need to check neighbors too, but base function is per-voxel.
-        // So: determine if THIS voxel belongs to canopy using distance to trunk column.
-        // Since trunk column is at (x,z) same as current voxel’s column, canopy in this simple version
-        // only exists in the same column. That’s not enough.
-        //
-        // To do a real canopy (multi-block), we need to test distance to trunk center with offsets
-        // derived from current voxel vs trunk center: current voxel is (x,z) and trunk center is (x0,z0).
-        // But here, x0=z0 are the same inputs. So to support radius, we must evaluate canopy
-        // when getBaseVoxelID is called at nearby columns too.
-        //
-        // That means: canopy should be decided by checking if the column's tree root is at (x0,z0),
-        // not necessarily at (x,z). To keep deterministic and cheap, we check a small neighborhood of
-        // possible tree roots and see if any canopy covers this voxel.
-        //
-        // So we fall through to "neighborhood canopy check" below.
-      }
-    }
-
-    // Desert cactus
-    if (shouldSpawnCactus(x, z, biome)) {
-      const baseY = height + 1;
-      const h = getCactusHeight(x, z);
-      if (y >= baseY && y < baseY + h) return BLOCKS.CACTUS;
-    }
-
-    // Neighborhood canopy check (supports multi-block canopy)
-    // We scan for tree roots in a small neighborhood so leaves can extend.
-    // Keep this small for performance.
-    //
-    // Radius max we expect: ~3. We'll scan +/-4 to be safe.
-    const SCAN_R = 4;
-
-    for (let ox = -SCAN_R; ox <= SCAN_R; ox++) {
-      for (let oz = -SCAN_R; oz <= SCAN_R; oz++) {
-        const rx = x + ox;
-        const rz = z + oz;
-
-        const bb = sampleBiome(rx, rz);
-        const rBiome = bb.biome;
-        const rHeight = bb.height;
-
-        if (!shouldSpawnTree(rx, rz, rBiome)) continue;
-
-        const spec = getTreeSpec(rx, rz, rBiome);
-        const trunkBaseY = rHeight + 1;
-        const trunkTopY = trunkBaseY + Math.max(1, spec.trunkHeight) - 1;
-
-        const canopyRadius = Math.max(1, Math.floor(Number((spec as any).canopyRadius ?? 2)));
-        const canopyHeight = Math.max(2, Math.floor(Number((spec as any).canopyHeight ?? 3)));
-
-        const canopyBottom = trunkTopY - 1;
-        const canopyTop = canopyBottom + canopyHeight;
-
-        if (y < canopyBottom || y > canopyTop) continue;
-
-        const dy = y - canopyBottom;
-        const taper = 1 - dy / (canopyHeight + 0.001);
-        const rr = Math.max(1, Math.floor(canopyRadius * (0.7 + 0.3 * taper)));
-
-        const dx = x - rx;
-        const dz = z - rz;
-
-        if (dx * dx + dz * dz <= rr * rr) {
-          // Avoid placing leaves inside trunk column above trunk
-          // (optional) — if it's exactly in trunk column and within trunk height, skip:
-          if (dx === 0 && dz === 0 && y >= trunkBaseY && y <= trunkTopY) continue;
-          return BLOCKS.LEAVES;
-        }
-      }
-    }
-
-    return BLOCKS.AIR;
-  }
-
-  // 4) At/Below surface: determine layer (surface/subsurface/stone)
-  const depth = height - y; // 0 => surface, 1.. => below surface
-  const layerId = getTerrainLayerBlockId(PALETTE, biome, depth);
-
-  // 5) Ores: only attempt in stone-like zones
-  // We treat "stone layer" as anything equal to BLOCKS.STONE.
-  if (layerId === BLOCKS.STONE) {
-    const oreId = pickOreId(x, y, z, biome, height, ORE_TABLES);
-    if (oreId && typeof oreId === "number" && oreId !== 0) return oreId;
-  }
-
-  return layerId;
+export interface AutosaveConfig {
+  path: string;
+  minIntervalMs: number;
 }
 
 // ------------------------------------------------------------
@@ -297,386 +87,248 @@ export function getBaseVoxelID(x: number, y: number, z: number): BlockId {
 // ------------------------------------------------------------
 
 export class WorldStore {
-  private edits: Map<string, BlockId>;
+  // Sparse map of player edits.
+  // Key: "x,y,z" (string)
+  // Value: BlockId (number)
+  // We only store blocks that differ from the procedural generator.
+  private edits = new Map<string, number>();
 
-  public readonly minCoord: number;
-  public readonly maxCoord: number;
+  // The procedural generation logic (injected from Biomes.ts via MyRoom)
+  private generator: WorldGenerator | null = null;
 
-  // Persistence State
-  private _dirty: boolean = false;
-  private _lastSaveAt: number = 0;
-  private _autosavePath: string | null = null;
-  private _autosaveMinIntervalMs: number = 2500;
+  // World boundaries (soft limits)
+  private minCoord: number;
+  private maxCoord: number;
 
-  constructor(opts?: {
-    minCoord?: number;
-    maxCoord?: number;
-    seed?: number;
-    autosavePath?: string;
-    autosaveMinIntervalMs?: number;
-  }) {
-    this.edits = new Map();
+  // Persistence state
+  private dirty = false;
+  private lastAutosave = 0;
+  private autosaveConfig: AutosaveConfig | null = null;
 
-    this.minCoord = isFiniteNum(opts?.minCoord) ? (opts!.minCoord as number) : -100000;
-    this.maxCoord = isFiniteNum(opts?.maxCoord) ? (opts!.maxCoord as number) : 100000;
-
-    if (typeof opts?.autosavePath === "string" && opts.autosavePath.trim()) {
-      this._autosavePath = opts.autosavePath.trim();
-    }
-    if (isFiniteNum(opts?.autosaveMinIntervalMs)) {
-      this._autosaveMinIntervalMs = Math.max(250, (opts!.autosaveMinIntervalMs as number) | 0);
-    }
+  constructor(cfg?: WorldStoreConfig) {
+    this.minCoord = cfg?.minCoord ?? -100000;
+    this.maxCoord = cfg?.maxCoord ?? 100000;
+    this.generator = cfg?.generator ?? null;
   }
 
-  /** Enable/disable autosave (file). */
-  public configureAutosave(opts: { path?: string | null; minIntervalMs?: number }) {
-    if (typeof opts.path === "string" && opts.path.trim()) this._autosavePath = opts.path.trim();
-    if (opts.path === null) this._autosavePath = null;
+  // ----------------------------------------------------------
+  // Core Accessors
+  // ----------------------------------------------------------
 
-    if (isFiniteNum(opts.minIntervalMs)) {
-      this._autosaveMinIntervalMs = Math.max(250, (opts.minIntervalMs as number) | 0);
-    }
-  }
-
-  /** Mark dirty and (optionally) autosave. */
-  private markDirty() {
-    this._dirty = true;
-    this.maybeAutosave();
-  }
-
-  /** Autosave if enabled and throttled interval passed. */
-  public maybeAutosave() {
-    if (!this._autosavePath) return;
-    const now = Date.now();
-    if (!this._dirty) return;
-    if (now - this._lastSaveAt < this._autosaveMinIntervalMs) return;
-
-    try {
-      this.saveToFileSync(this._autosavePath);
-      this._lastSaveAt = now;
-      this._dirty = false;
-    } catch (e) {
-      console.error("[WORLD] Autosave failed:", e);
-    }
-  }
-
-  /** Clamp coords into safe range for sanity */
-  public sanitizeCoord(n: any) {
-    const v = i32(n, 0);
-    return clamp(v, this.minCoord, this.maxCoord) | 0;
-  }
-
-  /** Base block at coordinate (no edits considered) */
-  public getBaseBlock(x: number, y: number, z: number): BlockId {
-    return getBaseVoxelID(x | 0, y | 0, z | 0);
-  }
-
-  /** Final block at coordinate (edits override base) */
-  public getBlock(x: number, y: number, z: number): BlockId {
-    x |= 0;
-    y |= 0;
-    z |= 0;
-    const k = keyOf(x, y, z);
-    const e = this.edits.get(k);
-    if (typeof e === "number") return e;
-    return this.getBaseBlock(x, y, z);
+  private key(x: number, y: number, z: number): string {
+    return `${x | 0},${y | 0},${z | 0}`;
   }
 
   /**
-   * Set a block at coordinate.
-   * Stores only delta vs base terrain.
-   * Returns the new final block id.
+   * Retrieves the block ID at a specific coordinate.
+   * Logic:
+   * 1. Check if a player has modified this block (Edits Map).
+   * 2. If not, ask the procedural generator.
+   * 3. If no generator, default to AIR.
    */
-  public setBlock(x: number, y: number, z: number, id: BlockId): BlockId {
-    x |= 0;
-    y |= 0;
-    z |= 0;
-    id = i32(id, BLOCKS.AIR);
-
-    const base = this.getBaseBlock(x, y, z);
-    const k = keyOf(x, y, z);
-
-    if (id === base) {
-      // If setting to base, remove the edit (optimization)
-      if (this.edits.has(k)) {
-        this.edits.delete(k);
-        this.markDirty();
-      }
-      return base;
+  public getBlock(x: number, y: number, z: number): number {
+    // 1. Check player edits
+    const k = this.key(x, y, z);
+    const edit = this.edits.get(k);
+    if (edit !== undefined) {
+      return edit;
     }
 
-    const prev = this.edits.get(k);
-    if (prev !== id) {
-      this.edits.set(k, id);
-      this.markDirty();
+    // 2. Check procedural generator
+    if (this.generator) {
+      return this.generator(x, y, z);
     }
-    return id;
+
+    // 3. Default
+    return BLOCKS.AIR;
   }
 
   /**
-   * Break a block (set to AIR).
-   * Returns previous and new ids.
+   * Sets a block at a specific coordinate (Player Action).
+   * Logic:
+   * 1. If the new ID matches the procedural generator's output, remove the edit (revert to nature).
+   * 2. Otherwise, store the new ID in the edits map.
    */
-  public applyBreak(x: number, y: number, z: number): { prevId: BlockId; newId: BlockId } {
-    x |= 0;
-    y |= 0;
-    z |= 0;
-    const prevId = this.getBlock(x, y, z);
-    const newId = this.setBlock(x, y, z, BLOCKS.AIR);
-    return { prevId, newId };
-  }
+  public setBlock(x: number, y: number, z: number, id: number): void {
+    const k = this.key(x, y, z);
 
-  /**
-   * Place a block (set to given id).
-   * Returns previous and new ids.
-   */
-  public applyPlace(x: number, y: number, z: number, id: BlockId): { prevId: BlockId; newId: BlockId } {
-    x |= 0;
-    y |= 0;
-    z |= 0;
-    id = i32(id, BLOCKS.AIR);
-    const prevId = this.getBlock(x, y, z);
-    const newId = this.setBlock(x, y, z, id);
-    return { prevId, newId };
-  }
-
-  /** Returns the internal edits Map size */
-  public editsCount() {
-    return this.edits.size;
-  }
-
-  /** Remove all edits (world reset) */
-  public clearAllEdits() {
-    if (this.edits.size > 0) {
-      this.edits.clear();
-      this.markDirty();
-    }
-  }
-
-  /** Get all edits as an array (careful: can be big) */
-  public getAllEdits(): WorldEdit[] {
-    const out: WorldEdit[] = [];
-    for (const [k, id] of this.edits.entries()) {
-      const p = parseKey(k);
-      if (!p) continue;
-      out.push({ x: p.x, y: p.y, z: p.z, id });
-    }
-    return out;
-  }
-
-  /**
-   * Get edits inside an axis-aligned bounding box (inclusive).
-   */
-  public getEditsInAABB(min: { x: number; y: number; z: number }, max: { x: number; y: number; z: number }): WorldEdit[] {
-    const minX = Math.min(min.x | 0, max.x | 0);
-    const maxX = Math.max(min.x | 0, max.x | 0);
-    const minY = Math.min(min.y | 0, max.y | 0);
-    const maxY = Math.max(min.y | 0, max.y | 0);
-    const minZ = Math.min(min.z | 0, max.z | 0);
-    const maxZ = Math.max(min.z | 0, max.z | 0);
-
-    const out: WorldEdit[] = [];
-
-    for (const [k, id] of this.edits.entries()) {
-      const p = parseKey(k);
-      if (!p) continue;
-      if (p.x < minX || p.x > maxX) continue;
-      if (p.y < minY || p.y > maxY) continue;
-      if (p.z < minZ || p.z > maxZ) continue;
-      out.push({ x: p.x, y: p.y, z: p.z, id });
-    }
-
-    return out;
-  }
-
-  /**
-   * Builds a chunk snapshot (base + edits merged) for a given chunk origin.
-   * Returns Uint16Array of size chunkSize^3 in X-major order (x -> y -> z).
-   */
-  public makeChunkSnapshot(chunkX: number, chunkY: number, chunkZ: number, chunkSize: number): Uint16Array {
-    chunkX |= 0;
-    chunkY |= 0;
-    chunkZ |= 0;
-    chunkSize = Math.max(1, chunkSize | 0);
-
-    const ox = chunkX * chunkSize;
-    const oy = chunkY * chunkSize;
-    const oz = chunkZ * chunkSize;
-
-    const total = chunkSize * chunkSize * chunkSize;
-    const arr = new Uint16Array(total);
-
-    let ptr = 0;
-    for (let x = 0; x < chunkSize; x++) {
-      for (let y = 0; y < chunkSize; y++) {
-        for (let z = 0; z < chunkSize; z++) {
-          const wx = ox + x;
-          const wy = oy + y;
-          const wz = oz + z;
-          arr[ptr++] = this.getBlock(wx, wy, wz) & 0xffff;
+    // Optimization: Don't store edits that match the natural world.
+    // This keeps the save file small.
+    if (this.generator) {
+      const naturalId = this.generator(x, y, z);
+      if (naturalId === id) {
+        if (this.edits.has(k)) {
+          this.edits.delete(k);
+          this.dirty = true;
         }
+        return;
       }
     }
 
-    return arr;
+    // Store the edit
+    this.edits.set(k, id);
+    this.dirty = true;
   }
 
-  /**
-   * Encode a patch payload for the client. Keeps it plain JSON.
-   * Provide an area; you get back only edits in that area.
-   */
-  public encodeEditsPatch(
-    min: { x: number; y: number; z: number },
-    max: { x: number; y: number; z: number },
-    opts?: { limit?: number }
-  ): { edits: WorldEdit[]; truncated: boolean } {
-    const edits = this.getEditsInAABB(min, max);
+  // ----------------------------------------------------------
+  // Room Operations (Helpers for MyRoom.ts)
+  // ----------------------------------------------------------
 
-    const limit = isFiniteNum(opts?.limit) ? Math.max(1, (opts!.limit as number) | 0) : 5000;
-
-    if (edits.length > limit) {
-      edits.length = limit;
-      return { edits, truncated: true };
-    }
-
-    return { edits, truncated: false };
+  public applyBreak(x: number, y: number, z: number) {
+    this.setBlock(x, y, z, BLOCKS.AIR);
+    return { newId: BLOCKS.AIR };
   }
 
+  public applyPlace(x: number, y: number, z: number, id: number) {
+    this.setBlock(x, y, z, id);
+    return { newId: id };
+  }
+
+  // ----------------------------------------------------------
+  // Network Patching
+  // ----------------------------------------------------------
+
   /**
-   * Convenience: encode a patch around a point with radius (block units).
+   * Scans a cubic volume around a center point and returns all non-AIR blocks.
+   * Used to send terrain data to the client.
+   * * @param center The center point {x, y, z}
+   * @param radius The radius of the scan (blocks)
+   * @param opts Optional limits to prevent massive payloads
    */
   public encodePatchAround(
     center: { x: number; y: number; z: number },
     radius: number,
     opts?: { limit?: number }
-  ): { edits: WorldEdit[]; truncated: boolean } {
-    const r = Math.max(1, Math.floor(Number(radius) || 0));
-    const min = { x: (center.x | 0) - r, y: (center.y | 0) - r, z: (center.z | 0) - r };
-    const max = { x: (center.x | 0) + r, y: (center.y | 0) + r, z: (center.z | 0) + r };
-    return this.encodeEditsPatch(min, max, opts);
-  }
+  ) {
+    const limit = opts?.limit ?? 50000;
+    
+    // Use a flat array for the data: [x, y, z, id, x, y, z, id, ...]
+    // This is efficient for JSON serialization and client-side parsing.
+    const blocks: number[] = [];
 
-  // ==========================================================
-  // Persistence helpers
-  // ==========================================================
+    const startX = (center.x - radius) | 0;
+    const endX = (center.x + radius) | 0;
+    const startY = Math.max(-64, (center.y - radius) | 0);
+    const endY = Math.min(320, (center.y + radius) | 0);
+    const startZ = (center.z - radius) | 0;
+    const endZ = (center.z + radius) | 0;
 
-  /** Serialize world edits to a JSON-friendly structure. */
-  public serialize(): SerializedWorld {
+    let count = 0;
+
+    // Iterate through the volume
+    // Order (X, Z, Y) is arbitrary but consistent loops help cache locality slightly
+    for (let x = startX; x <= endX; x++) {
+      for (let z = startZ; z <= endZ; z++) {
+        for (let y = startY; y <= endY; y++) {
+          
+          const id = this.getBlock(x, y, z);
+
+          // Optimization: Client treats missing blocks as AIR (or existing).
+          // We only send solid blocks to save bandwidth.
+          if (id !== BLOCKS.AIR) {
+            blocks.push(x, y, z, id);
+            count++;
+            
+            if (count >= limit) break;
+          }
+        }
+        if (count >= limit) break;
+      }
+      if (count >= limit) break;
+    }
+
     return {
-      version: 1,
-      edits: this.getAllEdits(),
+      cx: center.x,
+      cy: center.y,
+      cz: center.z,
+      r: radius,
+      data: blocks,
+      count: count,
     };
   }
 
+  // ----------------------------------------------------------
+  // Persistence (Load / Save)
+  // ----------------------------------------------------------
+
+  public editsCount(): number {
+    return this.edits.size;
+  }
+
+  public isDirty(): boolean {
+    return this.dirty;
+  }
+
   /**
-   * Apply serialized data.
-   * - replace=true clears existing edits first.
-   * - Any edit matching base will be dropped automatically.
+   * Loads world edits from a JSON file.
+   * Expects format: { version: number, timestamp: number, edits: [[key, val], ...] }
    */
-  public applySerialized(data: any, opts?: { replace?: boolean }) {
-    const replace = !!opts?.replace;
-
-    if (!data || typeof data !== "object") return;
-    const ver = Number((data as any).version || 0);
-    if (!Number.isFinite(ver) || ver < 1) return;
-
-    const editsArr = (data as any).edits;
-    if (!Array.isArray(editsArr)) return;
-
-    if (replace) this.edits.clear();
-
-    for (const e of editsArr) {
-      const x = i32(e?.x, 0);
-      const y = i32(e?.y, 0);
-      const z = i32(e?.z, 0);
-      const id = i32(e?.id, BLOCKS.AIR);
-
-      // clamp coords to store bounds
-      const sx = clamp(x, this.minCoord, this.maxCoord) | 0;
-      const sy = clamp(y, this.minCoord, this.maxCoord) | 0;
-      const sz = clamp(z, this.minCoord, this.maxCoord) | 0;
-
-      // store as delta vs base
-      const base = this.getBaseBlock(sx, sy, sz);
-      const k = keyOf(sx, sy, sz);
-
-      if (id === base) {
-        this.edits.delete(k);
-      } else {
-        this.edits.set(k, id);
-      }
-    }
-
-    this._dirty = false;
-  }
-
-  /** Ensure parent directory exists. */
-  private ensureDirForFile(filePath: string) {
-    const dir = path.dirname(filePath);
-    if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
-  }
-
-  /** Save serialized world to disk (sync). */
-  public saveToFileSync(filePath: string) {
-    const fp = String(filePath || "").trim();
-    if (!fp) throw new Error("saveToFileSync: invalid path");
-
-    this.ensureDirForFile(fp);
-
-    const data = this.serialize();
-    const json = JSON.stringify(data);
-
-    fs.writeFileSync(fp, json, "utf8");
-    this._dirty = false;
-    this._lastSaveAt = Date.now();
-  }
-
-  /** Load serialized world from disk (sync). */
-  public loadFromFileSync(filePath: string, opts?: { replace?: boolean }) {
-    const fp = String(filePath || "").trim();
-    if (!fp) throw new Error("loadFromFileSync: invalid path");
-
-    if (!fs.existsSync(fp)) return false;
-
-    const raw = fs.readFileSync(fp, "utf8");
-    const data = JSON.parse(raw);
-
-    this.applySerialized(data, { replace: opts?.replace ?? true });
-    return true;
-  }
-
-  /** Save serialized world to disk (async). */
-  public async saveToFile(filePath: string) {
-    const fp = String(filePath || "").trim();
-    if (!fp) throw new Error("saveToFile: invalid path");
-
-    this.ensureDirForFile(fp);
-
-    const data = this.serialize();
-    const json = JSON.stringify(data);
-
-    await fs.promises.writeFile(fp, json, "utf8");
-    this._dirty = false;
-    this._lastSaveAt = Date.now();
-  }
-
-  /** Load serialized world from disk (async). */
-  public async loadFromFile(filePath: string, opts?: { replace?: boolean }) {
-    const fp = String(filePath || "").trim();
-    if (!fp) throw new Error("loadFromFile: invalid path");
+  public loadFromFileSync(filePath: string): boolean {
+    if (!fs.existsSync(filePath)) return false;
 
     try {
-      const raw = await fs.promises.readFile(fp, "utf8");
+      const raw = fs.readFileSync(filePath, "utf8");
       const data = JSON.parse(raw);
-      this.applySerialized(data, { replace: opts?.replace ?? true });
-      return true;
-    } catch {
+
+      if (Array.isArray(data.edits)) {
+        this.edits.clear();
+        for (const [key, value] of data.edits) {
+          this.edits.set(key, value);
+        }
+        this.dirty = false;
+        return true;
+      }
+      return false;
+    } catch (e) {
+      console.error(`[WorldStore] Load failed for ${filePath}:`, e);
       return false;
     }
   }
 
-  /** Whether edits have changed since last save. */
-  public isDirty() {
-    return !!this._dirty;
+  /**
+   * Saves world edits to a JSON file safely (atomic write).
+   */
+  public saveToFileSync(filePath: string): void {
+    try {
+      // Serialize Map to an array of entries for JSON
+      const data = {
+        version: 1,
+        timestamp: Date.now(),
+        edits: Array.from(this.edits.entries()),
+      };
+
+      const dir = path.dirname(filePath);
+      if (!fs.existsSync(dir)) {
+        fs.mkdirSync(dir, { recursive: true });
+      }
+
+      // Write to a temp file first, then rename to ensure data integrity
+      const tmp = `${filePath}.tmp.${Date.now()}`;
+      fs.writeFileSync(tmp, JSON.stringify(data));
+      fs.renameSync(tmp, filePath);
+
+      this.dirty = false;
+    } catch (e) {
+      console.error(`[WorldStore] Save failed for ${filePath}:`, e);
+    }
+  }
+
+  // ----------------------------------------------------------
+  // Autosave Logic
+  // ----------------------------------------------------------
+
+  public configureAutosave(cfg: AutosaveConfig) {
+    this.autosaveConfig = cfg;
+  }
+
+  public maybeAutosave() {
+    if (!this.autosaveConfig || !this.dirty) return;
+
+    const now = Date.now();
+    if (now - this.lastAutosave > this.autosaveConfig.minIntervalMs) {
+      console.log(`[WorldStore] Autosaving ${this.edits.size} edits...`);
+      this.saveToFileSync(this.autosaveConfig.path);
+      this.lastAutosave = now;
+    }
   }
 }
