@@ -1,6 +1,6 @@
 // @ts-nocheck
 /*
- * fresh2 - client main/index (PRODUCTION - BIOMES + TOWN FPS CLAMP EDITION)
+ * fresh2 - client main/index (PRODUCTION - BIOMES + TOWN FPS CLAMP + CHAT COMMANDS)
  * -----------------------------------------------------------------------
  * INCLUDES (NO OMITS):
  * - 3x3 Crafting Grid (Virtual Mapping Strategy)
@@ -10,31 +10,20 @@
  * - 3D Rigs (FPS Hands + 3rd Person Avatars)
  * - Network Interpolation (Smooth movement)
  * - Debug Console (F4)
+ * - Chat System (Enter to chat, supports /find, /goto, /biome)
  * - Dynamic Environment Switching (Localhost vs Prod)
  *
  * ADDED (Phase 2 Option A):
- * - Client-only render clamp while inside Town of Beginnings safe zone:
- * - Reduce chunkAddDistance / chunkRemoveDistance
- * - Reduce camera maxZ (view distance)
+ * - Client-only render clamp while inside Town of Beginnings safe zone
+ * - Reduced chunkAddDistance / chunkRemoveDistance
+ * - Reduced camera maxZ (view distance)
  * - Optional fog (enabled inside town; disabled outside)
- * - When player exits town: restore original distances (future expansion)
  *
  * ALSO FIXED:
- * - Register room.onMessage handlers for "welcome" and "block:reject"
- * to avoid @colyseus/sdk warnings.
- *
- * ADDED (Spawn Under Town Fix + Logging):
- * - Prevent "spawn under town" by freezing player physics until first world patch
- * is applied, then snapping to spawn and zeroing velocity.
- * - Handle server "spawn:teleport" message (if server sends it).
- * - Add logging for:
- * - Server spawn
- * - Player position
- * - Town center block ids after patch
+ * - Register room.onMessage handlers for "welcome", "block:reject", "chat:sys"
  *
  * IMPORTANT:
  * - This file mirrors the server's biome/height/layer/ore logic via shared Biomes.ts
- * - It does NOT change server rules; FPS improvements are client-only.
  */
 
 import { Engine } from "noa-engine";
@@ -44,11 +33,6 @@ import * as Colyseus from "colyseus.js";
 /* ============================================================
  * 0. BIOMES (Shared Deterministic Math)
  * ============================================================
- *
- * IMPORTANT:
- * - Adjust this import path to match your project structure.
- * - This must point at the compiled JS output of shared/world/Biomes.ts
- * so client + server use identical math.
  */
 import {
   sampleBiome,
@@ -64,11 +48,6 @@ import {
 /* ============================================================
  * 0.5 TOWN OF BEGINNINGS (Client-only render clamp region)
  * ============================================================
- *
- * Match server applyBlueprint.ts safe-zone region:
- * - Center: (0,0) in XZ
- * - Radius: 42
- * - Ground Y: 10 (used for patch request hints / spawn visuals)
  */
 const TOWN = {
   cx: 0,
@@ -91,7 +70,7 @@ const RENDER_PRESET_TOWN = {
   chunkRemoveDistance: 2.15,
   cameraMaxZ: 120, // tighter view distance inside town
   fog: true,
-  fogDensity: 0.018, // tasteful; tweak if too strong
+  fogDensity: 0.018,
 };
 
 // Hysteresis helps avoid rapid toggling at boundary
@@ -130,8 +109,7 @@ const RECIPES = [
     key: { "#": "block:stone", "|": "item:stick" },
     result: { kind: "tool:pickaxe_stone", qty: 1 },
   },
-
-  // Expanded (if server also has them, client preview works)
+  // Expanded
   {
     id: "crafting_table",
     type: "shaped",
@@ -316,7 +294,7 @@ const opts = {
   chunkAddDistance: RENDER_PRESET_OUTSIDE.chunkAddDistance,
   chunkRemoveDistance: RENDER_PRESET_OUTSIDE.chunkRemoveDistance,
   stickyPointerLock: true,
-  dragCameraOutsidePointerLock: true, // Fixed Typo
+  dragCameraOutsidePointerLock: true,
   initialZoom: 0,
   zoomSpeed: 0.25,
 };
@@ -331,6 +309,7 @@ console.log("noa-engine booted:", noa.version);
 
 let viewMode = 0; // 0 = first, 1 = third
 let inventoryOpen = false;
+let chatOpen = false; // NEW
 
 // Multiplayer
 let colyRoom = null;
@@ -349,9 +328,9 @@ const LOCAL_INV = {
   equip: { head: "", chest: "", legs: "", feet: "", tool: "", offhand: "" },
 };
 
-// Crafting State (Virtual Mapping)
+// Crafting State
 const LOCAL_CRAFT = {
-  indices: new Array(9).fill(-1), // maps craft slot 0..8 -> inventory index 0..35
+  indices: new Array(9).fill(-1),
   result: null,
 };
 
@@ -374,17 +353,17 @@ const STATE = {
   moveAccum: 0,
 
   // ---- Spawn/patch safety ----
-  worldReady: false, // becomes true after first world patch is applied
+  worldReady: false,
   spawnSnapDone: false,
-  pendingTeleport: null, // {x,y,z} if received before worldReady
+  pendingTeleport: null,
   desiredSpawn: { x: 0, y: TOWN.groundY + 2, z: 0 },
-  freezeUntil: performance.now() + 8000, // safety: freeze for a few seconds on boot
+  freezeUntil: performance.now() + 8000,
   lastPosLogAt: 0,
   logPos: false, // toggle via F8
 };
 
 /* ============================================================
- * 4. UI: DEBUG CONSOLE (Robust)
+ * 4. UI: DEBUG CONSOLE
  * ============================================================
  */
 
@@ -440,7 +419,98 @@ const UI_CONSOLE = (() => {
 const uiLog = UI_CONSOLE.log;
 
 /* ============================================================
- * 5. UI: INVENTORY & CRAFTING (The Logic Core)
+ * 4.5 UI: CHAT (NEW)
+ * ============================================================
+ */
+
+function createChatUI() {
+  const wrap = document.createElement("div");
+  Object.assign(wrap.style, {
+    position: "fixed",
+    left: "14px",
+    bottom: "150px", // Above hotbar/console
+    width: "400px",
+    height: "200px",
+    display: "flex",
+    flexDirection: "column",
+    gap: "5px",
+    zIndex: "10060",
+    pointerEvents: "none", // click through when closed
+  });
+
+  // Log Area
+  const logArea = document.createElement("div");
+  Object.assign(logArea.style, {
+    flex: "1",
+    overflowY: "auto",
+    background: "rgba(0,0,0,0.4)",
+    borderRadius: "6px",
+    padding: "8px",
+    fontFamily: "monospace",
+    fontSize: "13px",
+    color: "white",
+    textShadow: "1px 1px 0 #000",
+    display: "flex",
+    flexDirection: "column",
+    justifyContent: "flex-end",
+    maskImage: "linear-gradient(to bottom, transparent, black 10%)",
+  });
+
+  // Input Area
+  const input = document.createElement("input");
+  Object.assign(input.style, {
+    width: "100%",
+    background: "rgba(0,0,0,0.7)",
+    border: "1px solid #555",
+    color: "white",
+    padding: "8px",
+    borderRadius: "4px",
+    outline: "none",
+    fontFamily: "monospace",
+    display: "none", // Hidden by default
+    pointerEvents: "auto",
+  });
+
+  wrap.appendChild(logArea);
+  wrap.appendChild(input);
+  document.body.appendChild(wrap);
+
+  function addMsg(text, color = "#eee") {
+    const el = document.createElement("div");
+    el.textContent = text;
+    el.style.color = color;
+    el.style.marginBottom = "2px";
+    logArea.appendChild(el);
+    logArea.scrollTop = logArea.scrollHeight;
+    
+    // Auto-fade older messages could be added here
+  }
+
+  return {
+    add: addMsg,
+    toggle: () => {
+      chatOpen = !chatOpen;
+      if (chatOpen) {
+        input.style.display = "block";
+        document.exitPointerLock();
+        input.focus();
+        wrap.style.pointerEvents = "auto";
+      } else {
+        input.style.display = "none";
+        input.value = "";
+        noa.container.canvas.requestPointerLock();
+        wrap.style.pointerEvents = "none";
+      }
+    },
+    isOpen: () => chatOpen,
+    input,
+  };
+}
+
+const chatUI = createChatUI();
+
+/* ============================================================
+ * 5. UI: INVENTORY & CRAFTING
  * ============================================================
  */
 
@@ -870,36 +940,6 @@ const hotbarUI = createHotbarUI();
 /* ============================================================
  * 7. WORLD GENERATION (BIOMES + ORES, MATCHES SERVER)
  * ============================================================
- *
- * Server WorldStore uses these IDs:
- * 0 air
- * 1 dirt
- * 2 grass
- * 3 stone
- * 4 bedrock
- * 5 log
- * 6 leaves
- * 7 planks
- * 8 sand
- * 9 snow
- * 10 clay
- * 11 gravel
- * 12 mud
- * 13 ice
- * 14 coal_ore
- * 15 copper_ore
- * 16 iron_ore
- * 17 silver_ore
- * 18 gold_ore
- * 19 ruby_ore
- * 20 sapphire_ore
- * 21 mythril_ore
- * 22 dragonstone
- * 23 crafting_table
- * 24 chest
- * 25 slab_plank
- * 26 stairs_plank
- * 27 door_wood
  */
 
 // Materials (RGB 0..1 arrays)
@@ -1003,21 +1043,11 @@ const PALETTE = {
   DRAGONSTONE: 22,
 };
 
-// Build ore tables once (same as server)
 const ORE_TABLES = buildDefaultOreTablesFromPalette(PALETTE);
 
-/**
- * getVoxelID - biome-aware base terrain, mirrors server WorldStore.getBaseVoxelID
- *
- * Notes:
- * - This returns the BASE world block id (no server edits).
- * - Server edits arrive via patches and overwrite blocks after generation.
- */
 function getVoxelID(x, y, z) {
-  // Bedrock floor
   if (y < -10) return ID.bedrock;
 
-  // Biome + height
   const sb = sampleBiome(x, z);
   const biome = sb.biome;
   const height = sb.height;
@@ -1027,18 +1057,15 @@ function getVoxelID(x, y, z) {
     const maxVegetationY = height + 8;
     if (y >= maxVegetationY) return 0;
 
-    // Trees
     if (shouldSpawnTree(x, z, biome)) {
       const spec = getTreeSpec(x, z, biome);
       const treeBaseY = height + 1;
       const trunkTopY = treeBaseY + spec.trunkHeight - 1;
 
-      // Trunk column
       if (y >= treeBaseY && y <= trunkTopY) {
         return ID.log;
       }
 
-      // Leaves (mirror server "vertical cap" behavior)
       const dy = y - trunkTopY;
       if (spec.type === "oak") {
         if (y >= trunkTopY - 1 && y <= trunkTopY + 2) {
@@ -1051,7 +1078,6 @@ function getVoxelID(x, y, z) {
       }
     }
 
-    // Cactus (placeholder using LOG unless you create a cactus block)
     if (shouldSpawnCactus(x, z, biome)) {
       const cactusBaseY = height + 1;
       const cactusH = getCactusHeight(x, z);
@@ -1059,27 +1085,20 @@ function getVoxelID(x, y, z) {
         return ID.log;
       }
     }
-
     return 0;
   }
 
-  // Ground and below: biome layering
   const depth = height - y;
-
-  // Use shared helper to pick terrain layer (returns numeric block id)
   const terrainNumericId = getTerrainLayerBlockId(PALETTE, biome, depth);
 
-  // If stone zone, allow ore replacement (shared helper)
   if (terrainNumericId === PALETTE.STONE) {
     const oreId = pickOreId(x, y, z, biome, height, ORE_TABLES);
     return oreId || ID.stone;
   }
 
-  // Since we registered blocks with exact IDs, we can just return the number.
   return terrainNumericId;
 }
 
-// Hook into noa chunk generation
 noa.world.on("worldDataNeeded", (id, data, x, y, z) => {
   for (let i = 0; i < data.shape[0]; i++) {
     for (let j = 0; j < data.shape[1]; j++) {
@@ -1156,7 +1175,6 @@ function createAvatar(scene) {
 }
 
 function updateRigAnim(dt) {
-  // Bobbing
   if (viewMode === 0 && MESH.weaponRoot) {
     const vel = noa.entities.getPhysicsBody(noa.playerEntity).velocity;
     const moving = Math.abs(vel[0]) > 0.1 || Math.abs(vel[2]) > 0.1;
@@ -1166,7 +1184,6 @@ function updateRigAnim(dt) {
     MESH.weaponRoot.position.x = Math.cos(STATE.bobPhase) * 0.02;
   }
 
-  // Swinging
   STATE.swingT += dt;
   if (STATE.swingT < STATE.swingDuration) {
     const prog = STATE.swingT / STATE.swingDuration;
@@ -1195,13 +1212,11 @@ function isInsideTown(x, z, alreadyInside) {
 }
 
 function applyRenderPreset(scene, preset) {
-  // Chunk distances: best-effort across noa versions
   try {
     if (noa?.world) {
       if ("chunkAddDistance" in noa.world) noa.world.chunkAddDistance = preset.chunkAddDistance;
       if ("chunkRemoveDistance" in noa.world) noa.world.chunkRemoveDistance = preset.chunkRemoveDistance;
 
-      // Some noa builds store these in private members:
       if (noa.world._chunkMgr) {
         if ("chunkAddDistance" in noa.world._chunkMgr) noa.world._chunkMgr.chunkAddDistance = preset.chunkAddDistance;
         if ("chunkRemoveDistance" in noa.world._chunkMgr) noa.world._chunkMgr.chunkRemoveDistance = preset.chunkRemoveDistance;
@@ -1213,7 +1228,6 @@ function applyRenderPreset(scene, preset) {
     }
   } catch (e) {}
 
-  // Camera view distance (Babylon)
   try {
     if (noa?.rendering?.getScene) {
       const sc = scene || noa.rendering.getScene();
@@ -1223,15 +1237,11 @@ function applyRenderPreset(scene, preset) {
     }
   } catch (e) {}
 
-  // Fog (Babylon) - optional
   try {
     if (!scene) return;
-
     if (preset.fog) {
       scene.fogMode = BABYLON.Scene.FOGMODE_EXP2;
       scene.fogDensity = preset.fogDensity || 0.01;
-
-      // Don’t hard-pick colors; use existing clearColor to blend
       if (scene.clearColor) {
         scene.fogColor = new BABYLON.Color3(scene.clearColor.r, scene.clearColor.g, scene.clearColor.b);
       }
@@ -1253,7 +1263,6 @@ function snapshotState(me) {
   LOCAL_STATS.stamina = me.stamina;
   LOCAL_HOTBAR.index = me.hotbarIndex;
 
-  // Pad inventory to 36 slots
   const rawSlots = (me.inventory?.slots || []).map(String);
   while (rawSlots.length < 36) rawSlots.push("");
   LOCAL_INV.slots = rawSlots;
@@ -1263,7 +1272,6 @@ function snapshotState(me) {
   LOCAL_INV.items = items;
   LOCAL_INV.equip = JSON.parse(JSON.stringify(me.equip || {}));
 
-  // Clean craft indices if item gone
   for (let i = 0; i < 9; i++) {
     const idx = LOCAL_CRAFT.indices[i];
     if (idx !== -1 && !LOCAL_INV.slots[idx]) LOCAL_CRAFT.indices[i] = -1;
@@ -1272,10 +1280,6 @@ function snapshotState(me) {
   if (inventoryUI.isOpen()) inventoryUI.refresh();
   hotbarUI.refresh();
 }
-
-/* ----------------------------
- * Spawn safety helpers (NEW)
- * ---------------------------- */
 
 function zeroPlayerVelocity() {
   try {
@@ -1301,7 +1305,6 @@ function forcePlayerPosition(x, y, z, reason = "") {
 }
 
 function tryLogTownCenterBlocks() {
-  // This depends on chunk availability; we try and log if accessible.
   try {
     const g = noa.getBlock(TOWN.cx, TOWN.groundY, TOWN.cz);
     const m = noa.getBlock(TOWN.cx, TOWN.groundY + 1, TOWN.cz);
@@ -1309,14 +1312,12 @@ function tryLogTownCenterBlocks() {
   } catch {}
 }
 
-// DYNAMIC ENDPOINT SWITCH (Vercel Frontend -> Colyseus Cloud Backend)
 const ENDPOINT = window.location.hostname.includes("localhost")
   ? "ws://localhost:2567"
   : "https://us-mia-ea26ba04.colyseus.cloud";
 
 const client = new Colyseus.Client(ENDPOINT);
 
-// Persistent ID
 function getDistinctId() {
   const key = "fresh2_player_id";
   let id = localStorage.getItem(key);
@@ -1336,16 +1337,15 @@ client
     colyRoom = room;
     uiLog("Connected to Server!");
 
-    // Register handlers to avoid sdk warnings
     room.onMessage("welcome", (msg) => {
       uiLog(`Welcome: ${msg?.roomId || ""} (${msg?.sessionId || ""})`);
+      chatUI.add("Welcome! Press [ENTER] to chat or use commands.", "#88ff88");
+      chatUI.add("Try: /find desert | /goto mountains | /biome", "#88ff88");
 
-      // Immediately request patch around town center too (helps ensure you see town)
       try {
         room.send("world:patch:req", { x: TOWN.cx, y: TOWN.groundY, z: TOWN.cz, r: 160, limit: 30000 });
       } catch {}
 
-      // Extra: also request patch around our *current* player position (best-effort)
       try {
         const p = noa.entities.getPosition(noa.playerEntity);
         room.send("world:patch:req", { x: p[0] | 0, y: p[1] | 0, z: p[2] | 0, r: 128, limit: 20000 });
@@ -1357,7 +1357,12 @@ client
       UI_CONSOLE.warn(`block:reject (${reason})`);
     });
 
-    // NEW: if server sends authoritative teleport/spawn
+    // Handle Chat Feedback
+    room.onMessage("chat:sys", (msg) => {
+      if (msg?.text) chatUI.add(msg.text, "#88ffff");
+    });
+
+    // Server-side Teleport
     room.onMessage("spawn:teleport", (msg) => {
       const x = Number(msg?.x);
       const y = Number(msg?.y);
@@ -1366,7 +1371,6 @@ client
 
       STATE.desiredSpawn = { x, y, z };
 
-      // If patch not ready yet, store it and freeze; otherwise snap immediately.
       if (!STATE.worldReady) {
         STATE.pendingTeleport = { x, y, z };
         UI_CONSOLE.log(`spawn:teleport received early -> pending (${x},${y},${z})`);
@@ -1375,17 +1379,14 @@ client
         STATE.spawnSnapDone = true;
       }
 
-      // HIDE LOADING SCREEN
       const loadingScreen = document.getElementById("loading-screen");
       if (loadingScreen) loadingScreen.style.display = "none";
     });
 
     room.onStateChange((state) => {
-      // 1) Sync Self
       const me = state.players.get(room.sessionId);
       if (me) snapshotState(me);
 
-      // 2) Sync Remotes
       state.players.forEach((p, sid) => {
         if (sid === room.sessionId) return;
         if (!remotePlayers[sid]) {
@@ -1405,31 +1406,25 @@ client
         noa.setBlock(e.id, e.x, e.y, e.z);
       }
 
-      // Mark world ready once we applied at least one patch.
       if (!STATE.worldReady) {
         STATE.worldReady = true;
         UI_CONSOLE.log(`worldReady=true (patch edits=${edits.length})`);
 
-        // If we were given a teleport before patch, apply now.
         if (STATE.pendingTeleport) {
           const t = STATE.pendingTeleport;
           STATE.pendingTeleport = null;
           forcePlayerPosition(t.x, t.y, t.z, "(pending teleport)");
           STATE.spawnSnapDone = true;
           
-          // HIDE LOADING SCREEN
           const loadingScreen = document.getElementById("loading-screen");
           if (loadingScreen) loadingScreen.style.display = "none";
 
         } else {
-          // Snap to default town spawn once patch exists to avoid falling under the town.
-          // (We only do this once; server still authoritatively tracks you.)
           const s = STATE.desiredSpawn || { x: 0, y: TOWN.groundY + 2, z: 0 };
           forcePlayerPosition(s.x, s.y, s.z, "(first patch snap)");
           STATE.spawnSnapDone = true;
         }
 
-        // Helpful logging: check town center blocks
         setTimeout(() => tryLogTownCenterBlocks(), 250);
         setTimeout(() => tryLogTownCenterBlocks(), 1200);
       }
@@ -1457,7 +1452,6 @@ client
  * ============================================================
  */
 
-// View Mode
 function setView(mode) {
   viewMode = mode;
   noa.camera.zoomDistance = mode === 1 ? 6 : 0;
@@ -1467,19 +1461,19 @@ function setView(mode) {
 
 // Mouse
 noa.inputs.down.on("fire", () => {
-  if (inventoryOpen) return;
+  if (inventoryOpen || chatOpen) return; // Block input if chat is open
   STATE.swingT = 0;
   if (colyRoom) colyRoom.send("swing");
 
   if (noa.targetedBlock) {
     const p = noa.targetedBlock.position;
     if (colyRoom) colyRoom.send("block:break", { x: p[0], y: p[1], z: p[2], src: "client_fire" });
-    noa.setBlock(0, p[0], p[1], p[2]); // Predict
+    noa.setBlock(0, p[0], p[1], p[2]);
   }
 });
 
 noa.inputs.down.on("alt-fire", () => {
-  if (inventoryOpen || !noa.targetedBlock) return;
+  if (inventoryOpen || chatOpen || !noa.targetedBlock) return;
   const p = noa.targetedBlock.adjacent;
   const idx = LOCAL_HOTBAR.index;
   const uid = LOCAL_INV.slots[idx];
@@ -1487,7 +1481,6 @@ noa.inputs.down.on("alt-fire", () => {
 
   if (it && it.kind.startsWith("block:")) {
     const kind = it.kind;
-
     const map = {
       "block:dirt": ID.dirt,
       "block:grass": ID.grass,
@@ -1496,25 +1489,21 @@ noa.inputs.down.on("alt-fire", () => {
       "block:log": ID.log,
       "block:leaves": ID.leaves,
       "block:plank": ID.planks,
-
       "block:sand": ID.sand,
       "block:snow": ID.snow,
       "block:clay": ID.clay,
       "block:gravel": ID.gravel,
       "block:mud": ID.mud,
       "block:ice": ID.ice,
-
       "block:coal_ore": ID.coal_ore,
       "block:copper_ore": ID.copper_ore,
       "block:iron_ore": ID.iron_ore,
       "block:silver_ore": ID.silver_ore,
       "block:gold_ore": ID.gold_ore,
-
       "block:ruby_ore": ID.ruby_ore,
       "block:sapphire_ore": ID.sapphire_ore,
       "block:mythril_ore": ID.mythril_ore,
       "block:dragonstone": ID.dragonstone,
-
       "block:crafting_table": ID.crafting_table,
       "block:chest": ID.chest,
       "block:slab_plank": ID.slab_plank,
@@ -1523,41 +1512,41 @@ noa.inputs.down.on("alt-fire", () => {
     };
 
     let id = map[kind] || 0;
-
-    if (!id) {
-      if (kind.includes("dirt")) id = ID.dirt;
-      if (kind.includes("grass")) id = ID.grass;
-      if (kind.includes("log")) id = ID.log;
-      if (kind.includes("leaves")) id = ID.leaves;
-      if (kind.includes("plank")) id = ID.planks;
-      if (kind.includes("stone")) id = ID.stone;
-      if (kind.includes("sand")) id = ID.sand;
-      if (kind.includes("snow")) id = ID.snow;
-      if (kind.includes("clay")) id = ID.clay;
-      if (kind.includes("gravel")) id = ID.gravel;
-      if (kind.includes("mud")) id = ID.mud;
-      if (kind.includes("ice")) id = ID.ice;
-      if (kind.includes("coal_ore")) id = ID.coal_ore;
-      if (kind.includes("copper_ore")) id = ID.copper_ore;
-      if (kind.includes("iron_ore")) id = ID.iron_ore;
-      if (kind.includes("silver_ore")) id = ID.silver_ore;
-      if (kind.includes("gold_ore")) id = ID.gold_ore;
-      if (kind.includes("ruby_ore")) id = ID.ruby_ore;
-      if (kind.includes("sapphire_ore")) id = ID.sapphire_ore;
-      if (kind.includes("mythril_ore")) id = ID.mythril_ore;
-      if (kind.includes("dragonstone")) id = ID.dragonstone;
+    if (id === 0) {
+        if (kind.includes("dirt")) id = ID.dirt;
+        else if (kind.includes("log")) id = ID.log;
+        else id = ID.dirt; // fallback
     }
 
     if (id !== 0) {
       if (colyRoom)
         colyRoom.send("block:place", { x: p[0], y: p[1], z: p[2], kind: it.kind, src: "client_alt_fire" });
-      noa.setBlock(id, p[0], p[1], p[2]); // Predict
+      noa.setBlock(id, p[0], p[1], p[2]);
     }
   }
 });
 
-// Keys
+// Key Listeners
 window.addEventListener("keydown", (e) => {
+  // Chat Toggle (Enter)
+  if (e.code === "Enter") {
+    e.preventDefault();
+    if (chatOpen) {
+      const text = chatUI.input.value.trim();
+      if (text && colyRoom) {
+        chatUI.add(`> ${text}`, "#ccc");
+        colyRoom.send("chat", { text }); // Send to server
+      }
+      chatUI.toggle();
+    } else {
+      chatUI.toggle();
+    }
+    return;
+  }
+
+  // If Chat is open, block all other keys (except Enter handled above)
+  if (chatOpen) return;
+
   if (e.code === "KeyI" || e.code === "Tab") {
     e.preventDefault();
     inventoryUI.toggle();
@@ -1579,7 +1568,6 @@ window.addEventListener("keydown", (e) => {
     }
   }
 
-  // Debug: request town patch
   if (e.code === "F6") {
     try {
       if (colyRoom) colyRoom.send("world:patch:req", { x: TOWN.cx, y: TOWN.groundY, z: TOWN.cz, r: 160, limit: 30000 });
@@ -1587,13 +1575,11 @@ window.addEventListener("keydown", (e) => {
     } catch {}
   }
 
-  // Debug: toggle position logging
   if (e.code === "F8") {
     STATE.logPos = !STATE.logPos;
     UI_CONSOLE.log(`pos logging: ${STATE.logPos ? "ON" : "OFF"} (F8)`);
   }
 
-  // Debug: force snap to town top
   if (e.code === "F9") {
     forcePlayerPosition(TOWN.cx + 0.5, TOWN.groundY + 3, TOWN.cz + 0.5, "(F9 manual snap)");
     if (colyRoom) {
@@ -1606,34 +1592,23 @@ window.addEventListener("keydown", (e) => {
 
 // --- RENDER LOOP ---
 noa.on("beforeRender", () => {
-  // 1) Ensure Scene Initialized
   if (!STATE.scene) {
     const scene = noa.rendering.getScene();
     if (scene) {
       STATE.scene = scene;
       initFpsRig(STATE.scene);
-
-      // Apply initial outside preset
       applyRenderPreset(STATE.scene, RENDER_PRESET_OUTSIDE);
     } else {
       return;
     }
   }
 
-  // 2) Robust Delta Time Calculation
   const now = performance.now();
   const dt = (now - STATE.lastTime) / 1000;
   STATE.lastTime = now;
 
-  if (dt > 0.1) return; // Skip giant lag spikes
+  if (dt > 0.1) return;
 
-  // 2.5) Spawn/fall prevention (NEW)
-  // Freeze player until:
-  // - first world patch applied (STATE.worldReady)
-  // - and we've performed at least one spawn snap
-  //
-  // We keep this gentle: we zero velocity and re-place them at desired spawn
-  // for a short boot window, so they can't fall below the stamped town.
   try {
     const tNow = performance.now();
     const shouldFreeze = !STATE.worldReady || !STATE.spawnSnapDone || tNow < STATE.freezeUntil;
@@ -1643,19 +1618,14 @@ noa.on("beforeRender", () => {
     }
   } catch {}
 
-  // 3) Update Animations
   updateRigAnim(dt);
 
-  // 4) Town Render Clamp Toggle (client-only)
   try {
     const p = noa.entities.getPosition(noa.playerEntity);
-    const px = p[0],
-      pz = p[2];
-
+    const px = p[0], pz = p[2];
     const inside = isInsideTown(px, pz, inTown);
     if (inside !== inTown) {
       const tNow = performance.now();
-      // debouncing
       if (tNow - lastTownToggleAt > 350) {
         inTown = inside;
         lastTownToggleAt = tNow;
@@ -1665,7 +1635,6 @@ noa.on("beforeRender", () => {
     }
   } catch {}
 
-  // 4.5) Optional position logging (NEW)
   if (STATE.logPos) {
     const tNow = performance.now();
     if (tNow - STATE.lastPosLogAt > 800) {
@@ -1677,7 +1646,6 @@ noa.on("beforeRender", () => {
     }
   }
 
-  // 5) Network Interpolation
   for (const sid in remotePlayers) {
     const rp = remotePlayers[sid];
     if (rp && rp.mesh) {
@@ -1689,12 +1657,10 @@ noa.on("beforeRender", () => {
     }
   }
 
-  // 6) Send Move (Throttle)
-  // IMPORTANT: don’t spam move while we are still freezing/spawn-snapping.
   STATE.moveAccum += dt;
   const stillFreezing = !STATE.worldReady || !STATE.spawnSnapDone || performance.now() < STATE.freezeUntil;
 
-  if (colyRoom && !inventoryOpen && !stillFreezing && STATE.moveAccum > 0.05) {
+  if (colyRoom && !inventoryOpen && !chatOpen && !stillFreezing && STATE.moveAccum > 0.05) {
     STATE.moveAccum = 0;
     try {
       const p = noa.entities.getPosition(noa.playerEntity);
@@ -1704,8 +1670,6 @@ noa.on("beforeRender", () => {
   }
 });
 
-// Initial spawn (client-side safety).
-// Server may override; we keep player near town so they don’t free-fall before patch.
 noa.entities.setPosition(noa.playerEntity, 0, TOWN.groundY + 2, 0);
 zeroPlayerVelocity();
 UI_CONSOLE.log(`Initial client spawn set to town top (0,${TOWN.groundY + 2},0)`);
