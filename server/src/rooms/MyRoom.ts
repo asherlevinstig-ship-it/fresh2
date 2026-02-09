@@ -13,6 +13,7 @@
 // - Crafting System (Legacy craft:commit)
 // - Anti-Cheat (Reach, Rate Limits, Area Protection)
 // - Stamina/Sprint/Health Systems
+// - NEW: Chat Command System (/find, /goto, /biome)
 // ============================================================
 
 import { Room, Client } from "colyseus";
@@ -38,7 +39,8 @@ import {
   getTerrainLayerBlockId,
   pickOreId,
   buildDefaultOreTablesFromPalette,
-  type OreTables
+  type OreTables,
+  type BiomeId
 } from "../world/Biomes.js";
 
 // ------------------------------------------------------------
@@ -55,6 +57,8 @@ type MoveMsg = {
   pitch?: number;
   viewMode?: number;
 };
+
+type ChatMsg = { text: string }; // NEW: Chat Command Support
 
 type SprintMsg = { on: boolean };
 type SwingMsg = { t?: number };
@@ -116,11 +120,9 @@ function writeJsonAtomic(filePath: string, data: any) {
   const tmp = `${filePath}.tmp.${process.pid}.${Math.floor(Math.random() * 1e9)}`;
   try {
     fs.writeFileSync(tmp, JSON.stringify(data, null, 2));
-    // Atomic rename
     try {
       fs.renameSync(tmp, filePath);
     } catch {
-      // Cross-device fallback
       fs.copyFileSync(tmp, filePath);
       fs.unlinkSync(tmp);
     }
@@ -136,8 +138,7 @@ function findSpawnYAt(world: WorldStore, x: number, z: number, preferredY: numbe
   const MIN_Y = -64;
   const MAX_Y = 256;
 
-  // Search downwards from somewhat high
-  const searchStart = clamp(preferredY + 40, MIN_Y, MAX_Y);
+  const searchStart = clamp(preferredY + 60, MIN_Y, MAX_Y);
   
   for (let y = searchStart; y >= MIN_Y; y--) {
     const id = world.getBlock(ix, y, iz);
@@ -155,6 +156,39 @@ function patchCount(patch: any): number | null {
   if (Array.isArray(p.blocks)) return p.blocks.length;
   if (Array.isArray(p.data)) return p.data.length;
   if (typeof p.count === "number") return p.count;
+  return null;
+}
+
+// ------------------------------------------------------------
+// Biome Seeker (The Beacon Logic)
+// ------------------------------------------------------------
+
+function findNearestBiome(startX: number, startZ: number, target: string): { x: number, z: number, biome: string } | null {
+  // Spiral search
+  // Step size 64 to cover ground fast
+  const step = 64;
+  const maxRadius = 5000; // Search up to 5k blocks away
+
+  // Check center first
+  const initial = sampleBiome(startX, startZ);
+  if (initial.biome === target) return { x: startX, z: startZ, biome: initial.biome };
+
+  for (let r = step; r <= maxRadius; r += step) {
+    // Check points in a circle/box at radius r
+    // 8 points is usually enough for broad search, but let's do 16
+    const points = 16;
+    for (let i = 0; i < points; i++) {
+      const angle = (Math.PI * 2 * i) / points;
+      const x = startX + Math.cos(angle) * r;
+      const z = startZ + Math.sin(angle) * r;
+      const sample = sampleBiome(x, z);
+      
+      // Fuzzy match target (e.g. "des" matches "desert")
+      if (sample.biome.includes(target.toLowerCase())) {
+        return { x, z, biome: sample.biome };
+      }
+    }
+  }
   return null;
 }
 
@@ -375,7 +409,6 @@ function kindToBlockId(kind: string): BlockId {
   if (kind === "block:leaves") return BLOCKS.LEAVES;
   if (kind === "block:plank") return BLOCKS.PLANKS;
 
-  // Biome blocks
   if (kind === "block:sand") return BLOCKS.SAND;
   if (kind === "block:snow") return BLOCKS.SNOW;
   if (kind === "block:clay") return BLOCKS.CLAY;
@@ -383,7 +416,6 @@ function kindToBlockId(kind: string): BlockId {
   if (kind === "block:mud") return BLOCKS.MUD;
   if (kind === "block:ice") return BLOCKS.ICE;
 
-  // Ores
   if (kind === "block:coal_ore") return BLOCKS.COAL_ORE;
   if (kind === "block:copper_ore") return BLOCKS.COPPER_ORE;
   if (kind === "block:iron_ore") return BLOCKS.IRON_ORE;
@@ -394,7 +426,6 @@ function kindToBlockId(kind: string): BlockId {
   if (kind === "block:mythril_ore") return BLOCKS.MYTHRIL_ORE;
   if (kind === "block:dragonstone") return BLOCKS.DRAGONSTONE;
 
-  // Buildables
   if (kind === "block:crafting_table") return BLOCKS.CRAFTING_TABLE;
   if (kind === "block:chest") return BLOCKS.CHEST;
   if (kind === "block:slab_plank") return BLOCKS.SLAB_PLANK;
@@ -454,28 +485,17 @@ function isValidBlockCoord(n: any) {
 // Procedural Generation Adapter
 // ------------------------------------------------------------
 
-// Initialize Ore Tables once from the Palette
 const ORE_TABLES: OreTables = buildDefaultOreTablesFromPalette(BLOCKS);
 
-/**
- * The callback function passed to WorldStore.
- * It ties the deterministic Biomes.ts logic to the WorldStore's queries.
- */
 function proceduralTerrainGenerator(x: number, y: number, z: number): number {
-  // 1. Get Biome & Surface Height at this (x,z)
   const { biome, height } = sampleBiome(x, z);
 
-  // 2. Air above surface
   if (y > height) return BLOCKS.AIR;
-
-  // 3. Bedrock at the absolute bottom
   if (y <= -63) return BLOCKS.BEDROCK;
 
-  // 4. Ores (Underground)
   const oreId = pickOreId(x, y, z, biome, height, ORE_TABLES);
   if (oreId !== 0) return oreId;
 
-  // 5. Terrain Layers (Grass, Dirt, Stone, Sand, etc.)
   const depth = height - y;
   return getTerrainLayerBlockId(BLOCKS, biome, depth);
 }
@@ -489,8 +509,6 @@ export class MyRoom extends Room {
 
   public maxClients = 16;
 
-  // Shared world per server process
-  // We attach the procedural generator here.
   private static WORLD = new WorldStore({ 
     minCoord: -100000, 
     maxCoord: 100000,
@@ -499,7 +517,6 @@ export class MyRoom extends Room {
 
   private static WORLD_BOOTSTRAPPED = false;
 
-  // Environment Toggles & Tuning
   private static FORCE_TOWN_STAMP = String(process.env.FORCE_TOWN_STAMP || "false").toLowerCase() === "true";
   private static FORCE_TOWN_SPAWN = String(process.env.FORCE_TOWN_SPAWN || "true").toLowerCase() === "true";
   private static ROOM_AUTO_DISPOSE = String(process.env.ROOM_AUTO_DISPOSE || "false").toLowerCase() === "true";
@@ -508,14 +525,11 @@ export class MyRoom extends Room {
   private static PATCH_REQ_DEFAULT_LIMIT = clamp(Math.floor(Number(process.env.PATCH_REQ_DEFAULT_LIMIT ?? 30000)), 1000, 2000000);
   private static PATCH_REQ_MAX_LIMIT = clamp(Math.floor(Number(process.env.PATCH_REQ_MAX_LIMIT ?? 200000)), 5000, 4000000);
   
-  // Delay before telling client to hide loading screen (allow patch to arrive)
   private static SPAWN_TELEPORT_DELAY_MS = clamp(Math.floor(Number(process.env.SPAWN_TELEPORT_DELAY_MS ?? 1200)), 0, 5000);
 
-  // Paths
   private worldPath = path.join(process.cwd(), "world_data.json");
   private playersPath = path.join(process.cwd(), "players.json");
 
-  // Anti-Cheat / Rate Limiting
   private lastBlockOpAt = new Map<string, number>();
 
   // Persistence Helpers
@@ -555,7 +569,6 @@ export class MyRoom extends Room {
     allData[distinctId] = saveData;
     try {
       writeJsonAtomic(this.playersPath, allData);
-      console.log(`[PERSIST] Saved data for ${distinctId}`);
     } catch (e) {
       console.error(`[PERSIST] Failed to save data for ${distinctId}:`, e);
     }
@@ -587,7 +600,6 @@ export class MyRoom extends Room {
     if (!MyRoom.WORLD_BOOTSTRAPPED) {
       MyRoom.WORLD_BOOTSTRAPPED = true;
 
-      // Load World
       if (fs.existsSync(this.worldPath)) {
         console.log(`[PERSIST] Loading world from ${this.worldPath}...`);
         try {
@@ -599,7 +611,6 @@ export class MyRoom extends Room {
         console.log(`[PERSIST] No save file found. Starting fresh.`);
       }
 
-      // Stamp Town (Artistic Version)
       try {
         const res = stampTownOfBeginnings(MyRoom.WORLD, {
           verbose: true,
@@ -608,7 +619,6 @@ export class MyRoom extends Room {
         console.log("[TOWN] Stamp result:", res);
       } catch (e) { console.error("[TOWN] Stamp failed:", e); }
 
-      // Config Autosave
       MyRoom.WORLD.configureAutosave({ path: this.worldPath, minIntervalMs: 30000 });
       console.log(`[CFG] INITIAL_PATCH_LIMIT=${MyRoom.INITIAL_PATCH_LIMIT} SPAWN_DELAY=${MyRoom.SPAWN_TELEPORT_DELAY_MS}`);
     }
@@ -651,6 +661,74 @@ export class MyRoom extends Room {
 
     // --- Message Handlers ---
 
+    // Chat Command System (/find, /tp, /biome)
+    this.onMessage("chat", (client: Client, msg: ChatMsg) => {
+      const p = this.state.players.get(client.sessionId);
+      if (!p || !msg?.text) return;
+
+      const text = msg.text.trim();
+      if (!text.startsWith("/")) return; // Only process commands
+
+      const parts = text.slice(1).split(" ");
+      const cmd = parts[0].toLowerCase();
+      const args = parts.slice(1);
+
+      // /tp x y z
+      if (cmd === "tp" && args.length === 3) {
+        const x = Number(args[0]);
+        const y = Number(args[1]);
+        const z = Number(args[2]);
+        if (isFinite(x) && isFinite(y) && isFinite(z)) {
+          p.x = x; p.y = y; p.z = z;
+          client.send("spawn:teleport", { x, y, z });
+          client.send("chat:sys", { text: `Teleported to ${x}, ${y}, ${z}` });
+          
+          // Force world refresh
+          const patch = MyRoom.WORLD.encodePatchAround({ x, y, z }, 48, { limit: MyRoom.INITIAL_PATCH_LIMIT });
+          client.send("world:patch", patch);
+        }
+        return;
+      }
+
+      // /biome (Current Biome info)
+      if (cmd === "biome") {
+        const info = sampleBiome(p.x, p.z);
+        client.send("chat:sys", { text: `Current Biome: [${info.biome.toUpperCase()}] Temp: ${info.temperature.toFixed(2)}` });
+        return;
+      }
+
+      // /find [biome] (Search)
+      if (cmd === "find" && args.length > 0) {
+        const target = args[0].toLowerCase();
+        const found = findNearestBiome(p.x, p.z, target);
+        if (found) {
+          const dist = Math.floor(dist3(p.x, 0, p.z, found.x, 0, found.z));
+          client.send("chat:sys", { text: `Found ${found.biome.toUpperCase()} at (${Math.floor(found.x)}, ${Math.floor(found.z)}) - ${dist} blocks away.` });
+        } else {
+          client.send("chat:sys", { text: `Could not find biome containing '${target}' nearby.` });
+        }
+        return;
+      }
+
+      // /goto [biome] (Teleport to Biome)
+      if (cmd === "goto" && args.length > 0) {
+        const target = args[0].toLowerCase();
+        const found = findNearestBiome(p.x, p.z, target);
+        if (found) {
+          const y = findSpawnYAt(MyRoom.WORLD, found.x, found.z, 20); // Search for ground
+          p.x = found.x; p.y = y; p.z = found.z;
+          client.send("spawn:teleport", { x: found.x, y, z: found.z });
+          client.send("chat:sys", { text: `Teleported to ${found.biome.toUpperCase()}!` });
+          
+          const patch = MyRoom.WORLD.encodePatchAround({ x: found.x, y, z: found.z }, 48, { limit: MyRoom.INITIAL_PATCH_LIMIT });
+          client.send("world:patch", patch);
+        } else {
+          client.send("chat:sys", { text: `Could not find '${target}' to teleport to.` });
+        }
+        return;
+      }
+    });
+
     this.onMessage("move", (client: Client, msg: MoveMsg) => {
       const p = this.state.players.get(client.sessionId);
       if (!p) return;
@@ -688,7 +766,7 @@ export class MyRoom extends Room {
       syncEquipToolToHotbar(p);
     });
 
-    // Inventory Ops
+    // Inventory
     this.onMessage("inv:consumeHotbar", (client: Client, msg: InvConsumeHotbarMsg) => {
       const p = this.state.players.get(client.sessionId);
       if (!p) return;
@@ -902,7 +980,6 @@ export class MyRoom extends Room {
       if (!withinWorld(x, y, z)) return;
       if (inTownSafeZone(x, y, z)) { reject(client, "safe_zone", { op: "break", src }); return; }
       
-      // Distance Check
       const d = dist3(p.x, p.y + 1.6, p.z, x + 0.5, y + 0.5, z + 0.5);
       if (d > BLOCK_REACH) return;
 
@@ -1018,13 +1095,15 @@ export class MyRoom extends Room {
       add("item:stick", 8, 4);
     }
 
-    // Town Spawn / Safe Zone Logic
+    // Force Spawn Logic
+    let isForceSpawn = false;
     if (MyRoom.FORCE_TOWN_SPAWN) {
+      isForceSpawn = true;
       const sx = TOWN_SAFE_ZONE.center.x;
-      const sz = TOWN_SAFE_ZONE.center.z + 8; // Offset to avoid spawning inside fountain
+      const sz = TOWN_SAFE_ZONE.center.z + 8; // Offset to avoid fountain
       const finalY = findSpawnYAt(MyRoom.WORLD, sx, sz, TOWN_GROUND_Y);
 
-      // Temp position high in air prevents clipping before teleport
+      // Temp position high in air
       p.x = sx; p.y = TOWN_GROUND_Y + 80; p.z = sz;
       p.yaw = 0; p.pitch = 0;
 
@@ -1035,12 +1114,12 @@ export class MyRoom extends Room {
 
       // Send smaller patch for fast load
       const patchCenter = { x: Math.floor(sx), y: TOWN_GROUND_Y, z: Math.floor(sz) };
-      const patchR = 48; // Smaller initial radius
+      const patchR = 48; // Reduce radius
       const patch = MyRoom.WORLD.encodePatchAround(patchCenter, patchR, { limit: MyRoom.INITIAL_PATCH_LIMIT });
       console.log(`[SPAWN] Initial Patch -> ${client.sessionId} r=${patchR} count=${patchCount(patch)}`);
       client.send("world:patch", patch);
 
-      // Delay Teleport Signal (Hide Loading Screen after assets load)
+      // Delay Teleport Signal (Hide Loading Screen)
       this.clock.setTimeout(() => {
         p.x = sx; p.y = finalY; p.z = sz;
         client.send("spawn:teleport", { x: sx, y: finalY, z: sz });
@@ -1049,17 +1128,16 @@ export class MyRoom extends Room {
       return;
     }
 
-    // Standard Persistence Join (Non-Town)
+    // Normal Persistence Join
     syncEquipToolToHotbar(p);
     this.state.players.set(client.sessionId, p);
     client.send("welcome", { roomId: this.roomId, sessionId: client.sessionId });
 
-    // Send Patch around player
     const patchCenter = { x: Math.floor(p.x), y: Math.floor(p.y), z: Math.floor(p.z) };
     const patch = MyRoom.WORLD.encodePatchAround(patchCenter, 48, { limit: MyRoom.INITIAL_PATCH_LIMIT });
     client.send("world:patch", patch);
     
-    // Immediate teleport signal
+    // Also send teleport signal immediately for consistent client handling
     client.send("spawn:teleport", { x: p.x, y: p.y, z: p.z });
   }
 
