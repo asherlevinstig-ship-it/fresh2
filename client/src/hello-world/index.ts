@@ -2,11 +2,10 @@
 /*
  * fresh2 - client main/index (PRODUCTION - FULL LOGIC)
  * -----------------------------------------------------------------------
- * REORDERED FOR SAFETY
- * - Fix: MESH/STATE ReferenceError (Defined at top of file)
- * - Fix: Invisible Town (CLIENT_EDITS logic included)
- * - Fix: Freezing (Updated freeze logic)
- * - Fix: Protocol (Flat array decoding)
+ * DIAGNOSTIC VERSION
+ * - Added: "PATCH recv" log to verify if server is actually sending blocks.
+ * - Fix: CLIENT_EDITS logic robust against chunk reload race conditions.
+ * - Fix: Freezing logic safe against network lag.
  */
 
 import { Engine } from "noa-engine";
@@ -29,8 +28,8 @@ import {
 const TOWN = {
   cx: 0,
   cz: 0,
-  radius: 48,
-  groundY: 6,
+  radius: 48, // Matches Server
+  groundY: 6, // Matches Server
 };
 
 const RENDER_PRESET_OUTSIDE = {
@@ -49,15 +48,16 @@ const RENDER_PRESET_TOWN = {
   fogDensity: 0.018,
 };
 
-// --- 2. GLOBAL STATE (DEFINED FIRST TO PREVENT REFERENCE ERRORS) ---
+// --- 2. GLOBAL STATE (DEFINED FIRST) ---
 
-// Client-Side Edits (Persists map patches)
+// Client-Side Edits (The Fix for Invisible Town)
 const CLIENT_EDITS = new Map(); 
 function getEditKey(x, y, z) {
+    // Use floor to match server logic exactly
     return `${Math.floor(x)},${Math.floor(y)},${Math.floor(z)}`;
 }
 
-// 3D Resources (The source of your error - now defined early)
+// 3D Resources
 const MESH = {
   weaponRoot: null,
   armR: null,
@@ -760,9 +760,11 @@ client
             count++;
          }
          
+         // --- DIAGNOSTIC LOG (CHECK CONSOLE FOR THIS) ---
+         // If count=0, server is sending nothing.
          if (!STATE.worldReady) {
             STATE.worldReady = true;
-            uiLog(`worldReady=true (loaded ${count} blocks)`);
+            uiLog(`PATCH recv: count=${count} dataLen=${arr.length}`);
          }
       } 
       // Legacy fallback
@@ -874,6 +876,12 @@ window.addEventListener("keydown", (e) => {
       uiLog("Requested town patch (F6)");
     } catch {}
   }
+  
+  // F7 = FORCE FULL REDOWNLOAD
+  if (e.code === "F7") {
+      uiLog("F7: Re-requesting full town patch...");
+      if (colyRoom) colyRoom.send("world:patch:req", { r: 64, limit: 100000 });
+  }
 
   if (e.code === "F8") {
     STATE.logPos = !STATE.logPos;
@@ -904,7 +912,7 @@ noa.on("beforeRender", () => {
     const scene = noa.rendering.getScene();
     if (scene) {
       STATE.scene = scene;
-      initFpsRig(STATE.scene); // Now safe because MESH is defined above
+      initFpsRig(STATE.scene); // Safe now
       applyRenderPreset(STATE.scene, RENDER_PRESET_OUTSIDE);
     } else return;
   }
