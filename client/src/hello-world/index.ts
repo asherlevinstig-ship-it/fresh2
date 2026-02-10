@@ -3,11 +3,10 @@
  * fresh2 - client main/index (PRODUCTION - FULL LOGIC)
  * -----------------------------------------------------------------------
  * INCLUDES:
- * - Fix: Protocol mismatch for world:patch (Handles flat arrays)
- * - Fix: Block ID sync (Crafting Table=30, Chest=31)
- * - Fix: Town Radius/Height constants matched to Server (48, 6)
- * - Fix: Rollback prediction on block:reject
- * - Feature: Durability support in UI
+ * - Fix: Freezing logic (Removed worldReady dependency from freeze loop)
+ * - Fix: World Patch Protocol (Handles flat data array correctly)
+ * - Fix: Town Constants (Radius 48, GroundY 6) to match server
+ * - Fix: Block IDs (Crafting Table 30, Chest 31)
  * - Feature: Mob Rendering, Inventory, Chat, 3D Rigs
  */
 
@@ -433,7 +432,6 @@ function createInventoryUI() {
       fontSize: "11px", fontWeight: "bold", pointerEvents: "none",
     });
 
-    // Fix: Future-proofing for tools (Durability Bar)
     const durabilityBar = document.createElement("div");
     Object.assign(durabilityBar.style, {
         position: "absolute", bottom: "2px", left: "2px", right: "2px",
@@ -1048,36 +1046,26 @@ client
         }
     };
 
-    // Fix: Protocol Mismatch Handler
+    // Fix: Protocol Mismatch Handler (Flat Array Support)
     room.onMessage("world:patch", (patch) => {
-      let count = 0;
-
-      // Case A: Standard 'edits' object array
-      if (patch.edits && Array.isArray(patch.edits)) {
-        for (const e of patch.edits) {
-           noa.setBlock(e.id, e.x, e.y, e.z);
-           count++;
-        }
-      } 
-      // Case B: Flat Data Array (Server sends [x, y, z, id, ...])
-      else if (patch.data && Array.isArray(patch.data)) {
-        // Assume stride of 4: x, y, z, id
-        const arr = patch.data;
-        for (let i = 0; i < arr.length; i += 4) {
-           // Ensure bounds check just in case
-           if (i + 3 < arr.length) {
-              noa.setBlock(arr[i+3], arr[i], arr[i+1], arr[i+2]);
-              count++;
-           }
-        }
-      }
-
-      if (!STATE.worldReady) {
-        STATE.worldReady = true;
-        uiLog(`worldReady=true (patch applied: ${count} blocks)`);
-        if (!STATE.spawnSnapDone) {
-            forcePlayerPosition(TOWN.cx, TOWN.groundY + 10, TOWN.cz, "worldReady");
-        }
+      const arr = patch?.data;
+      if (arr && Array.isArray(arr)) {
+         let count = 0;
+         for (let i = 0; i < arr.length; i += 4) {
+            noa.setBlock(arr[i+3] | 0, arr[i] | 0, arr[i+1] | 0, arr[i+2] | 0);
+            count++;
+         }
+         
+         if (!STATE.worldReady) {
+            STATE.worldReady = true;
+            uiLog(`worldReady=true (loaded ${count} blocks)`);
+         }
+      } else if (patch?.edits) {
+         // Fallback for old format if needed, but WorldStore sends flat data now
+         for (const e of patch.edits) {
+            noa.setBlock(e.id, e.x, e.y, e.z);
+         }
+         if (!STATE.worldReady) STATE.worldReady = true;
       }
     });
 
@@ -1225,10 +1213,14 @@ noa.on("beforeRender", () => {
 
   if (dt > 0.1) return;
 
-  const shouldFreeze = !STATE.worldReady || !STATE.spawnSnapDone || now < STATE.freezeUntil;
+  // FIX: Freezing Safety (Removed worldReady dependency from strict freeze loop)
+  // We allow movement if we have snapped once, or if freeze timer expired.
+  // We rely on world:patch handler to flip worldReady for visual/logic, but not to lock player forever.
+  const shouldFreeze = !STATE.spawnSnapDone || now < STATE.freezeUntil;
   if (shouldFreeze) {
       const s = STATE.desiredSpawn;
-      forcePlayerPosition(s.x, s.y, s.z, "");
+      // Slightly lift player to prevent clipping into floor
+      forcePlayerPosition(s.x, s.y + 0.5, s.z, "");
   }
 
   updateRigAnim(dt);

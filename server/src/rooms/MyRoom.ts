@@ -1,14 +1,13 @@
 // ============================================================
 // src/rooms/MyRoom.ts
 // ------------------------------------------------------------
-// FULL REWRITE - "PERSISTENCE & IDENTITY" EDITION
+// FULL REWRITE - "SAFE SPAWN" EDITION
 //
 // FIXES:
-// 1. Cursor Identity: Preserves durability/meta when moving items.
-// 2. Safe Load: Validates position (anti-void) & restores all fields (equip/meta).
-// 3. Performance: Removed per-tick equipment sync.
-// 4. Limits: Respects environment limits for patch requests.
-// 5. Stability: Clamps array lengths and normalizes inputs.
+// 1. Force Town Spawn: Overrides saved position if FORCE_TOWN_SPAWN is true.
+// 2. Anti-Void/Stuck: Always recomputes Y using findSpawnYAt (even on valid loads).
+// 3. Persistence: Restores inventory, cursor, and meta-data safely.
+// 4. Performance: Optimized hotbar syncing and patch limiting.
 // ============================================================
 
 import { Room, Client } from "colyseus";
@@ -129,7 +128,8 @@ function findSpawnYAt(world: WorldStore, x: number, z: number, preferredY: numbe
   const MAX_Y = 256;
 
   // Start searching a bit above the preferred Y to catch surface
-  const searchStart = clamp(Math.floor(preferredY) + 30, MIN_Y, MAX_Y);
+  // (e.g. if they saved while jumping or on a roof)
+  const searchStart = clamp(Math.floor(preferredY) + 10, MIN_Y, MAX_Y);
   
   for (let y = searchStart; y >= MIN_Y; y--) {
     const id = world.getBlock(ix, y, iz);
@@ -224,7 +224,6 @@ function normalizeHotbarIndex(i: any) {
   return clamp(Math.floor(n), 0, 8);
 }
 
-// Optimization: Only run this when inventory changes, not every tick
 function syncEquipToolToHotbar(p: PlayerState) {
   ensureSlotsLength(p);
   const idx = normalizeHotbarIndex(p.hotbarIndex);
@@ -241,7 +240,6 @@ function makeUid(sessionId: string, tag: string) {
   return `${sessionId}:${tag}:${nowMs()}:${Math.floor(Math.random() * 1e9)}`;
 }
 
-// Standard create (fresh item)
 function createItem(p: PlayerState, kind: string, qty: number) {
   const uid = makeUid(p.id, "created");
   const it = new ItemState();
@@ -264,15 +262,12 @@ function createItemFromCursor(p: PlayerState, cursor: any, qtyOverride?: number)
     it.kind = cursor.kind;
     it.qty = qtyOverride !== undefined ? qtyOverride : cursor.qty;
     
-    // Identity restoration
     it.durability = cursor.durability || 0;
     it.maxDurability = cursor.maxDurability || 0;
     if (cursor.meta) {
-        // simple shallow copy for meta
         try { it.meta = JSON.parse(JSON.stringify(cursor.meta)); } catch {}
     }
 
-    // Fallback if missing defaults
     if (it.kind.startsWith("tool:") && it.maxDurability === 0) {
         it.maxDurability = 100;
         if (it.durability === 0) it.durability = 100;
@@ -286,10 +281,6 @@ function createItemFromCursor(p: PlayerState, cursor: any, qtyOverride?: number)
 function setCursorFromItem(p: PlayerState, item: ItemState, qty: number) {
     p.cursor.kind = item.kind;
     p.cursor.qty = qty;
-    
-    // Copy Identity fields to cursor
-    // (We cast to 'any' because strict schema might not show these dynamic fields on cursor yet, 
-    // but JS allows it and we need it for persistence in memory)
     (p.cursor as any).durability = item.durability;
     (p.cursor as any).maxDurability = item.maxDurability;
     (p.cursor as any).meta = item.meta;
@@ -309,7 +300,6 @@ function consumeFromHotbar(p: PlayerState, qty: number) {
   const it = p.items.get(uid);
   if (!it) return 0;
   
-  // Only blocks are typically consumed from hotbar on place
   const kind = String(it.kind || "");
   if (!isBlockKind(kind)) return 0;
 
@@ -334,8 +324,6 @@ function addKindToInventory(p: PlayerState, kind: string, qty: number) {
   const maxStack = maxStackForKind(kind);
   let remaining = qty;
 
-  // 1. Stack into existing (only if stackable and matching meta/durability is default)
-  // Simple check: we only stack if durability is 0/undefined to avoid merging used tools
   for (let i = 0; i < p.inventory.slots.length; i++) {
     if (remaining <= 0) break;
     const uid = p.inventory.slots[i];
@@ -354,7 +342,6 @@ function addKindToInventory(p: PlayerState, kind: string, qty: number) {
     }
   }
 
-  // 2. Add to empty slots
   while (remaining > 0) {
     let emptyIdx = -1;
     for (let i = 0; i < p.inventory.slots.length; i++) {
@@ -363,7 +350,7 @@ function addKindToInventory(p: PlayerState, kind: string, qty: number) {
         break;
       }
     }
-    if (emptyIdx === -1) break; // Full
+    if (emptyIdx === -1) break;
 
     const add = Math.min(maxStack, remaining);
     const newUid = createItem(p, kind, add);
@@ -375,7 +362,6 @@ function addKindToInventory(p: PlayerState, kind: string, qty: number) {
   return qty - remaining;
 }
 
-// Update Crafting Result based on Grid
 function updateCraftingResult(p: PlayerState) {
   const kinds = p.craft.slots.map((uid) => {
     if (!uid) return "";
@@ -505,6 +491,7 @@ export class MyRoom extends Room {
 
   private static WORLD_BOOTSTRAPPED = false;
   private static FORCE_TOWN_STAMP = String(process.env.FORCE_TOWN_STAMP || "false").toLowerCase() === "true";
+  private static FORCE_TOWN_SPAWN = String(process.env.FORCE_TOWN_SPAWN || "true").toLowerCase() === "true";
   private static ROOM_AUTO_DISPOSE = String(process.env.ROOM_AUTO_DISPOSE || "false").toLowerCase() === "true";
 
   private static INITIAL_PATCH_LIMIT = clamp(Math.floor(Number(process.env.INITIAL_PATCH_LIMIT ?? 200000)), 10000, 2000000);
@@ -512,7 +499,6 @@ export class MyRoom extends Room {
   private static PATCH_REQ_MAX_LIMIT = clamp(Math.floor(Number(process.env.PATCH_REQ_MAX_LIMIT ?? 200000)), 5000, 4000000);
   private static SPAWN_TELEPORT_DELAY_MS = clamp(Math.floor(Number(process.env.SPAWN_TELEPORT_DELAY_MS ?? 1200)), 0, 5000);
 
-  // Mob Config
   private static MAX_MOBS = 10;
   private static MOB_SPAWN_RATE_MS = 5000;
   private lastMobSpawn = 0;
@@ -544,7 +530,6 @@ export class MyRoom extends Room {
 
     const craftSlots = Array.from(p.craft.slots);
     
-    // Save cursor logic (with extra fields)
     const cursor = { 
         kind: p.cursor.kind, 
         qty: p.cursor.qty,
@@ -680,7 +665,6 @@ export class MyRoom extends Room {
             // Fresh craft result: set cursor props
             p.cursor.kind = p.craft.resultKind;
             p.cursor.qty = p.craft.resultQty;
-            // Crafting usually produces fresh items, so 100% durability default
             if (p.cursor.kind.startsWith("tool:")) {
                 (p.cursor as any).durability = 100;
                 (p.cursor as any).maxDurability = 100;
@@ -724,10 +708,6 @@ export class MyRoom extends Room {
       if (!isRight) { // Left Click
         if (cursorHasItem && slotHasItem) {
           if (p.cursor.kind === slotItem.kind) {
-            // Stack (if compatible)
-            // Check meta/durability compatibility before stacking? 
-            // Simplified: only stack if slotItem is unused (maxDur=0 or dur=maxDur)
-            // If tools are used, we usually swap instead of stack.
             const isTool = slotItem.maxDurability > 0;
             const isUsed = isTool && slotItem.durability < slotItem.maxDurability;
 
@@ -744,12 +724,9 @@ export class MyRoom extends Room {
                   }
                 }
             } else {
-                // Swap if incompatible or full
-                // (For now, just swap logic implies swapping the *entire* struct)
-                // But simplified: just swap
+                // Swap if incompatible
                 const temp = { ...p.cursor };
                 setCursorFromItem(p, slotItem, slotItem.qty);
-                // Recreate slot item from temp
                 deleteItem(p, slotUid);
                 const newUid = createItemFromCursor(p, temp);
                 if (loc === "inv") p.inventory.slots[idx] = newUid;
@@ -757,19 +734,14 @@ export class MyRoom extends Room {
             }
           } else {
             // Swap
-            // 1. Hold cursor data temporarily
             const oldCursor = { 
                 kind: p.cursor.kind, qty: p.cursor.qty, 
                 durability: (p.cursor as any).durability, 
                 maxDurability: (p.cursor as any).maxDurability, 
                 meta: (p.cursor as any).meta 
             };
-
-            // 2. Move Slot -> Cursor
             setCursorFromItem(p, slotItem, slotItem.qty);
-
-            // 3. Move Old Cursor -> Slot
-            deleteItem(p, slotUid); // remove old slot item
+            deleteItem(p, slotUid); 
             const newUid = createItemFromCursor(p, oldCursor);
             if (loc === "inv") p.inventory.slots[idx] = newUid;
             else p.craft.slots[idx] = newUid;
@@ -791,7 +763,6 @@ export class MyRoom extends Room {
         }
       } else { // Right Click
         if (cursorHasItem && !slotHasItem) {
-          // Place One (Create new item with same stats as cursor, but qty 1)
           const newUid = createItemFromCursor(p, p.cursor, 1);
           if (loc === "inv") p.inventory.slots[idx] = newUid;
           else p.craft.slots[idx] = newUid;
@@ -802,7 +773,6 @@ export class MyRoom extends Room {
               (p.cursor as any).durability = 0;
           }
         } else if (cursorHasItem && slotHasItem) {
-          // Place One (Stack)
           if (p.cursor.kind === slotItem.kind) {
             const max = maxStackForKind(slotItem.kind);
             if (slotItem.qty < max) {
@@ -815,12 +785,8 @@ export class MyRoom extends Room {
             }
           }
         } else if (!cursorHasItem && slotHasItem) {
-          // Split Half
           const take = Math.ceil(slotItem.qty / 2);
-          
-          // Cursor gets half, inheriting stats
           setCursorFromItem(p, slotItem, take);
-          
           slotItem.qty -= take;
           if (slotItem.qty <= 0) {
             deleteItem(p, slotUid);
@@ -916,7 +882,6 @@ export class MyRoom extends Room {
     this.onMessage("world:patch:req", (client, msg: WorldPatchReqMsg) => {
       const p = this.state.players.get(client.sessionId);
       if (p) {
-        // Safe patch limits respecting Env and Client Request
         const defaultLimit = MyRoom.PATCH_REQ_DEFAULT_LIMIT;
         const maxLimit = MyRoom.PATCH_REQ_MAX_LIMIT;
         
@@ -939,8 +904,6 @@ export class MyRoom extends Room {
     const STAMINA_DRAIN = 18;
     const STAMINA_REGEN = 12;
 
-    // 1. Players
-    // Explicit 'any' to avoid type never issues
     this.state.players.forEach((p: any) => {
         if (p.sprinting) {
           p.stamina = clamp(p.stamina - STAMINA_DRAIN * dt, 0, 100);
@@ -948,26 +911,20 @@ export class MyRoom extends Room {
         } else {
           p.stamina = clamp(p.stamina + STAMINA_REGEN * dt, 0, 100);
         }
-        // Removed syncEquipToolToHotbar(p) from tick loop for performance
     });
 
-    // 2. Mobs (Spawn)
     if (this.state.mobs.size < MyRoom.MAX_MOBS && nowMs() - this.lastMobSpawn > MyRoom.MOB_SPAWN_RATE_MS) {
         this.spawnMob();
         this.lastMobSpawn = nowMs();
     }
 
-    // 3. Mobs (AI)
-    // Explicit 'any' to avoid type never issues
     this.state.mobs.forEach((mob: any, id: string) => {
-        // Gravity
         const idBelow = MyRoom.WORLD.getBlock(Math.floor(mob.x), Math.floor(mob.y - 0.1), Math.floor(mob.z));
         const isGrounded = (idBelow !== BLOCKS.AIR);
 
         if (!isGrounded) {
             mob.y -= 10 * dt; 
         } else {
-            // AI Logic
             let nearestDist = 999;
             let target: any = null;
             this.state.players.forEach((p: any) => {
@@ -979,7 +936,6 @@ export class MyRoom extends Room {
             });
 
             if (target) {
-                // Chase
                 const dx = target.x - mob.x;
                 const dz = target.z - mob.z;
                 const angle = Math.atan2(dx, dz);
@@ -989,21 +945,17 @@ export class MyRoom extends Room {
                 const mx = Math.sin(angle) * speed * dt;
                 const mz = Math.cos(angle) * speed * dt;
 
-                // Wall/Jump Check
                 const idAhead = MyRoom.WORLD.getBlock(Math.floor(mob.x + mx), Math.floor(mob.y + 0.5), Math.floor(mob.z + mz));
                 if (idAhead !== BLOCKS.AIR) {
-                    mob.y += 1.2; // Jump
+                    mob.y += 1.2;
                 } else {
                     mob.x += mx;
                     mob.z += mz;
                 }
             } else {
-                // Wander
                 if (Math.random() < 0.02) mob.yaw += (Math.random() - 0.5) * 2;
             }
         }
-
-        // Void kill
         if (mob.y < -50) this.state.mobs.delete(id);
     });
 
@@ -1085,12 +1037,11 @@ export class MyRoom extends Room {
     // SAFE LOAD LOGIC
     if (saved) {
       try {
-        // 1. Validate Position
         let lx = isFiniteNum(saved.x) ? saved.x : TOWN_SAFE_ZONE.center.x;
         let lz = isFiniteNum(saved.z) ? saved.z : TOWN_SAFE_ZONE.center.z;
         let ly = isFiniteNum(saved.y) ? saved.y : TOWN_GROUND_Y;
         
-        // Re-calculate Y to prevent embedding or void spawn
+        // FIX: Always recompute Y to prevent stuck logic, even on valid saves
         ly = findSpawnYAt(MyRoom.WORLD, lx, lz, ly);
         
         p.x = lx; p.y = ly; p.z = lz;
@@ -1098,7 +1049,6 @@ export class MyRoom extends Room {
         p.hp = saved.hp || 20; p.stamina = saved.stamina || 100;
         p.hotbarIndex = normalizeHotbarIndex(saved.hotbarIndex);
 
-        // 2. Load Items (with meta/durability)
         if (Array.isArray(saved.items)) {
           saved.items.forEach((si: any) => {
             const it = new ItemState();
@@ -1125,7 +1075,6 @@ export class MyRoom extends Room {
         if (saved.cursor) {
           p.cursor.kind = saved.cursor.kind;
           p.cursor.qty = saved.cursor.qty;
-          // Restore extended properties if present
           (p.cursor as any).durability = saved.cursor.durability;
           (p.cursor as any).maxDurability = saved.cursor.maxDurability;
           (p.cursor as any).meta = saved.cursor.meta;
@@ -1144,7 +1093,6 @@ export class MyRoom extends Room {
       } catch (e) {
         console.error("Failed to load save data (corrupt?). Starting fresh.", e);
         loadSuccess = false;
-        // Reset player object
         p = new PlayerState();
         p.id = client.sessionId;
         p.name = (options.name || "Player").slice(0, 16);
@@ -1165,6 +1113,13 @@ export class MyRoom extends Room {
       add("tool:pickaxe_wood", 1, 0);
       add("block:dirt", 16, 1);
       syncEquipToolToHotbar(p);
+    }
+
+    // FIX: Force Town Spawn Override (Developer Tool / Stuck Safety)
+    if (MyRoom.FORCE_TOWN_SPAWN) {
+        p.x = TOWN_SAFE_ZONE.center.x;
+        p.z = TOWN_SAFE_ZONE.center.z;
+        p.y = findSpawnYAt(MyRoom.WORLD, p.x, p.z, TOWN_GROUND_Y);
     }
 
     this.state.players.set(client.sessionId, p);
