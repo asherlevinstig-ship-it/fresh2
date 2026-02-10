@@ -2,12 +2,11 @@
 /*
  * fresh2 - client main/index (PRODUCTION - FULL LOGIC)
  * -----------------------------------------------------------------------
- * FINAL FIXES:
- * - Fix: Re-added missing 'applyRenderPreset', 'distXZ', 'isInsideTown' functions.
- * - Fix: MESH/STATE defined early to prevent TDZ errors.
- * - Fix: Invisible Town (CLIENT_EDITS + Protocol Patch).
- * - Fix: Freezing & Race Conditions.
- * - Fix: Ordered Handler Registration (Fixes "onMessage not registered").
+ * FINAL RELEASE CANDIDATE
+ * - Race Condition Fixed: Registers 'world:patch' listener BEFORE requesting data.
+ * - Invisible Town Fixed: Uses CLIENT_EDITS map to persist patches over terrain gen.
+ * - Reference Errors Fixed: All state/helpers defined at top of scope.
+ * - Protocol Fixed: Decodes flat integer arrays correctly.
  */
 
 import { Engine } from "noa-engine";
@@ -27,11 +26,12 @@ import {
 } from "../../world/Biomes";
 
 // --- 1. CONSTANTS ---
+// Synced with Server Logic
 const TOWN = {
   cx: 0,
   cz: 0,
-  radius: 48,
-  groundY: 6,
+  radius: 48, 
+  groundY: 6, 
 };
 
 const RENDER_PRESET_OUTSIDE = {
@@ -53,6 +53,7 @@ const RENDER_PRESET_TOWN = {
 const TOWN_HYSTERESIS = 3.0;
 
 // --- 1.5 RENDER HELPERS ---
+// Defined early to prevent ReferenceError in render loop
 
 function distXZ(ax, az, bx, bz) {
   const dx = ax - bx;
@@ -101,6 +102,7 @@ function applyRenderPreset(scene, preset) {
 
 // --- 2. GLOBAL STATE ---
 
+// Client-Side Edits (Persists server patches locally so terrain gen respects them)
 const CLIENT_EDITS = new Map(); 
 function getEditKey(x, y, z) {
     return `${Math.floor(x)},${Math.floor(y)},${Math.floor(z)}`;
@@ -121,12 +123,14 @@ const STATE = {
   swingDuration: 0.22,
   moveAccum: 0,
 
+  // Connectivity & Safety
   worldReady: false,
   spawnSnapDone: false,
   pendingTeleport: null,
   desiredSpawn: { x: 0, y: TOWN.groundY + 2, z: 0 },
   freezeUntil: performance.now() + 2000,
   
+  // Debug
   logPos: false,
   lastPosLogAt: 0,
 };
@@ -720,18 +724,18 @@ client
     mySessionId = room.sessionId;
     uiLog("Connected to Server!");
 
-    // CRITICAL FIX: REGISTER HANDLERS BEFORE JOIN LOGIC
+    // CRITICAL FIX: REGISTER HANDLERS BEFORE REQUESTING DATA
     
-    // 1. Register Patch Handler FIRST
+    // 1. Register Patch Handler
     room.onMessage("world:patch", (patch) => {
       const arr = patch?.data;
       if (arr && Array.isArray(arr)) {
          let count = 0;
          for (let i = 0; i < arr.length; i += 4) {
-            const x = arr[i];
-            const y = arr[i+1];
-            const z = arr[i+2];
-            const id = arr[i+3];
+            const x = arr[i] | 0;
+            const y = arr[i+1] | 0;
+            const z = arr[i+2] | 0;
+            const id = arr[i+3] | 0;
             
             CLIENT_EDITS.set(getEditKey(x, y, z), id);
             noa.setBlock(id, x, y, z);
@@ -752,15 +756,13 @@ client
       }
     });
 
-    // 2. Register Welcome Handler (Requests Patch)
+    // 2. Register Welcome
     room.onMessage("welcome", (msg) => {
       uiLog(`Welcome: ${msg?.roomId || ""} (${msg?.sessionId || ""})`);
       chatUI.add("Welcome! Press [ENTER] to chat or use commands.", "#88ff88");
-      
-      // Explicitly request patch now that handler is ready
-      room.send("world:patch:req", { r: 64 });
     });
 
+    // 3. Register Other Handlers
     room.onMessage("block:reject", (msg) => {
       UI_CONSOLE.warn(`block:reject (${msg?.reason || "reject"}) - Resyncing...`);
       room.send("world:patch:req", { r: 8 }); 
@@ -822,6 +824,9 @@ client
       CLIENT_EDITS.set(getEditKey(msg.x, msg.y, msg.z), msg.id);
       noa.setBlock(msg.id, msg.x, msg.y, msg.z);
     });
+
+    // 4. NOW Request Data (Safe because handlers are registered)
+    room.send("world:patch:req", { r: 64 });
 
   })
   .catch((e) => uiLog(`Connect Error: ${e}`, "red"));
@@ -953,7 +958,7 @@ noa.on("beforeRender", () => {
     const scene = noa.rendering.getScene();
     if (scene) {
       STATE.scene = scene;
-      initFpsRig(STATE.scene); // Safe now
+      initFpsRig(STATE.scene); 
       applyRenderPreset(STATE.scene, RENDER_PRESET_OUTSIDE);
     } else return;
   }
