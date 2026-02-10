@@ -3,10 +3,9 @@
  * fresh2 - client main/index (PRODUCTION - FULL LOGIC)
  * -----------------------------------------------------------------------
  * FINAL RELEASE CANDIDATE
- * - Race Condition Fixed: Registers 'world:patch' listener BEFORE requesting data.
- * - Invisible Town Fixed: Uses CLIENT_EDITS map to persist patches over terrain gen.
- * - Reference Errors Fixed: All state/helpers defined at top of scope.
- * - Protocol Fixed: Decodes flat integer arrays correctly.
+ * - Race Condition Fixed: Registers 'world:patch:resp' listener BEFORE requesting.
+ * - Invisible Town Fixed: Uses CLIENT_EDITS map to persist patches.
+ * - Protocol Fixed: Renamed to 'world:patch:resp' to avoid legacy conflicts.
  */
 
 import { Engine } from "noa-engine";
@@ -725,17 +724,18 @@ client
     uiLog("Connected to Server!");
 
     // CRITICAL FIX: REGISTER HANDLERS BEFORE REQUESTING DATA
+    // We register the patch listener immediately to catch any response.
     
-    // 1. Register Patch Handler
-    room.onMessage("world:patch", (patch) => {
+    // 1. Register Patch Handler (Renamed Protocol :resp)
+    room.onMessage("world:patch:resp", (patch) => {
       const arr = patch?.data;
       if (arr && Array.isArray(arr)) {
          let count = 0;
          for (let i = 0; i < arr.length; i += 4) {
-            const x = arr[i] | 0;
-            const y = arr[i+1] | 0;
-            const z = arr[i+2] | 0;
-            const id = arr[i+3] | 0;
+            const x = arr[i];
+            const y = arr[i+1];
+            const z = arr[i+2];
+            const id = arr[i+3];
             
             CLIENT_EDITS.set(getEditKey(x, y, z), id);
             noa.setBlock(id, x, y, z);
@@ -747,13 +747,6 @@ client
             uiLog(`PATCH recv: count=${count} dataLen=${arr.length}`);
          }
       } 
-      else if (patch?.edits) {
-         for (const e of patch.edits) {
-            CLIENT_EDITS.set(getEditKey(e.x, e.y, e.z), e.id);
-            noa.setBlock(e.id, e.x, e.y, e.z);
-         }
-         if (!STATE.worldReady) STATE.worldReady = true;
-      }
     });
 
     // 2. Register Welcome
@@ -826,7 +819,8 @@ client
     });
 
     // 4. NOW Request Data (Safe because handlers are registered)
-    room.send("world:patch:req", { r: 64 });
+    // We send request immediately. Server will reply with :resp
+    room.send("world:patch:req", { r: 64, limit: 40000 });
 
   })
   .catch((e) => uiLog(`Connect Error: ${e}`, "red"));
@@ -958,7 +952,7 @@ noa.on("beforeRender", () => {
     const scene = noa.rendering.getScene();
     if (scene) {
       STATE.scene = scene;
-      initFpsRig(STATE.scene); 
+      initFpsRig(STATE.scene); // Safe now
       applyRenderPreset(STATE.scene, RENDER_PRESET_OUTSIDE);
     } else return;
   }

@@ -1,12 +1,12 @@
 // ============================================================
 // src/rooms/MyRoom.ts
 // ------------------------------------------------------------
-// FULL REWRITE - "STRICT REQUEST-ONLY" EDITION
+// PROTOCOL UPGRADE EDITION
 //
-// CRITICAL CHANGES:
-// 1. BUILD TAG: Added log to confirm you are running this specific build.
-// 2. NO PUSH: "world:patch" is NEVER sent in onJoin.
-// 3. ONLY REQ: "world:patch" is ONLY sent when client asks for it.
+// CHANGES:
+// 1. RENAMED: Response message is now "world:patch:resp".
+//    (Old clients/servers cannot interfere with this new channel).
+// 2. CLEANUP: No automatic patch sending in onJoin.
 // ============================================================
 
 import { Room, Client } from "colyseus";
@@ -126,18 +126,14 @@ function findSpawnYAt(world: WorldStore, x: number, z: number, preferredY: numbe
   const MIN_Y = -64;
   const MAX_Y = 256;
 
-  // Start searching a bit above the preferred Y to catch surface
-  // (e.g. if they saved while jumping or on a roof)
   const searchStart = clamp(Math.floor(preferredY) + 10, MIN_Y, MAX_Y);
   
   for (let y = searchStart; y >= MIN_Y; y--) {
     const id = world.getBlock(ix, y, iz);
     if (id !== BLOCKS.AIR) {
-        // Found ground, return 2 blocks above
         return y + 2;
     }
   }
-  // Fallback if void
   return preferredY;
 }
 
@@ -183,11 +179,9 @@ function getTotalSlots(p: PlayerState) {
 
 function ensureSlotsLength(p: PlayerState) {
   const total = getTotalSlots(p);
-  // Inventory
   while (p.inventory.slots.length < total) p.inventory.slots.push("");
   while (p.inventory.slots.length > total) p.inventory.slots.pop();
   
-  // Crafting (Force 9)
   while (p.craft.slots.length < 9) p.craft.slots.push("");
   while (p.craft.slots.length > 9) p.craft.slots.pop();
 }
@@ -253,7 +247,6 @@ function createItem(p: PlayerState, kind: string, qty: number) {
   return uid;
 }
 
-// Restore item from cursor data (preserving durability/meta)
 function createItemFromCursor(p: PlayerState, cursor: any, qtyOverride?: number) {
     const uid = makeUid(p.id, "restored");
     const it = new ItemState();
@@ -276,7 +269,6 @@ function createItemFromCursor(p: PlayerState, cursor: any, qtyOverride?: number)
     return uid;
 }
 
-// Copy ItemState -> Cursor (preserving identity)
 function setCursorFromItem(p: PlayerState, item: ItemState, qty: number) {
     p.cursor.kind = item.kind;
     p.cursor.qty = qty;
@@ -330,7 +322,6 @@ function addKindToInventory(p: PlayerState, kind: string, qty: number) {
     const it = p.items.get(uid);
     if (!it || it.kind !== kind) continue;
     
-    // Don't stack used tools
     if (it.durability < it.maxDurability) continue;
 
     const space = maxStack - it.qty;
@@ -878,7 +869,7 @@ export class MyRoom extends Room {
        if (p && msg.kind) addKindToInventory(p, msg.kind, msg.qty || 1);
     });
 
-    // --- PATCH REQUEST HANDLER (THE ONLY PLACE WORLD:PATCH IS SENT) ---
+    // --- PATCH REQUEST HANDLER (PROTOCOL UPGRADE: RESPONDS WITH :RESP) ---
     this.onMessage("world:patch:req", (client, msg: WorldPatchReqMsg) => {
       const p = this.state.players.get(client.sessionId);
       if (p) {
@@ -893,7 +884,10 @@ export class MyRoom extends Room {
             msg.r || 48, 
             { limit: reqLimit }
         );
-        client.send("world:patch", patch);
+        
+        // PROTOCOL FIX: Send on 'world:patch:resp' channel so old clients don't crash
+        // and new clients listen specifically for this.
+        client.send("world:patch:resp", patch);
       }
     });
   }
@@ -1007,7 +1001,10 @@ export class MyRoom extends Room {
          const y = findSpawnYAt(MyRoom.WORLD, res.x, res.z, 20);
          p.x = res.x; p.y = y; p.z = res.z;
          client.send("spawn:teleport", { x: res.x, y, z: res.z });
-         client.send("world:patch", MyRoom.WORLD.encodePatchAround({ x: res.x, y, z: res.z }, 48));
+         
+         // Trigger patch for new location
+         const patch = MyRoom.WORLD.encodePatchAround({ x: res.x, y: y, z: res.z }, 48);
+         client.send("world:patch:resp", patch);
       }
     }
   }
@@ -1025,7 +1022,7 @@ export class MyRoom extends Room {
   public onJoin(client: Client, options: JoinOptions) {
     const distinctId = options.distinctId || client.sessionId;
     (client as any).auth = { distinctId };
-    console.log(`### CLOUD BUILD: PATCHPUSH REMOVED v2026-02-10 ### Player: ${distinctId}`);
+    console.log(`### BUILD v2026-02-10 (PROTOCOL FIX) ### Player: ${distinctId}`);
 
     let p = new PlayerState();
     p.id = client.sessionId;
@@ -1041,7 +1038,6 @@ export class MyRoom extends Room {
         let lz = isFiniteNum(saved.z) ? saved.z : TOWN_SAFE_ZONE.center.z;
         let ly = isFiniteNum(saved.y) ? saved.y : TOWN_GROUND_Y;
         
-        // FIX: Always recompute Y to prevent stuck logic, even on valid saves
         ly = findSpawnYAt(MyRoom.WORLD, lx, lz, ly);
         
         p.x = lx; p.y = ly; p.z = lz;
@@ -1115,26 +1111,22 @@ export class MyRoom extends Room {
       syncEquipToolToHotbar(p);
     }
 
-    // FIX: Force Town Spawn Override (Developer Tool / Stuck Safety)
+    // Force Town Spawn Override (Developer Tool / Stuck Safety)
     if (MyRoom.FORCE_TOWN_SPAWN) {
         p.x = TOWN_SAFE_ZONE.center.x;
         p.z = TOWN_SAFE_ZONE.center.z;
         p.y = findSpawnYAt(MyRoom.WORLD, p.x, p.z, TOWN_GROUND_Y);
     }
 
-    // --- NEW DIAGNOSTIC LOGGING ---
+    // --- LOGGING ---
     console.log(`[SPAWN DEBUG] Session: ${client.sessionId} (${distinctId})`);
     console.log(`[SPAWN DEBUG] Player Pos: x=${p.x.toFixed(2)}, y=${p.y.toFixed(2)}, z=${p.z.toFixed(2)}`);
     console.log(`[SPAWN DEBUG] Town Center: x=${TOWN_SAFE_ZONE.center.x}, y=${TOWN_GROUND_Y}, z=${TOWN_SAFE_ZONE.center.z}`);
-    const dist = Math.sqrt(Math.pow(p.x - TOWN_SAFE_ZONE.center.x, 2) + Math.pow(p.z - TOWN_SAFE_ZONE.center.z, 2));
-    console.log(`[SPAWN DEBUG] Distance from Town Center: ${dist.toFixed(2)} blocks`);
     
     this.state.players.set(client.sessionId, p);
+    
+    // NO PATCH PUSHED HERE. Client requests it.
     client.send("welcome", { sessionId: client.sessionId });
-    
-    // Initial Patch - REMOVED! Client will request it in 'welcome' handler to fix race condition.
-    // client.send("world:patch", patch); 
-    
     client.send("spawn:teleport", { x: p.x, y: p.y, z: p.z });
   }
 
