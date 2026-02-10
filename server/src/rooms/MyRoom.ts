@@ -1,12 +1,14 @@
 // ============================================================
 // src/rooms/MyRoom.ts
 // ------------------------------------------------------------
-// FULL REWRITE - "SAFE LOAD" EDITION
+// FULL REWRITE - "PERSISTENCE & IDENTITY" EDITION
 //
 // FIXES:
-// 1. "Stuck on Spawn": Automatically discards corrupt/old save data so you can join.
-// 2. "Inventory Rubbish": Resets inventory to a clean state so items stack correctly.
-// 3. "No Enemies": Ensures the game loop starts cleanly.
+// 1. Cursor Identity: Preserves durability/meta when moving items.
+// 2. Safe Load: Validates position (anti-void) & restores all fields (equip/meta).
+// 3. Performance: Removed per-tick equipment sync.
+// 4. Limits: Respects environment limits for patch requests.
+// 5. Stability: Clamps array lengths and normalizes inputs.
 // ============================================================
 
 import { Room, Client } from "colyseus";
@@ -126,15 +128,18 @@ function findSpawnYAt(world: WorldStore, x: number, z: number, preferredY: numbe
   const MIN_Y = -64;
   const MAX_Y = 256;
 
-  const searchStart = clamp(preferredY + 60, MIN_Y, MAX_Y);
+  // Start searching a bit above the preferred Y to catch surface
+  const searchStart = clamp(Math.floor(preferredY) + 30, MIN_Y, MAX_Y);
   
   for (let y = searchStart; y >= MIN_Y; y--) {
     const id = world.getBlock(ix, y, iz);
     if (id !== BLOCKS.AIR) {
+        // Found ground, return 2 blocks above
         return y + 2;
     }
   }
-  return preferredY + 2;
+  // Fallback if void
+  return preferredY;
 }
 
 // ------------------------------------------------------------
@@ -144,9 +149,10 @@ function findSpawnYAt(world: WorldStore, x: number, z: number, preferredY: numbe
 function findNearestBiome(startX: number, startZ: number, target: string): { x: number, z: number, biome: string } | null {
   const step = 64;
   const maxRadius = 5000;
+  const targetLower = target.toLowerCase();
 
   const initial = sampleBiome(startX, startZ);
-  if (initial.biome.includes(target)) return { x: startX, z: startZ, biome: initial.biome };
+  if (initial.biome.toLowerCase().includes(targetLower)) return { x: startX, z: startZ, biome: initial.biome };
 
   for (let r = step; r <= maxRadius; r += step) {
     const points = 16;
@@ -156,7 +162,7 @@ function findNearestBiome(startX: number, startZ: number, target: string): { x: 
       const z = startZ + Math.sin(angle) * r;
       const sample = sampleBiome(x, z);
       
-      if (sample.biome.includes(target.toLowerCase())) {
+      if (sample.biome.toLowerCase().includes(targetLower)) {
         return { x, z, biome: sample.biome };
       }
     }
@@ -178,11 +184,13 @@ function getTotalSlots(p: PlayerState) {
 
 function ensureSlotsLength(p: PlayerState) {
   const total = getTotalSlots(p);
+  // Inventory
   while (p.inventory.slots.length < total) p.inventory.slots.push("");
   while (p.inventory.slots.length > total) p.inventory.slots.pop();
   
-  // Ensure crafting slots exist
+  // Crafting (Force 9)
   while (p.craft.slots.length < 9) p.craft.slots.push("");
+  while (p.craft.slots.length > 9) p.craft.slots.pop();
 }
 
 function isEquipSlotCompatible(slotKey: EquipKey, itemKind: string) {
@@ -216,6 +224,7 @@ function normalizeHotbarIndex(i: any) {
   return clamp(Math.floor(n), 0, 8);
 }
 
+// Optimization: Only run this when inventory changes, not every tick
 function syncEquipToolToHotbar(p: PlayerState) {
   ensureSlotsLength(p);
   const idx = normalizeHotbarIndex(p.hotbarIndex);
@@ -232,6 +241,7 @@ function makeUid(sessionId: string, tag: string) {
   return `${sessionId}:${tag}:${nowMs()}:${Math.floor(Math.random() * 1e9)}`;
 }
 
+// Standard create (fresh item)
 function createItem(p: PlayerState, kind: string, qty: number) {
   const uid = makeUid(p.id, "created");
   const it = new ItemState();
@@ -244,6 +254,45 @@ function createItem(p: PlayerState, kind: string, qty: number) {
   }
   p.items.set(uid, it);
   return uid;
+}
+
+// Restore item from cursor data (preserving durability/meta)
+function createItemFromCursor(p: PlayerState, cursor: any, qtyOverride?: number) {
+    const uid = makeUid(p.id, "restored");
+    const it = new ItemState();
+    it.uid = uid;
+    it.kind = cursor.kind;
+    it.qty = qtyOverride !== undefined ? qtyOverride : cursor.qty;
+    
+    // Identity restoration
+    it.durability = cursor.durability || 0;
+    it.maxDurability = cursor.maxDurability || 0;
+    if (cursor.meta) {
+        // simple shallow copy for meta
+        try { it.meta = JSON.parse(JSON.stringify(cursor.meta)); } catch {}
+    }
+
+    // Fallback if missing defaults
+    if (it.kind.startsWith("tool:") && it.maxDurability === 0) {
+        it.maxDurability = 100;
+        if (it.durability === 0) it.durability = 100;
+    }
+
+    p.items.set(uid, it);
+    return uid;
+}
+
+// Copy ItemState -> Cursor (preserving identity)
+function setCursorFromItem(p: PlayerState, item: ItemState, qty: number) {
+    p.cursor.kind = item.kind;
+    p.cursor.qty = qty;
+    
+    // Copy Identity fields to cursor
+    // (We cast to 'any' because strict schema might not show these dynamic fields on cursor yet, 
+    // but JS allows it and we need it for persistence in memory)
+    (p.cursor as any).durability = item.durability;
+    (p.cursor as any).maxDurability = item.maxDurability;
+    (p.cursor as any).meta = item.meta;
 }
 
 function deleteItem(p: PlayerState, uid: string) {
@@ -259,6 +308,8 @@ function consumeFromHotbar(p: PlayerState, qty: number) {
   if (!uid) return 0;
   const it = p.items.get(uid);
   if (!it) return 0;
+  
+  // Only blocks are typically consumed from hotbar on place
   const kind = String(it.kind || "");
   if (!isBlockKind(kind)) return 0;
 
@@ -272,6 +323,7 @@ function consumeFromHotbar(p: PlayerState, qty: number) {
     p.inventory.slots[idx] = "";
     p.items.delete(uid);
   }
+  syncEquipToolToHotbar(p);
   return take;
 }
 
@@ -282,7 +334,8 @@ function addKindToInventory(p: PlayerState, kind: string, qty: number) {
   const maxStack = maxStackForKind(kind);
   let remaining = qty;
 
-  // 1. Stack into existing
+  // 1. Stack into existing (only if stackable and matching meta/durability is default)
+  // Simple check: we only stack if durability is 0/undefined to avoid merging used tools
   for (let i = 0; i < p.inventory.slots.length; i++) {
     if (remaining <= 0) break;
     const uid = p.inventory.slots[i];
@@ -290,6 +343,9 @@ function addKindToInventory(p: PlayerState, kind: string, qty: number) {
     const it = p.items.get(uid);
     if (!it || it.kind !== kind) continue;
     
+    // Don't stack used tools
+    if (it.durability < it.maxDurability) continue;
+
     const space = maxStack - it.qty;
     if (space > 0) {
       const add = Math.min(space, remaining);
@@ -315,6 +371,7 @@ function addKindToInventory(p: PlayerState, kind: string, qty: number) {
     remaining -= add;
   }
   
+  syncEquipToolToHotbar(p);
   return qty - remaining;
 }
 
@@ -413,17 +470,6 @@ function blockIdToKind(id: BlockId): string {
   return "";
 }
 
-function sanitizeInt(n: any, fallback = 0) {
-  const v = Number(n);
-  if (!Number.isFinite(v)) return fallback;
-  return v | 0;
-}
-
-function isValidBlockCoord(n: any) {
-  const v = Number(n);
-  return Number.isFinite(v) && Math.floor(v) === v;
-}
-
 // ------------------------------------------------------------
 // Procedural Generation Adapter
 // ------------------------------------------------------------
@@ -459,7 +505,6 @@ export class MyRoom extends Room {
 
   private static WORLD_BOOTSTRAPPED = false;
   private static FORCE_TOWN_STAMP = String(process.env.FORCE_TOWN_STAMP || "false").toLowerCase() === "true";
-  private static FORCE_TOWN_SPAWN = String(process.env.FORCE_TOWN_SPAWN || "true").toLowerCase() === "true";
   private static ROOM_AUTO_DISPOSE = String(process.env.ROOM_AUTO_DISPOSE || "false").toLowerCase() === "true";
 
   private static INITIAL_PATCH_LIMIT = clamp(Math.floor(Number(process.env.INITIAL_PATCH_LIMIT ?? 200000)), 10000, 2000000);
@@ -498,7 +543,15 @@ export class MyRoom extends Room {
     });
 
     const craftSlots = Array.from(p.craft.slots);
-    const cursor = { kind: p.cursor.kind, qty: p.cursor.qty };
+    
+    // Save cursor logic (with extra fields)
+    const cursor = { 
+        kind: p.cursor.kind, 
+        qty: p.cursor.qty,
+        durability: (p.cursor as any).durability,
+        maxDurability: (p.cursor as any).maxDurability,
+        meta: (p.cursor as any).meta
+    };
 
     const saveData = {
       x: p.x, y: p.y, z: p.z,
@@ -602,7 +655,7 @@ export class MyRoom extends Room {
       }
     });
 
-    // --- NEW INVENTORY SYSTEM (Cursor) ---
+    // --- CURSOR & INVENTORY LOGIC (PRESERVING META) ---
     
     this.onMessage("inv:click", (client, msg: InvClickMsg) => {
       const p = this.state.players.get(client.sessionId);
@@ -624,10 +677,19 @@ export class MyRoom extends Room {
 
         // Add to cursor
         if (!p.cursor.kind) {
-          p.cursor.kind = p.craft.resultKind;
-          p.cursor.qty = p.craft.resultQty;
+            // Fresh craft result: set cursor props
+            p.cursor.kind = p.craft.resultKind;
+            p.cursor.qty = p.craft.resultQty;
+            // Crafting usually produces fresh items, so 100% durability default
+            if (p.cursor.kind.startsWith("tool:")) {
+                (p.cursor as any).durability = 100;
+                (p.cursor as any).maxDurability = 100;
+            } else {
+                (p.cursor as any).durability = 0;
+            }
         } else {
-          p.cursor.qty += p.craft.resultQty;
+            // Stack logic
+            p.cursor.qty += p.craft.resultQty;
         }
 
         // Consume ingredients
@@ -662,46 +724,83 @@ export class MyRoom extends Room {
       if (!isRight) { // Left Click
         if (cursorHasItem && slotHasItem) {
           if (p.cursor.kind === slotItem.kind) {
-            // Stack
-            const max = maxStackForKind(slotItem.kind);
-            const space = max - slotItem.qty;
-            if (space > 0) {
-              const move = Math.min(space, p.cursor.qty);
-              slotItem.qty += move;
-              p.cursor.qty -= move;
-              if (p.cursor.qty <= 0) { p.cursor.kind = ""; p.cursor.qty = 0; }
+            // Stack (if compatible)
+            // Check meta/durability compatibility before stacking? 
+            // Simplified: only stack if slotItem is unused (maxDur=0 or dur=maxDur)
+            // If tools are used, we usually swap instead of stack.
+            const isTool = slotItem.maxDurability > 0;
+            const isUsed = isTool && slotItem.durability < slotItem.maxDurability;
+
+            if (!isUsed) {
+                const max = maxStackForKind(slotItem.kind);
+                const space = max - slotItem.qty;
+                if (space > 0) {
+                  const move = Math.min(space, p.cursor.qty);
+                  slotItem.qty += move;
+                  p.cursor.qty -= move;
+                  if (p.cursor.qty <= 0) { 
+                      p.cursor.kind = ""; p.cursor.qty = 0; 
+                      (p.cursor as any).durability = 0; 
+                  }
+                }
+            } else {
+                // Swap if incompatible or full
+                // (For now, just swap logic implies swapping the *entire* struct)
+                // But simplified: just swap
+                const temp = { ...p.cursor };
+                setCursorFromItem(p, slotItem, slotItem.qty);
+                // Recreate slot item from temp
+                deleteItem(p, slotUid);
+                const newUid = createItemFromCursor(p, temp);
+                if (loc === "inv") p.inventory.slots[idx] = newUid;
+                else p.craft.slots[idx] = newUid;
             }
           } else {
             // Swap
-            const newUid = createItem(p, p.cursor.kind, p.cursor.qty);
-            p.cursor.kind = slotItem.kind;
-            p.cursor.qty = slotItem.qty;
-            deleteItem(p, slotUid);
+            // 1. Hold cursor data temporarily
+            const oldCursor = { 
+                kind: p.cursor.kind, qty: p.cursor.qty, 
+                durability: (p.cursor as any).durability, 
+                maxDurability: (p.cursor as any).maxDurability, 
+                meta: (p.cursor as any).meta 
+            };
+
+            // 2. Move Slot -> Cursor
+            setCursorFromItem(p, slotItem, slotItem.qty);
+
+            // 3. Move Old Cursor -> Slot
+            deleteItem(p, slotUid); // remove old slot item
+            const newUid = createItemFromCursor(p, oldCursor);
             if (loc === "inv") p.inventory.slots[idx] = newUid;
             else p.craft.slots[idx] = newUid;
           }
         } else if (cursorHasItem && !slotHasItem) {
-          // Place
-          const newUid = createItem(p, p.cursor.kind, p.cursor.qty);
+          // Place into empty
+          const newUid = createItemFromCursor(p, p.cursor);
           if (loc === "inv") p.inventory.slots[idx] = newUid;
           else p.craft.slots[idx] = newUid;
+          
           p.cursor.kind = ""; p.cursor.qty = 0;
+          (p.cursor as any).durability = 0;
         } else if (!cursorHasItem && slotHasItem) {
           // Pickup
-          p.cursor.kind = slotItem.kind;
-          p.cursor.qty = slotItem.qty;
+          setCursorFromItem(p, slotItem, slotItem.qty);
           deleteItem(p, slotUid);
           if (loc === "inv") p.inventory.slots[idx] = "";
           else p.craft.slots[idx] = "";
         }
       } else { // Right Click
         if (cursorHasItem && !slotHasItem) {
-          // Place One
-          const newUid = createItem(p, p.cursor.kind, 1);
+          // Place One (Create new item with same stats as cursor, but qty 1)
+          const newUid = createItemFromCursor(p, p.cursor, 1);
           if (loc === "inv") p.inventory.slots[idx] = newUid;
           else p.craft.slots[idx] = newUid;
+          
           p.cursor.qty--;
-          if (p.cursor.qty <= 0) { p.cursor.kind = ""; p.cursor.qty = 0; }
+          if (p.cursor.qty <= 0) { 
+              p.cursor.kind = ""; p.cursor.qty = 0; 
+              (p.cursor as any).durability = 0;
+          }
         } else if (cursorHasItem && slotHasItem) {
           // Place One (Stack)
           if (p.cursor.kind === slotItem.kind) {
@@ -709,14 +808,19 @@ export class MyRoom extends Room {
             if (slotItem.qty < max) {
               slotItem.qty++;
               p.cursor.qty--;
-              if (p.cursor.qty <= 0) { p.cursor.kind = ""; p.cursor.qty = 0; }
+              if (p.cursor.qty <= 0) { 
+                  p.cursor.kind = ""; p.cursor.qty = 0; 
+                  (p.cursor as any).durability = 0;
+              }
             }
           }
         } else if (!cursorHasItem && slotHasItem) {
           // Split Half
           const take = Math.ceil(slotItem.qty / 2);
-          p.cursor.kind = slotItem.kind;
-          p.cursor.qty = take;
+          
+          // Cursor gets half, inheriting stats
+          setCursorFromItem(p, slotItem, take);
+          
           slotItem.qty -= take;
           if (slotItem.qty <= 0) {
             deleteItem(p, slotUid);
@@ -762,7 +866,6 @@ export class MyRoom extends Room {
       const kind = blockIdToKind(oldId);
       if (kind) {
           addKindToInventory(p, kind, 1);
-          syncEquipToolToHotbar(p); // Ensure client UI updates immediately
       }
       
       this.broadcast("block:update", { x, y, z, id: BLOCKS.AIR });
@@ -793,6 +896,7 @@ export class MyRoom extends Room {
         deleteItem(p, uid);
         p.inventory.slots[idx] = "";
       }
+      syncEquipToolToHotbar(p);
 
       const id = kindToBlockId(kind);
       MyRoom.WORLD.setBlock(x, y, z, id);
@@ -812,7 +916,18 @@ export class MyRoom extends Room {
     this.onMessage("world:patch:req", (client, msg: WorldPatchReqMsg) => {
       const p = this.state.players.get(client.sessionId);
       if (p) {
-        const patch = MyRoom.WORLD.encodePatchAround({ x: p.x, y: p.y, z: p.z }, msg.r || 48, { limit: 20000 });
+        // Safe patch limits respecting Env and Client Request
+        const defaultLimit = MyRoom.PATCH_REQ_DEFAULT_LIMIT;
+        const maxLimit = MyRoom.PATCH_REQ_MAX_LIMIT;
+        
+        let reqLimit = msg.limit ?? defaultLimit;
+        reqLimit = clamp(reqLimit, 1000, maxLimit);
+
+        const patch = MyRoom.WORLD.encodePatchAround(
+            { x: p.x, y: p.y, z: p.z }, 
+            msg.r || 48, 
+            { limit: reqLimit }
+        );
         client.send("world:patch", patch);
       }
     });
@@ -827,14 +942,13 @@ export class MyRoom extends Room {
     // 1. Players
     // Explicit 'any' to avoid type never issues
     this.state.players.forEach((p: any) => {
-        ensureSlotsLength(p);
         if (p.sprinting) {
           p.stamina = clamp(p.stamina - STAMINA_DRAIN * dt, 0, 100);
           if (p.stamina <= 0.01) p.sprinting = false;
         } else {
           p.stamina = clamp(p.stamina + STAMINA_REGEN * dt, 0, 100);
         }
-        syncEquipToolToHotbar(p);
+        // Removed syncEquipToolToHotbar(p) from tick loop for performance
     });
 
     // 2. Mobs (Spawn)
@@ -926,7 +1040,7 @@ export class MyRoom extends Room {
       const b = sampleBiome(p.x, p.z);
       client.send("chat:sys", { text: `Biome: ${b.biome}` });
     } else if (cmd === "find" && parts[1]) {
-      const t = parts[1].toLowerCase();
+      const t = parts[1];
       const res = findNearestBiome(p.x, p.z, t);
       if (res) {
          const d = Math.floor(dist3(p.x, 0, p.z, res.x, 0, res.z));
@@ -935,7 +1049,7 @@ export class MyRoom extends Room {
          client.send("chat:sys", { text: "Not found nearby." });
       }
     } else if (cmd === "goto" && parts[1]) {
-      const t = parts[1].toLowerCase();
+      const t = parts[1];
       const res = findNearestBiome(p.x, p.z, t);
       if (res) {
          const y = findSpawnYAt(MyRoom.WORLD, res.x, res.z, 20);
@@ -968,18 +1082,30 @@ export class MyRoom extends Room {
     let loadSuccess = false;
     const saved = this.loadPlayerData(distinctId);
     
-    // SAFE LOAD LOGIC: If loading fails, fall back to new spawn
+    // SAFE LOAD LOGIC
     if (saved) {
       try {
-        p.x = saved.x; p.y = saved.y; p.z = saved.z;
-        p.yaw = saved.yaw; p.pitch = saved.pitch;
-        p.hp = saved.hp; p.stamina = saved.stamina;
-        p.hotbarIndex = saved.hotbarIndex;
+        // 1. Validate Position
+        let lx = isFiniteNum(saved.x) ? saved.x : TOWN_SAFE_ZONE.center.x;
+        let lz = isFiniteNum(saved.z) ? saved.z : TOWN_SAFE_ZONE.center.z;
+        let ly = isFiniteNum(saved.y) ? saved.y : TOWN_GROUND_Y;
+        
+        // Re-calculate Y to prevent embedding or void spawn
+        ly = findSpawnYAt(MyRoom.WORLD, lx, lz, ly);
+        
+        p.x = lx; p.y = ly; p.z = lz;
+        p.yaw = saved.yaw || 0; p.pitch = saved.pitch || 0;
+        p.hp = saved.hp || 20; p.stamina = saved.stamina || 100;
+        p.hotbarIndex = normalizeHotbarIndex(saved.hotbarIndex);
 
+        // 2. Load Items (with meta/durability)
         if (Array.isArray(saved.items)) {
           saved.items.forEach((si: any) => {
             const it = new ItemState();
-            it.uid = si.uid; it.kind = si.kind; it.qty = si.qty; it.durability = si.durability;
+            it.uid = si.uid; it.kind = si.kind; it.qty = si.qty; 
+            it.durability = si.durability || 0;
+            it.maxDurability = si.maxDurability || 0;
+            it.meta = si.meta || null;
             p.items.set(it.uid, it);
           });
         }
@@ -999,6 +1125,18 @@ export class MyRoom extends Room {
         if (saved.cursor) {
           p.cursor.kind = saved.cursor.kind;
           p.cursor.qty = saved.cursor.qty;
+          // Restore extended properties if present
+          (p.cursor as any).durability = saved.cursor.durability;
+          (p.cursor as any).maxDurability = saved.cursor.maxDurability;
+          (p.cursor as any).meta = saved.cursor.meta;
+        }
+
+        if (saved.equip) {
+            if (saved.equip.tool) p.equip.tool = saved.equip.tool;
+            if (saved.equip.head) p.equip.head = saved.equip.head;
+            if (saved.equip.chest) p.equip.chest = saved.equip.chest;
+            if (saved.equip.legs) p.equip.legs = saved.equip.legs;
+            if (saved.equip.feet) p.equip.feet = saved.equip.feet;
         }
         
         this.cleanupDanglingInventoryRefs(p);
@@ -1006,7 +1144,7 @@ export class MyRoom extends Room {
       } catch (e) {
         console.error("Failed to load save data (corrupt?). Starting fresh.", e);
         loadSuccess = false;
-        // Reset player object if partial load failed
+        // Reset player object
         p = new PlayerState();
         p.id = client.sessionId;
         p.name = (options.name || "Player").slice(0, 16);
@@ -1026,11 +1164,20 @@ export class MyRoom extends Room {
       };
       add("tool:pickaxe_wood", 1, 0);
       add("block:dirt", 16, 1);
+      syncEquipToolToHotbar(p);
     }
 
     this.state.players.set(client.sessionId, p);
     client.send("welcome", { sessionId: client.sessionId });
-    client.send("world:patch", MyRoom.WORLD.encodePatchAround({ x: p.x, y: p.y, z: p.z }, 48));
+    
+    // Initial Patch (Respect limit for initial heavy load)
+    const patch = MyRoom.WORLD.encodePatchAround(
+        { x: p.x, y: p.y, z: p.z }, 
+        48, 
+        { limit: MyRoom.INITIAL_PATCH_LIMIT }
+    );
+    client.send("world:patch", patch);
+    
     client.send("spawn:teleport", { x: p.x, y: p.y, z: p.z });
   }
 

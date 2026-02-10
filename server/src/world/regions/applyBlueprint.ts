@@ -1,7 +1,7 @@
 // ============================================================
 // src/world/regions/applyBlueprint.ts
 // ------------------------------------------------------------
-// Town of Beginnings v3.7 (FULL REWRITE)
+// Town of Beginnings v3.8 (FULL REWRITE)
 //
 // Features:
 // - ASCII Prefab System: Draw buildings in text!
@@ -11,9 +11,13 @@
 // - Procedural Tree generation
 // - Textural variation in roads
 // - EXPORTED inTownSafeZone helper (Required by MyRoom.ts)
-// - FIX: Diagonal walls are watertight (no edge gaps)
-// - FIX: Terraforming Skirt & Lower Elevation
-// - FIX: Rotation typing is stable (0|1|2|3) to prevent TS literal-narrow bugs
+//
+// FIXES vs v3.7:
+// - FIX: Rotation math uses normalized dimensions (ragged array safety).
+// - FIX: Diagonal walls are truly watertight (fills both gap tiles).
+// - FIX: Accurate block modification counts.
+// - FIX: Re-stamp safety (avoids clearing builds in the slope region).
+// - FIX: Versioning includes config parameters to detect changes.
 //
 // ============================================================
 
@@ -38,7 +42,7 @@ export const TOWN_GROUND_Y = 6;
 // How far (beyond the safe zone) we slope/feather terrain down
 const TOWN_SLOPE_WIDTH = 24;
 
-export const TOWN_STAMP_VERSION = "town_v3.7_full_rewrite_rotation_union";
+export const TOWN_STAMP_VERSION = "town_v3.8_ragged_fix_watertight";
 
 // -----------------------------
 // Safe Zone Helper
@@ -94,6 +98,8 @@ const ROT_3: SchematicRotation = 3;
 
 /**
  * Pastes a 3D ASCII schematic into the world.
+ * * FIX: Computes max dimensions first to ensure rotation logic is stable
+ * regardless of ragged input strings.
  *
  * Legend:
  * - '.' means "skip/no-op" (do not change anything)
@@ -106,62 +112,78 @@ function pasteStructure(
   oz: number,
   schematic: Schematic,
   rotation: SchematicRotation = ROT_0
-) {
+): number {
   let blocksTouched = 0;
 
-  schematic.forEach((layer, yOffset) => {
-    const y = oy + yOffset;
+  // 1. Normalize Dimensions
+  const height = schematic.length;
+  let maxDepth = 0;
+  let maxWidth = 0;
 
-    layer.forEach((rowStr, zIndex) => {
-      const rowChars = [...rowStr];
-      const width = rowChars.length;
-      const depth = layer.length;
+  for (const layer of schematic) {
+      if (layer.length > maxDepth) maxDepth = layer.length;
+      for (const row of layer) {
+          if (row.length > maxWidth) maxWidth = row.length;
+      }
+  }
 
-      rowChars.forEach((char, xIndex) => {
-        if (char === ".") return;
+  // 2. Iterate normalized grid
+  for (let y = 0; y < height; y++) {
+      const layer = schematic[y];
+      const worldY = oy + y;
 
-        // local coords before rotation
-        let x = xIndex;
-        let z = zIndex;
+      for (let z = 0; z < maxDepth; z++) {
+          const rowStr = z < layer.length ? layer[z] : "";
+          
+          for (let x = 0; x < maxWidth; x++) {
+              const char = x < rowStr.length ? rowStr[x] : "."; // Pad with skip
 
-        // Rotation Logic (0, 1, 2, 3)
-        // 0 = 0 deg, 1 = 90 deg, 2 = 180 deg, 3 = 270 deg
-        if (rotation === ROT_1) {
-          const t = x;
-          x = depth - 1 - z;
-          z = t;
-        } else if (rotation === ROT_2) {
-          x = width - 1 - x;
-          z = depth - 1 - z;
-        } else if (rotation === ROT_3) {
-          const t = x;
-          x = z;
-          z = width - 1 - t;
-        }
+              if (char === ".") continue;
 
-        const wx = ox + x;
-        const wz = oz + z;
+              // Local coords before rotation
+              let lx = x;
+              let lz = z;
 
-        // Default mapping
-        let blockId = (P as any)[char] ?? BLOCKS.AIR;
+              // 3. Rotation Logic (Using stable MaxWidth/MaxDepth)
+              // 0 = 0 deg, 1 = 90 deg, 2 = 180 deg, 3 = 270 deg
+              if (rotation === ROT_1) {
+                  // 90 deg: x -> z, z -> inverted x (based on Depth)
+                  const t = lx;
+                  lx = maxDepth - 1 - lz;
+                  lz = t;
+              } else if (rotation === ROT_2) {
+                  // 180 deg: x -> inverted x, z -> inverted z
+                  lx = maxWidth - 1 - lx;
+                  lz = maxDepth - 1 - lz;
+              } else if (rotation === ROT_3) {
+                  // 270 deg: x -> inverted z, z -> x
+                  const t = lx;
+                  lx = lz;
+                  lz = maxWidth - 1 - t;
+              }
 
-        // Road randomization for texture variation
-        if (char === "R") {
-          blockId =
-            Math.random() > 0.7
-              ? ((BLOCKS as any).GRAVEL ?? BLOCKS.STONE)
-              : BLOCKS.STONE;
-        }
+              const wx = ox + lx;
+              const wz = oz + lz;
 
-        // Apply only if changed (reduce ops)
-        if (world.getBlock(wx, y, wz) !== blockId) {
-          if (blockId === BLOCKS.AIR) world.applyBreak(wx, y, wz);
-          else world.applyPlace(wx, y, wz, blockId);
-          blocksTouched++;
-        }
-      });
-    });
-  });
+              // Default mapping
+              let blockId = (P as any)[char] ?? BLOCKS.AIR;
+
+              // Road randomization for texture variation
+              if (char === "R") {
+                  blockId = Math.random() > 0.7
+                      ? ((BLOCKS as any).GRAVEL ?? BLOCKS.STONE)
+                      : BLOCKS.STONE;
+              }
+
+              // Apply only if changed (reduce ops)
+              if (world.getBlock(wx, worldY, wz) !== blockId) {
+                  if (blockId === BLOCKS.AIR) world.applyBreak(wx, worldY, wz);
+                  else world.applyPlace(wx, worldY, wz, blockId);
+                  blocksTouched++;
+              }
+          }
+      }
+  }
 
   return blocksTouched;
 }
@@ -198,11 +220,17 @@ const FOUNTAIN: Schematic = [
 // Procedural Logic
 // -----------------------------
 
-function spawnTree(world: WorldStore, x: number, y: number, z: number) {
+function spawnTree(world: WorldStore, x: number, y: number, z: number): number {
+  let touched = 0;
   const height = 4 + Math.floor(Math.random() * 3);
 
   // trunk
-  for (let i = 0; i < height; i++) world.applyPlace(x, y + i, z, BLOCKS.LOG);
+  for (let i = 0; i < height; i++) {
+      if (world.getBlock(x, y + i, z) !== BLOCKS.LOG) {
+          world.applyPlace(x, y + i, z, BLOCKS.LOG);
+          touched++;
+      }
+  }
 
   // crown
   const crownY = y + height - 1;
@@ -219,10 +247,14 @@ function spawnTree(world: WorldStore, x: number, y: number, z: number) {
           continue;
 
         const existing = world.getBlock(lx, ly, lz);
-        if (existing === BLOCKS.AIR) world.applyPlace(lx, ly, lz, BLOCKS.LEAVES);
+        if (existing === BLOCKS.AIR) {
+            world.applyPlace(lx, ly, lz, BLOCKS.LEAVES);
+            touched++;
+        }
       }
     }
   }
+  return touched;
 }
 
 function drawColumn(
@@ -231,15 +263,32 @@ function drawColumn(
   z: number,
   yBase: number,
   crenellation: boolean
-) {
+): number {
+  let touched = 0;
   // underground "skirt" / footing
-  for (let y = -2; y < yBase; y++) world.applyPlace(x, y, z, BLOCKS.STONE);
+  for (let y = -2; y < yBase; y++) {
+      if (world.getBlock(x, y, z) !== BLOCKS.STONE) {
+        world.applyPlace(x, y, z, BLOCKS.STONE);
+        touched++;
+      }
+  }
 
   // vertical wall
-  for (let y = yBase; y < yBase + 5; y++) world.applyPlace(x, y, z, BLOCKS.STONE);
+  for (let y = yBase; y < yBase + 5; y++) {
+      if (world.getBlock(x, y, z) !== BLOCKS.STONE) {
+        world.applyPlace(x, y, z, BLOCKS.STONE);
+        touched++;
+      }
+  }
 
   // top detail
-  if (crenellation) world.applyPlace(x, yBase + 5, z, BLOCKS.STONE);
+  if (crenellation) {
+      if (world.getBlock(x, yBase + 5, z) !== BLOCKS.STONE) {
+        world.applyPlace(x, yBase + 5, z, BLOCKS.STONE);
+        touched++;
+      }
+  }
+  return touched;
 }
 
 function drawWall(
@@ -249,7 +298,8 @@ function drawWall(
   x2: number,
   z2: number,
   yBase: number
-) {
+): number {
+  let touched = 0;
   const dx = Math.sign(x2 - x1);
   const dz = Math.sign(z2 - z1);
 
@@ -260,16 +310,19 @@ function drawWall(
   const isDiagonal = dx !== 0 && dz !== 0;
 
   for (let i = 0; i <= len; i++) {
-    drawColumn(world, cx, cz, yBase, i % 2 === 0);
+    touched += drawColumn(world, cx, cz, yBase, i % 2 === 0);
 
-    // Watertight diagonal fix: fill the "corner gap" tile
+    // FIX: Watertight diagonal fill
+    // We must fill both adjacent blocks to prevent corner gaps in voxel rendering
     if (isDiagonal && i < len) {
-      drawColumn(world, cx + dx, cz, yBase, (i + 1) % 2 === 0);
+      touched += drawColumn(world, cx + dx, cz, yBase, (i + 1) % 2 === 0);
+      touched += drawColumn(world, cx, cz + dz, yBase, (i + 1) % 2 === 0); // Fills the second gap
     }
 
     cx += dx;
     cz += dz;
   }
+  return touched;
 }
 
 // -----------------------------
@@ -290,8 +343,17 @@ export function stampTownOfBeginnings(
   }
 
   const forced = !!opts?.force;
+  
+  // FIX: Detect parameter changes
+  const cx = TOWN_SAFE_ZONE.center.x;
+  const cz = TOWN_SAFE_ZONE.center.z;
+  const gy = TOWN_GROUND_Y;
+  const r = TOWN_SAFE_ZONE.radius;
+  
+  const matchesVersion = meta?.version === TOWN_STAMP_VERSION;
+  const matchesParams = meta?.radius === r && meta?.groundY === gy && meta?.slopeWidth === TOWN_SLOPE_WIDTH;
 
-  if (!forced && meta?.version === TOWN_STAMP_VERSION) {
+  if (!forced && matchesVersion && matchesParams) {
     if (opts?.verbose) console.log(`[TOWN] Already stamped v${TOWN_STAMP_VERSION}`);
     return {
       stamped: false,
@@ -305,10 +367,7 @@ export function stampTownOfBeginnings(
 
   if (opts?.verbose) console.log(`[TOWN] Stamping v${TOWN_STAMP_VERSION}...`);
 
-  const cx = TOWN_SAFE_ZONE.center.x;
-  const cz = TOWN_SAFE_ZONE.center.z;
-  const gy = TOWN_GROUND_Y;
-  const r = TOWN_SAFE_ZONE.radius;
+  let totalTouched = 0;
 
   // ----------------------------------------------------------
   // 1) TERRAFORMING SKIRT
@@ -340,13 +399,25 @@ export function stampTownOfBeginnings(
         let block: number = BLOCKS.DIRT;
         if (y === surfaceY) block = BLOCKS.GRASS;
         else if (y < surfaceY - 3) block = BLOCKS.STONE;
-        world.applyPlace(wx, y, wz, block);
+        
+        if (world.getBlock(wx, y, wz) !== block) {
+            world.applyPlace(wx, y, wz, block);
+            totalTouched++;
+        }
       }
 
-      // clear above for a clean stamp area
-      const clearHeight = dist <= r ? 20 : 5;
-      for (let y = surfaceY + 1; y <= surfaceY + clearHeight; y++) {
-        world.applyBreak(wx, y, wz);
+      // FIX: Re-stamp safety. 
+      // Only clear high air INSIDE the safe zone.
+      // Outside (slope region), avoid clearing to preserve player builds on the outskirts.
+      const clearHeight = dist <= r ? 20 : 0; 
+      
+      if (clearHeight > 0) {
+          for (let y = surfaceY + 1; y <= surfaceY + clearHeight; y++) {
+            if (world.getBlock(wx, y, wz) !== BLOCKS.AIR) {
+                world.applyBreak(wx, y, wz);
+                totalTouched++;
+            }
+          }
       }
     }
   }
@@ -366,7 +437,11 @@ export function stampTownOfBeginnings(
           Math.random() > 0.2
             ? ((BLOCKS as any).GRAVEL ?? BLOCKS.STONE)
             : BLOCKS.STONE;
-        world.applyPlace(cx + x, gy, cz + z, mat);
+        
+        if (world.getBlock(cx + x, gy, cz + z) !== mat) {
+            world.applyPlace(cx + x, gy, cz + z, mat);
+            totalTouched++;
+        }
       }
     }
   }
@@ -374,18 +449,18 @@ export function stampTownOfBeginnings(
   // ----------------------------------------------------------
   // 3) CENTERPIECE
   // ----------------------------------------------------------
-  pasteStructure(world, cx - 3, gy + 1, cz - 3, FOUNTAIN, ROT_0);
+  totalTouched += pasteStructure(world, cx - 3, gy + 1, cz - 3, FOUNTAIN, ROT_0);
 
   // ----------------------------------------------------------
   // 4) BUILDINGS
   // ----------------------------------------------------------
   // Fixed literal narrowing using constants
-  pasteStructure(world, cx - 15, gy + 1, cz + 28, HOUSE_SMALL, ROT_2);
-  pasteStructure(world, cx + 28, gy + 1, cz - 15, HOUSE_SMALL, ROT_3);
-  pasteStructure(world, cx - 28, gy + 1, cz + 10, HOUSE_SMALL, ROT_1);
+  totalTouched += pasteStructure(world, cx - 15, gy + 1, cz + 28, HOUSE_SMALL, ROT_2);
+  totalTouched += pasteStructure(world, cx + 28, gy + 1, cz - 15, HOUSE_SMALL, ROT_3);
+  totalTouched += pasteStructure(world, cx - 28, gy + 1, cz + 10, HOUSE_SMALL, ROT_1);
 
-  pasteStructure(world, cx + 15, gy + 1, cz + 15, MARKET_STALL, ROT_0);
-  pasteStructure(world, cx + 24, gy + 1, cz + 15, MARKET_STALL, ROT_1);
+  totalTouched += pasteStructure(world, cx + 15, gy + 1, cz + 15, MARKET_STALL, ROT_0);
+  totalTouched += pasteStructure(world, cx + 24, gy + 1, cz + 15, MARKET_STALL, ROT_1);
 
   // ----------------------------------------------------------
   // 5) WALLS (square + diagonals)
@@ -393,16 +468,16 @@ export function stampTownOfBeginnings(
   const wallR = r - 2;
 
   // cardinal edges
-  drawWall(world, cx - 10, cz + wallR, cx + 10, cz + wallR, gy + 1);
-  drawWall(world, cx - 10, cz - wallR, cx + 10, cz - wallR, gy + 1);
-  drawWall(world, cx + wallR, cz - 10, cx + wallR, cz + 10, gy + 1);
-  drawWall(world, cx - wallR, cz - 10, cx - wallR, cz + 10, gy + 1);
+  totalTouched += drawWall(world, cx - 10, cz + wallR, cx + 10, cz + wallR, gy + 1);
+  totalTouched += drawWall(world, cx - 10, cz - wallR, cx + 10, cz - wallR, gy + 1);
+  totalTouched += drawWall(world, cx + wallR, cz - 10, cx + wallR, cz + 10, gy + 1);
+  totalTouched += drawWall(world, cx - wallR, cz - 10, cx - wallR, cz + 10, gy + 1);
 
   // diagonals to corners
-  drawWall(world, cx + 10, cz + wallR, cx + wallR, cz + 10, gy + 1);
-  drawWall(world, cx - 10, cz + wallR, cx - wallR, cz + 10, gy + 1);
-  drawWall(world, cx + 10, cz - wallR, cx + wallR, cz - 10, gy + 1);
-  drawWall(world, cx - 10, cz - wallR, cx - wallR, cz - 10, gy + 1);
+  totalTouched += drawWall(world, cx + 10, cz + wallR, cx + wallR, cz + 10, gy + 1);
+  totalTouched += drawWall(world, cx - 10, cz + wallR, cx - wallR, cz + 10, gy + 1);
+  totalTouched += drawWall(world, cx + 10, cz - wallR, cx + wallR, cz - 10, gy + 1);
+  totalTouched += drawWall(world, cx - 10, cz - wallR, cx - wallR, cz - 10, gy + 1);
 
   // ----------------------------------------------------------
   // 6) VEGETATION
@@ -415,7 +490,7 @@ export function stampTownOfBeginnings(
       const floor = world.getBlock(cx + rx, gy, cz + rz);
       const above = world.getBlock(cx + rx, gy + 1, cz + rz);
       if (floor === BLOCKS.GRASS && above === BLOCKS.AIR) {
-        spawnTree(world, cx + rx, gy + 1, cz + rz);
+        totalTouched += spawnTree(world, cx + rx, gy + 1, cz + rz);
       }
     }
   }
@@ -426,7 +501,13 @@ export function stampTownOfBeginnings(
   try {
     fs.writeFileSync(
       metaPath,
-      JSON.stringify({ version: TOWN_STAMP_VERSION, at: Date.now() })
+      JSON.stringify({ 
+          version: TOWN_STAMP_VERSION, 
+          radius: r,
+          groundY: gy,
+          slopeWidth: TOWN_SLOPE_WIDTH,
+          at: Date.now() 
+      })
     );
   } catch {
     // ignore write errors
@@ -436,8 +517,8 @@ export function stampTownOfBeginnings(
     stamped: true,
     forced,
     version: TOWN_STAMP_VERSION,
-    opsApplied: 1,
-    blocksTouched: 1,
+    opsApplied: totalTouched,
+    blocksTouched: totalTouched,
     metaPath,
   };
 }

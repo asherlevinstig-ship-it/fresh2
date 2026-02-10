@@ -2,14 +2,13 @@
 /*
  * fresh2 - client main/index (PRODUCTION - FULL LOGIC)
  * -----------------------------------------------------------------------
- * INCLUDES (NO OMITS):
- * - Mob Rendering (Procedural Slimes + Interpolation)
- * - Minecraft-Style Inventory (Server-Side Cursor + Click Networking)
- * - Server-Authoritative Crafting (3x3 Grid)
- * - World Generation (BIOME-AWARE: Matches Server Logic)
- * - Town of Beginnings (Render Clamping + Safe Zone Visuals)
- * - 3D Rigs (FPS Hands + 3rd Person Avatars)
- * - Chat System (/find, /goto, /biome)
+ * INCLUDES:
+ * - Fix: Protocol mismatch for world:patch (Handles flat arrays)
+ * - Fix: Block ID sync (Crafting Table=30, Chest=31)
+ * - Fix: Town Radius/Height constants matched to Server (48, 6)
+ * - Fix: Rollback prediction on block:reject
+ * - Feature: Durability support in UI
+ * - Feature: Mob Rendering, Inventory, Chat, 3D Rigs
  */
 
 import { Engine } from "noa-engine";
@@ -32,21 +31,22 @@ import {
 } from "../../world/Biomes";
 
 /* ============================================================
- * 0.5 TOWN OF BEGINNINGS (Client-only render clamp region)
+ * 0.5 TOWN OF BEGINNINGS (Render clamp region)
  * ============================================================
  */
+// FIX: Synced with Server (Radius 48, GroundY 6)
 const TOWN = {
   cx: 0,
   cz: 0,
-  radius: 42,
-  groundY: 10,
+  radius: 48,
+  groundY: 6,
 };
 
 // Render clamp presets
 const RENDER_PRESET_OUTSIDE = {
   chunkAddDistance: 2.5,
   chunkRemoveDistance: 3.5,
-  cameraMaxZ: 220, // Far view
+  cameraMaxZ: 220,
   fog: false,
   fogDensity: 0.0,
 };
@@ -54,7 +54,7 @@ const RENDER_PRESET_OUTSIDE = {
 const RENDER_PRESET_TOWN = {
   chunkAddDistance: 1.35,
   chunkRemoveDistance: 2.15,
-  cameraMaxZ: 120, // Tighter view inside town
+  cameraMaxZ: 120,
   fog: true,
   fogDensity: 0.018,
 };
@@ -106,10 +106,10 @@ const LOCAL_STATE = {
   maxHp: 20,
   stamina: 100,
   hotbarIndex: 0,
-  inventory: [], // Array of { kind, qty }
+  inventory: [], // Array of { kind, qty, durability?, maxDurability? }
   craft: [],     // Array of 9
-  craftResult: null, // { kind, qty }
-  cursor: null,  // { kind, qty } (The item floating on mouse)
+  craftResult: null,
+  cursor: null,  // { kind, qty, ... }
   equip: { tool: "" }
 };
 
@@ -284,7 +284,7 @@ function createChatUI() {
 const chatUI = createChatUI();
 
 /* ============================================================
- * 5. UI: INVENTORY & CRAFTING (UPDATED FOR CURSOR LOGIC)
+ * 5. UI: INVENTORY & CRAFTING
  * ============================================================
  */
 
@@ -305,11 +305,10 @@ function createInventoryUI() {
     position: "fixed",
     width: "48px",
     height: "48px",
-    pointerEvents: "none", // Click through to slots
+    pointerEvents: "none",
     zIndex: "10000",
-    display: "none", // Hidden when empty
+    display: "none",
     background: "none",
-    // Icon styles
     color: "white",
     fontSize: "10px",
     textAlign: "center",
@@ -337,7 +336,7 @@ function createInventoryUI() {
     color: "#eee",
   });
 
-  // --- Left: Crafting & Equip ---
+  // --- Left: Crafting ---
   const leftCol = document.createElement("div");
   leftCol.innerHTML = `<div style="font-weight:bold; margin-bottom:8px">Crafting</div>`;
 
@@ -351,7 +350,6 @@ function createInventoryUI() {
     borderRadius: "8px",
   });
 
-  // 3x3 Grid
   const craftGrid = document.createElement("div");
   Object.assign(craftGrid.style, {
     display: "grid",
@@ -360,14 +358,13 @@ function createInventoryUI() {
   });
   const craftCells = [];
   for (let i = 0; i < 9; i++) {
-    const { cell, icon, qty } = makeSlot("craft", i);
+    const { cell, icon, qty, durabilityBar } = makeSlot("craft", i);
     craftGrid.appendChild(cell);
-    craftCells.push({ cell, icon, qty });
+    craftCells.push({ cell, icon, qty, durabilityBar });
   }
 
-  // Result
   const resWrap = document.createElement("div");
-  const { cell: resCell, icon: resIcon, qty: resQty } = makeSlot("result", 0);
+  const { cell: resCell, icon: resIcon, qty: resQty, durabilityBar: resDur } = makeSlot("result", 0);
   resCell.style.border = "1px solid #6c6";
   resWrap.appendChild(resCell);
 
@@ -376,7 +373,6 @@ function createInventoryUI() {
   craftWrap.appendChild(resWrap);
   leftCol.appendChild(craftWrap);
 
-  // Equipment (Visual Only for now)
   leftCol.appendChild(document.createElement("hr"));
   const eqGrid = document.createElement("div");
   Object.assign(eqGrid.style, { display: "grid", gridTemplateColumns: "repeat(3, 48px)", gap: "4px" });
@@ -400,9 +396,9 @@ function createInventoryUI() {
   });
   const invCells = [];
   for (let i = 0; i < 36; i++) {
-    const { cell, icon, qty } = makeSlot("inv", i);
+    const { cell, icon, qty, durabilityBar } = makeSlot("inv", i);
     invGrid.appendChild(cell);
-    invCells.push({ cell, icon, qty });
+    invCells.push({ cell, icon, qty, durabilityBar });
   }
   rightCol.appendChild(invGrid);
 
@@ -411,7 +407,6 @@ function createInventoryUI() {
   overlay.appendChild(panel);
   document.body.appendChild(overlay);
 
-  // --- Helpers ---
   function makeSlot(loc, idx) {
     const cell = document.createElement("div");
     Object.assign(cell.style, {
@@ -438,25 +433,36 @@ function createInventoryUI() {
       fontSize: "11px", fontWeight: "bold", pointerEvents: "none",
     });
 
+    // Fix: Future-proofing for tools (Durability Bar)
+    const durabilityBar = document.createElement("div");
+    Object.assign(durabilityBar.style, {
+        position: "absolute", bottom: "2px", left: "2px", right: "2px",
+        height: "3px", background: "#555", display: "none"
+    });
+    const durInner = document.createElement("div");
+    Object.assign(durInner.style, {
+        height: "100%", width: "0%", background: "linear-gradient(to right, #f00, #0f0)"
+    });
+    durabilityBar.appendChild(durInner);
+    cell.appendChild(durabilityBar);
+
     cell.appendChild(icon);
     cell.appendChild(qty);
 
-    // Event Listener: SEND NETWORK MESSAGE
     cell.addEventListener("mousedown", (e) => {
-        e.stopPropagation(); // Don't fire weapon
+        e.stopPropagation();
         if (colyRoom) {
             colyRoom.send("inv:click", {
                 location: loc,
                 index: idx,
-                button: e.button === 2 ? 1 : 0 // 0=Left, 1=Right
+                button: e.button === 2 ? 1 : 0
             });
         }
     });
 
-    // Prevent context menu on right click
     cell.addEventListener("contextmenu", e => e.preventDefault());
 
-    return { cell, icon, qty };
+    return { cell, icon, qty, durabilityBar: { outer: durabilityBar, inner: durInner } };
   }
 
   function getShortName(kind) {
@@ -464,28 +470,29 @@ function createInventoryUI() {
       return kind.split(":")[1] || kind;
   }
 
-  // --- Main Refresh Logic ---
+  function updateSlotVisual(uiObj, item) {
+      uiObj.icon.textContent = item ? getShortName(item.kind) : "";
+      uiObj.qty.textContent = (item && item.qty > 1) ? item.qty : "";
+      
+      // Handle Durability
+      if (item && item.maxDurability && item.durability < item.maxDurability) {
+          uiObj.durabilityBar.outer.style.display = "block";
+          const pct = Math.max(0, Math.min(100, (item.durability / item.maxDurability) * 100));
+          uiObj.durabilityBar.inner.style.width = pct + "%";
+      } else {
+          uiObj.durabilityBar.outer.style.display = "none";
+      }
+  }
+
   function refresh() {
-    // 1. Inventory Slots
     for(let i=0; i<36; i++) {
-        const item = LOCAL_STATE.inventory[i];
-        invCells[i].icon.textContent = item ? getShortName(item.kind) : "";
-        invCells[i].qty.textContent = (item && item.qty > 1) ? item.qty : "";
+        updateSlotVisual(invCells[i], LOCAL_STATE.inventory[i]);
     }
-
-    // 2. Crafting Slots
     for(let i=0; i<9; i++) {
-        const item = LOCAL_STATE.craft[i];
-        craftCells[i].icon.textContent = item ? getShortName(item.kind) : "";
-        craftCells[i].qty.textContent = (item && item.qty > 1) ? item.qty : "";
+        updateSlotVisual(craftCells[i], LOCAL_STATE.craft[i]);
     }
+    updateSlotVisual({ icon: resIcon, qty: resQty, durabilityBar: resDur }, LOCAL_STATE.craftResult);
 
-    // 3. Craft Result
-    const res = LOCAL_STATE.craftResult;
-    resIcon.textContent = res ? getShortName(res.kind) : "";
-    resQty.textContent = (res && res.qty > 0) ? res.qty : "";
-
-    // 4. Cursor (Floating)
     const cur = LOCAL_STATE.cursor;
     if (cur && cur.kind && cur.qty > 0) {
         cursorEl.style.display = "block";
@@ -495,7 +502,6 @@ function createInventoryUI() {
     }
   }
 
-  // --- Mouse Following ---
   window.addEventListener("mousemove", (e) => {
       if (inventoryOpen) {
           cursorEl.style.left = (e.clientX + 10) + "px";
@@ -524,7 +530,7 @@ function createInventoryUI() {
 const inventoryUI = createInventoryUI();
 
 /* ============================================================
- * 6. UI: HOTBAR (Passive Display)
+ * 6. UI: HOTBAR
  * ============================================================
  */
 
@@ -585,7 +591,7 @@ function createHotbarUI() {
 const hotbarUI = createHotbarUI();
 
 /* ============================================================
- * 7. WORLD GENERATION (BIOMES + ORES, MATCHES SERVER)
+ * 7. WORLD GENERATION & BLOCK REGISTRY
  * ============================================================
  */
 
@@ -612,20 +618,18 @@ const mats = {
   silver_ore: [0.78, 0.78, 0.85],
   gold_ore: [0.9, 0.78, 0.2],
   
-  // Fancy Ores
   ruby_ore: [0.85, 0.15, 0.25],
   sapphire_ore: [0.15, 0.35, 0.9],
   mythril_ore: [0.3, 0.9, 0.85],
   dragonstone: [0.5, 0.1, 0.75],
   
-  // Furniture
   crafting_table: [0.55, 0.35, 0.18],
   chest: [0.58, 0.38, 0.18],
 };
 
 Object.keys(mats).forEach((k) => noa.registry.registerMaterial(k, { color: mats[k] }));
 
-// Register blocks with EXACT server IDs (1-based)
+// FIX: Register blocks with updated Server IDs (30 for Crafting, 31 for Chest)
 const ID = {
   dirt: noa.registry.registerBlock(1, { material: "dirt" }),
   grass: noa.registry.registerBlock(2, { material: "grass" }),
@@ -653,11 +657,11 @@ const ID = {
   mythril_ore: noa.registry.registerBlock(21, { material: "mythril_ore" }),
   dragonstone: noa.registry.registerBlock(22, { material: "dragonstone" }),
 
-  crafting_table: noa.registry.registerBlock(23, { material: "crafting_table" }),
-  chest: noa.registry.registerBlock(24, { material: "chest" }),
+  // JUMP TO 30/31 to match Server
+  crafting_table: noa.registry.registerBlock(30, { material: "crafting_table" }),
+  chest: noa.registry.registerBlock(31, { material: "chest" }),
 };
 
-// Map used by Biomes.ts
 const PALETTE = {
   AIR: 0,
   DIRT: 1,
@@ -692,7 +696,6 @@ function getVoxelID(x, y, z) {
   const biome = sb.biome;
   const height = sb.height;
 
-  // Above ground: air except deterministic vegetation
   if (y > height) {
     const maxVegetationY = height + 8;
     if (y >= maxVegetationY) return 0;
@@ -814,11 +817,9 @@ function createAvatar(scene) {
   return { root, head, body };
 }
 
-// Procedural Slime Mob
 function createSlimeMesh(scene) {
     const root = new BABYLON.TransformNode("mob_root", scene);
     
-    // Slime Body (Green Box)
     const mat = new BABYLON.StandardMaterial("slime_mat", scene);
     mat.diffuseColor = new BABYLON.Color3(0.2, 0.8, 0.2);
     mat.alpha = 0.8;
@@ -828,7 +829,6 @@ function createSlimeMesh(scene) {
     box.parent = root;
     box.position.y = 0.4;
     
-    // Eyes
     const eyeMat = new BABYLON.StandardMaterial("eye_mat", scene);
     eyeMat.diffuseColor = BABYLON.Color3.Black();
     
@@ -921,13 +921,13 @@ function applyRenderPreset(scene, preset) {
  * ============================================================
  */
 
-// Helper to resolve UID to Item Data from the Map
 function resolveItem(uid, playersMap) {
     if (!uid || !playersMap) return null;
     const me = playersMap.get(mySessionId);
     if (!me || !me.items) return null;
     const it = me.items.get(uid);
-    return it ? { kind: it.kind, qty: it.qty } : null;
+    // Fix: Pass durability info to local state for UI rendering
+    return it ? { kind: it.kind, qty: it.qty, durability: it.durability, maxDurability: it.maxDurability } : null;
 }
 
 function snapshotState(me, playersMap) {
@@ -935,17 +935,9 @@ function snapshotState(me, playersMap) {
   LOCAL_STATE.hp = me.hp;
   LOCAL_STATE.stamina = me.stamina;
   LOCAL_STATE.hotbarIndex = me.hotbarIndex;
-
-  // Inventory Array
   LOCAL_STATE.inventory = me.inventory.slots.map(uid => resolveItem(uid, playersMap));
-
-  // Craft Array
   LOCAL_STATE.craft = me.craft.slots.map(uid => resolveItem(uid, playersMap));
-
-  // Result
   LOCAL_STATE.craftResult = { kind: me.craft.resultKind, qty: me.craft.resultQty };
-
-  // Cursor
   LOCAL_STATE.cursor = { kind: me.cursor.kind, qty: me.cursor.qty };
 
   inventoryUI.refresh();
@@ -993,12 +985,15 @@ client
       uiLog(`Welcome: ${msg?.roomId || ""} (${msg?.sessionId || ""})`);
       chatUI.add("Welcome! Press [ENTER] to chat or use commands.", "#88ff88");
       
-      // Initial patch request around Town
-      room.send("world:patch:req", { x: TOWN.cx, y: TOWN.groundY, z: TOWN.cz, r: 48, limit: 10000 });
+      // Fix: Stop sending x,y,z if server ignores it. Send 'r' for initial sync.
+      room.send("world:patch:req", { r: 48 });
     });
 
+    // Fix: Block Reject Safety Rollback
     room.onMessage("block:reject", (msg) => {
-      UI_CONSOLE.warn(`block:reject (${msg?.reason || "reject"})`);
+      UI_CONSOLE.warn(`block:reject (${msg?.reason || "reject"}) - Resyncing...`);
+      // Request immediate patch around player to fix ghost blocks
+      room.send("world:patch:req", { r: 8 }); 
     });
 
     room.onMessage("chat:sys", (msg) => {
@@ -1018,10 +1013,7 @@ client
       if (ls) ls.style.display = "none";
     });
 
-    // --- STATE CHANGES ---
-
     room.onStateChange((state) => {
-        // Player Updates
         const me = state.players.get(room.sessionId);
         if (me) snapshotState(me, state.players);
 
@@ -1036,7 +1028,6 @@ client
         });
     });
 
-    // Mob Updates
     room.state.mobs.onAdd = (mob, key) => {
         const mesh = createSlimeMesh(noa.rendering.getScene());
         mesh.position.set(mob.x, mob.y, mob.z);
@@ -1057,16 +1048,33 @@ client
         }
     };
 
+    // Fix: Protocol Mismatch Handler
     room.onMessage("world:patch", (patch) => {
-      const edits = patch?.edits || [];
-      for (let i = 0; i < edits.length; i++) {
-        const e = edits[i];
-        noa.setBlock(e.id, e.x, e.y, e.z);
+      let count = 0;
+
+      // Case A: Standard 'edits' object array
+      if (patch.edits && Array.isArray(patch.edits)) {
+        for (const e of patch.edits) {
+           noa.setBlock(e.id, e.x, e.y, e.z);
+           count++;
+        }
+      } 
+      // Case B: Flat Data Array (Server sends [x, y, z, id, ...])
+      else if (patch.data && Array.isArray(patch.data)) {
+        // Assume stride of 4: x, y, z, id
+        const arr = patch.data;
+        for (let i = 0; i < arr.length; i += 4) {
+           // Ensure bounds check just in case
+           if (i + 3 < arr.length) {
+              noa.setBlock(arr[i+3], arr[i], arr[i+1], arr[i+2]);
+              count++;
+           }
+        }
       }
 
       if (!STATE.worldReady) {
         STATE.worldReady = true;
-        uiLog(`worldReady=true (patch=${edits.length})`);
+        uiLog(`worldReady=true (patch applied: ${count} blocks)`);
         if (!STATE.spawnSnapDone) {
             forcePlayerPosition(TOWN.cx, TOWN.groundY + 10, TOWN.cz, "worldReady");
         }
@@ -1169,7 +1177,10 @@ window.addEventListener("keydown", (e) => {
   
   if (e.code === "F6") {
     try {
-      if (colyRoom) colyRoom.send("world:patch:req", { x: TOWN.cx, y: TOWN.groundY, z: TOWN.cz, r: 160, limit: 30000 });
+      if (colyRoom) {
+          // Fix: Clean patch request
+          colyRoom.send("world:patch:req", { r: 160 });
+      }
       uiLog("Requested town patch (F6)");
     } catch {}
   }
@@ -1180,6 +1191,7 @@ window.addEventListener("keydown", (e) => {
   }
 
   if (e.code === "F9") {
+    // Fix: Updated F9 manual snap to use new Ground Y
     forcePlayerPosition(TOWN.cx + 0.5, TOWN.groundY + 3, TOWN.cz + 0.5, "(F9 manual snap)");
     if (colyRoom) {
       try {
@@ -1213,7 +1225,6 @@ noa.on("beforeRender", () => {
 
   if (dt > 0.1) return;
 
-  // Freeze check
   const shouldFreeze = !STATE.worldReady || !STATE.spawnSnapDone || now < STATE.freezeUntil;
   if (shouldFreeze) {
       const s = STATE.desiredSpawn;
@@ -1222,7 +1233,6 @@ noa.on("beforeRender", () => {
 
   updateRigAnim(dt);
 
-  // Town Clamp Check
   try {
     const p = noa.entities.getPosition(noa.playerEntity);
     const px = p[0], pz = p[2];
@@ -1247,7 +1257,6 @@ noa.on("beforeRender", () => {
     }
   }
 
-  // Player Interpolation
   for (const sid in remotePlayers) {
     const rp = remotePlayers[sid];
     if (rp && rp.mesh) {
@@ -1259,7 +1268,6 @@ noa.on("beforeRender", () => {
     }
   }
 
-  // Mob Interpolation
   for (const mid in mobs) {
     const m = mobs[mid];
     if (m && m.mesh) {
@@ -1267,10 +1275,8 @@ noa.on("beforeRender", () => {
       m.mesh.position.y += (m.targetPos[1] - m.mesh.position.y) * 0.1;
       m.mesh.position.z += (m.targetPos[2] - m.mesh.position.z) * 0.1;
       
-      // Simple rotation
       m.mesh.rotation.y += (m.targetYaw - m.mesh.rotation.y) * 0.1;
 
-      // Bobbing Animation
       const isMoving = Math.abs(m.targetPos[0] - m.mesh.position.x) > 0.01;
       if (isMoving) {
           const s = 1 + Math.sin(now * 0.01) * 0.1;
@@ -1283,7 +1289,6 @@ noa.on("beforeRender", () => {
     }
   }
 
-  // Network Movement Send
   STATE.moveAccum += dt;
   if (colyRoom && !inventoryOpen && !chatOpen && !shouldFreeze && STATE.moveAccum > 0.05) {
     STATE.moveAccum = 0;
