@@ -2,10 +2,11 @@
 /*
  * fresh2 - client main/index (PRODUCTION - FULL LOGIC)
  * -----------------------------------------------------------------------
- * DIAGNOSTIC VERSION
- * - Added: "PATCH recv" log to verify if server is actually sending blocks.
- * - Fix: CLIENT_EDITS logic robust against chunk reload race conditions.
- * - Fix: Freezing logic safe against network lag.
+ * FINAL FIXES:
+ * - Fix: Re-added missing 'applyRenderPreset', 'distXZ', 'isInsideTown' functions.
+ * - Fix: MESH/STATE defined early to prevent TDZ errors.
+ * - Fix: Invisible Town (CLIENT_EDITS + Protocol Patch).
+ * - Fix: Freezing & Race Conditions.
  */
 
 import { Engine } from "noa-engine";
@@ -28,8 +29,8 @@ import {
 const TOWN = {
   cx: 0,
   cz: 0,
-  radius: 48, // Matches Server
-  groundY: 6, // Matches Server
+  radius: 48,
+  groundY: 6,
 };
 
 const RENDER_PRESET_OUTSIDE = {
@@ -48,12 +49,63 @@ const RENDER_PRESET_TOWN = {
   fogDensity: 0.018,
 };
 
-// --- 2. GLOBAL STATE (DEFINED FIRST) ---
+const TOWN_HYSTERESIS = 3.0;
 
-// Client-Side Edits (The Fix for Invisible Town)
+// --- 1.5 RENDER HELPERS (DEFINED HERE TO FIX REFERENCE ERROR) ---
+
+function distXZ(ax, az, bx, bz) {
+  const dx = ax - bx;
+  const dz = az - bz;
+  return Math.sqrt(dx * dx + dz * dz);
+}
+
+function isInsideTown(x, z, alreadyInside) {
+  const d = distXZ(x, z, TOWN.cx, TOWN.cz);
+  const r = TOWN.radius + (alreadyInside ? TOWN_HYSTERESIS : -TOWN_HYSTERESIS);
+  return d <= r;
+}
+
+function applyRenderPreset(scene, preset) {
+  // NOA chunk distances
+  try {
+    if (noa?.world) {
+      if ("chunkAddDistance" in noa.world) noa.world.chunkAddDistance = preset.chunkAddDistance;
+      if ("chunkRemoveDistance" in noa.world) noa.world.chunkRemoveDistance = preset.chunkRemoveDistance;
+
+      const mgr = noa.world._chunkMgr || noa.world._chunkManager;
+      if (mgr) {
+        if ("chunkAddDistance" in mgr) mgr.chunkAddDistance = preset.chunkAddDistance;
+        if ("chunkRemoveDistance" in mgr) mgr.chunkRemoveDistance = preset.chunkRemoveDistance;
+      }
+    }
+  } catch {}
+
+  // Camera far plane
+  try {
+    if (scene?.activeCamera) scene.activeCamera.maxZ = preset.cameraMaxZ;
+  } catch {}
+
+  // Fog
+  try {
+    if (!scene) return;
+    if (preset.fog) {
+      scene.fogMode = BABYLON.Scene.FOGMODE_EXP2;
+      scene.fogDensity = preset.fogDensity || 0.01;
+      if (scene.clearColor) {
+        scene.fogColor = new BABYLON.Color3(scene.clearColor.r, scene.clearColor.g, scene.clearColor.b);
+      }
+    } else {
+      scene.fogMode = BABYLON.Scene.FOGMODE_NONE;
+      scene.fogDensity = 0;
+    }
+  } catch {}
+}
+
+// --- 2. GLOBAL STATE ---
+
+// Client-Side Edits (Persists map patches)
 const CLIENT_EDITS = new Map(); 
 function getEditKey(x, y, z) {
-    // Use floor to match server logic exactly
     return `${Math.floor(x)},${Math.floor(y)},${Math.floor(z)}`;
 }
 
@@ -760,11 +812,9 @@ client
             count++;
          }
          
-         // --- DIAGNOSTIC LOG (CHECK CONSOLE FOR THIS) ---
-         // If count=0, server is sending nothing.
          if (!STATE.worldReady) {
             STATE.worldReady = true;
-            uiLog(`PATCH recv: count=${count} dataLen=${arr.length}`);
+            uiLog(`worldReady=true (loaded ${count} blocks)`);
          }
       } 
       // Legacy fallback
