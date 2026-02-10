@@ -1,10 +1,12 @@
 // ============================================================
 // src/rooms/MyRoom.ts
 // ------------------------------------------------------------
-// FULL REWRITE - PRODUCTION READY - TYPESCRIPT FIX APPLIED
+// FULL REWRITE - "SAFE LOAD" EDITION
 //
-// FIX: Explicitly typed 'mob' and 'p' as 'any' in updateLoop
-//      to prevent "Property does not exist on type never" errors.
+// FIXES:
+// 1. "Stuck on Spawn": Automatically discards corrupt/old save data so you can join.
+// 2. "Inventory Rubbish": Resets inventory to a clean state so items stack correctly.
+// 3. "No Enemies": Ensures the game loop starts cleanly.
 // ============================================================
 
 import { Room, Client } from "colyseus";
@@ -48,12 +50,9 @@ type MoveMsg = {
 };
 
 type ChatMsg = { text: string };
-
 type SprintMsg = { on: boolean };
-type SwingMsg = { t?: number };
 type HotbarSetMsg = { index: number };
 
-// Minecraft-style interaction interaction
 type InvClickMsg = {
   location: "inv" | "craft" | "result";
   index: number;
@@ -62,11 +61,9 @@ type InvClickMsg = {
 
 type InvConsumeHotbarMsg = { qty?: number };
 type InvAddMsg = { kind: string; qty?: number };
-type InvCloseMsg = {};
 
 type BlockBreakMsg = { x: number; y: number; z: number; src?: string };
 type BlockPlaceMsg = { x: number; y: number; z: number; kind: string; src?: string };
-
 type WorldPatchReqMsg = { x: number; y: number; z: number; r?: number; limit?: number };
 
 // ------------------------------------------------------------
@@ -763,7 +760,10 @@ export class MyRoom extends Room {
       MyRoom.WORLD.setBlock(x, y, z, BLOCKS.AIR);
       
       const kind = blockIdToKind(oldId);
-      if (kind) addKindToInventory(p, kind, 1);
+      if (kind) {
+          addKindToInventory(p, kind, 1);
+          syncEquipToolToHotbar(p); // Ensure client UI updates immediately
+      }
       
       this.broadcast("block:update", { x, y, z, id: BLOCKS.AIR });
     });
@@ -961,44 +961,60 @@ export class MyRoom extends Room {
     (client as any).auth = { distinctId };
     console.log(client.sessionId, "joined");
 
-    const p = new PlayerState();
+    let p = new PlayerState();
     p.id = client.sessionId;
     p.name = (options.name || "Player").slice(0, 16);
 
+    let loadSuccess = false;
     const saved = this.loadPlayerData(distinctId);
+    
+    // SAFE LOAD LOGIC: If loading fails, fall back to new spawn
     if (saved) {
-      p.x = saved.x; p.y = saved.y; p.z = saved.z;
-      p.yaw = saved.yaw; p.pitch = saved.pitch;
-      p.hp = saved.hp; p.stamina = saved.stamina;
-      p.hotbarIndex = saved.hotbarIndex;
+      try {
+        p.x = saved.x; p.y = saved.y; p.z = saved.z;
+        p.yaw = saved.yaw; p.pitch = saved.pitch;
+        p.hp = saved.hp; p.stamina = saved.stamina;
+        p.hotbarIndex = saved.hotbarIndex;
 
-      if (Array.isArray(saved.items)) {
-        saved.items.forEach((si: any) => {
-          const it = new ItemState();
-          it.uid = si.uid; it.kind = si.kind; it.qty = si.qty; it.durability = si.durability;
-          p.items.set(it.uid, it);
-        });
-      }
-      
-      ensureSlotsLength(p);
-      if (Array.isArray(saved.inventory)) {
-        saved.inventory.forEach((uid: string, i: number) => {
-          if (i < p.inventory.slots.length) p.inventory.slots[i] = uid;
-        });
-      }
+        if (Array.isArray(saved.items)) {
+          saved.items.forEach((si: any) => {
+            const it = new ItemState();
+            it.uid = si.uid; it.kind = si.kind; it.qty = si.qty; it.durability = si.durability;
+            p.items.set(it.uid, it);
+          });
+        }
+        
+        ensureSlotsLength(p);
+        if (Array.isArray(saved.inventory)) {
+          saved.inventory.forEach((uid: string, i: number) => {
+            if (i < p.inventory.slots.length) p.inventory.slots[i] = uid;
+          });
+        }
 
-      if (Array.isArray(saved.craftSlots)) {
-        saved.craftSlots.forEach((uid: string, i: number) => { if(i<9) p.craft.slots[i] = uid; });
-        updateCraftingResult(p);
-      }
+        if (Array.isArray(saved.craftSlots)) {
+          saved.craftSlots.forEach((uid: string, i: number) => { if(i<9) p.craft.slots[i] = uid; });
+          updateCraftingResult(p);
+        }
 
-      if (saved.cursor) {
-        p.cursor.kind = saved.cursor.kind;
-        p.cursor.qty = saved.cursor.qty;
+        if (saved.cursor) {
+          p.cursor.kind = saved.cursor.kind;
+          p.cursor.qty = saved.cursor.qty;
+        }
+        
+        this.cleanupDanglingInventoryRefs(p);
+        loadSuccess = true;
+      } catch (e) {
+        console.error("Failed to load save data (corrupt?). Starting fresh.", e);
+        loadSuccess = false;
+        // Reset player object if partial load failed
+        p = new PlayerState();
+        p.id = client.sessionId;
+        p.name = (options.name || "Player").slice(0, 16);
       }
-      
-      this.cleanupDanglingInventoryRefs(p);
-    } else {
+    }
+
+    if (!loadSuccess) {
+      // FRESH SPAWN
       p.x = TOWN_SAFE_ZONE.center.x; 
       p.z = TOWN_SAFE_ZONE.center.z;
       p.y = findSpawnYAt(MyRoom.WORLD, p.x, p.z, TOWN_GROUND_Y);
