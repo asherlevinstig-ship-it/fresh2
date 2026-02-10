@@ -3,17 +3,13 @@
 // ------------------------------------------------------------
 // FULL REWRITE - PRODUCTION READY - NO OMITS
 //
-// Features Included:
-// - World Persistence & Autosave (JSON)
-// - "Town of Beginnings" Artistic Stamp (Safe Zone & Spawn)
-// - Procedural Terrain Generation (Biomes, Ores, Trees)
-// - Optimized Initial Patch (Radius 48 for fast loading)
-// - Loading Screen Signal (spawn:teleport delay)
-// - Inventory (Move, Split, Stack, Consume, Equip Sync)
-// - Crafting System (Legacy craft:commit)
-// - Anti-Cheat (Reach, Rate Limits, Area Protection)
-// - Stamina/Sprint/Health Systems
-// - NEW: Chat Command System (/find, /goto, /biome)
+// INCLUDES:
+// - Minecraft-Style Inventory (Cursor Stack + Left/Right Click)
+// - Reactive Crafting (3x3 Grid, Server-Side)
+// - Full Block ID Mappings (Restored from your working version)
+// - World Persistence & Autosave
+// - Town of Beginnings Safe Zone
+// - Chat Commands (/find, /goto, /biome)
 // ============================================================
 
 import { Room, Client } from "colyseus";
@@ -55,22 +51,24 @@ type MoveMsg = {
   z: number;
   yaw?: number;
   pitch?: number;
-  viewMode?: number;
 };
 
-type ChatMsg = { text: string }; // NEW: Chat Command Support
+type ChatMsg = { text: string };
 
 type SprintMsg = { on: boolean };
 type SwingMsg = { t?: number };
 type HotbarSetMsg = { index: number };
 
-type InvMoveMsg = { from: string; to: string };
-type InvSplitMsg = { slot: string };
+// NEW: Minecraft-style interaction
+type InvClickMsg = {
+  location: "inv" | "craft" | "result";
+  index: number;
+  button: number; // 0 = Left, 1 = Right
+};
 
 type InvConsumeHotbarMsg = { qty?: number };
 type InvAddMsg = { kind: string; qty?: number };
-
-type CraftCommitMsg = { srcIndices: number[] };
+type InvCloseMsg = {};
 
 type BlockBreakMsg = { x: number; y: number; z: number; src?: string };
 type BlockPlaceMsg = { x: number; y: number; z: number; kind: string; src?: string };
@@ -131,7 +129,6 @@ function writeJsonAtomic(filePath: string, data: any) {
   }
 }
 
-/** Finds a safe spawn Y (highest block + 2) */
 function findSpawnYAt(world: WorldStore, x: number, z: number, preferredY: number) {
   const ix = Math.floor(x);
   const iz = Math.floor(z);
@@ -160,22 +157,17 @@ function patchCount(patch: any): number | null {
 }
 
 // ------------------------------------------------------------
-// Biome Seeker (The Beacon Logic)
+// Biome Seeker
 // ------------------------------------------------------------
 
 function findNearestBiome(startX: number, startZ: number, target: string): { x: number, z: number, biome: string } | null {
-  // Spiral search
-  // Step size 64 to cover ground fast
   const step = 64;
-  const maxRadius = 5000; // Search up to 5k blocks away
+  const maxRadius = 5000;
 
-  // Check center first
   const initial = sampleBiome(startX, startZ);
   if (initial.biome === target) return { x: startX, z: startZ, biome: initial.biome };
 
   for (let r = step; r <= maxRadius; r += step) {
-    // Check points in a circle/box at radius r
-    // 8 points is usually enough for broad search, but let's do 16
     const points = 16;
     for (let i = 0; i < points; i++) {
       const angle = (Math.PI * 2 * i) / points;
@@ -183,7 +175,6 @@ function findNearestBiome(startX: number, startZ: number, target: string): { x: 
       const z = startZ + Math.sin(angle) * r;
       const sample = sampleBiome(x, z);
       
-      // Fuzzy match target (e.g. "des" matches "desert")
       if (sample.biome.includes(target.toLowerCase())) {
         return { x, z, biome: sample.biome };
       }
@@ -197,26 +188,6 @@ function findNearestBiome(startX: number, startZ: number, target: string): { x: 
 // ------------------------------------------------------------
 
 type EquipKey = "head" | "chest" | "legs" | "feet" | "tool" | "offhand";
-type SlotRef = { kind: "inv"; index: number } | { kind: "eq"; key: EquipKey };
-
-function parseSlotRef(s: any): SlotRef | null {
-  if (typeof s !== "string") return null;
-
-  if (s.startsWith("inv:")) {
-    const idx = Number(s.slice(4));
-    if (!Number.isInteger(idx) || idx < 0) return null;
-    return { kind: "inv", index: idx };
-  }
-
-  if (s.startsWith("eq:")) {
-    const key = s.slice(3) as EquipKey;
-    const allowed = new Set<EquipKey>(["head", "chest", "legs", "feet", "tool", "offhand"]);
-    if (!allowed.has(key)) return null;
-    return { kind: "eq", key };
-  }
-
-  return null;
-}
 
 function getTotalSlots(p: PlayerState) {
   const cols = isFiniteNum(p.inventory?.cols) ? p.inventory.cols : 9;
@@ -228,32 +199,11 @@ function ensureSlotsLength(p: PlayerState) {
   const total = getTotalSlots(p);
   while (p.inventory.slots.length < total) p.inventory.slots.push("");
   while (p.inventory.slots.length > total) p.inventory.slots.pop();
+  
+  // Ensure crafting slots exist
+  while (p.craft.slots.length < 9) p.craft.slots.push("");
 }
 
-function getSlotUid(p: PlayerState, slot: SlotRef): string {
-  if (slot.kind === "inv") {
-    ensureSlotsLength(p);
-    const total = getTotalSlots(p);
-    if (slot.index < 0 || slot.index >= total) return "";
-    return String(p.inventory.slots[slot.index] || "");
-  } else {
-    return String((p.equip as any)[slot.key] || "");
-  }
-}
-
-function setSlotUid(p: PlayerState, slot: SlotRef, uid: string) {
-  uid = uid ? String(uid) : "";
-  if (slot.kind === "inv") {
-    ensureSlotsLength(p);
-    const total = getTotalSlots(p);
-    if (slot.index < 0 || slot.index >= total) return;
-    p.inventory.slots[slot.index] = uid;
-  } else {
-    (p.equip as any)[slot.key] = uid;
-  }
-}
-
-// Item Type Checks
 function isEquipSlotCompatible(slotKey: EquipKey, itemKind: string) {
   if (!itemKind) return true;
   const k = itemKind.toLowerCase();
@@ -285,7 +235,6 @@ function normalizeHotbarIndex(i: any) {
   return clamp(Math.floor(n), 0, 8);
 }
 
-// Sync held tool to hotbar selection
 function syncEquipToolToHotbar(p: PlayerState) {
   ensureSlotsLength(p);
   const idx = normalizeHotbarIndex(p.hotbarIndex);
@@ -298,79 +247,28 @@ function syncEquipToolToHotbar(p: PlayerState) {
   p.equip.tool = uid;
 }
 
-// Inventory Logic
 function makeUid(sessionId: string, tag: string) {
   return `${sessionId}:${tag}:${nowMs()}:${Math.floor(Math.random() * 1e9)}`;
 }
 
-function firstEmptyInvIndex(p: PlayerState) {
-  ensureSlotsLength(p);
-  for (let i = 0; i < p.inventory.slots.length; i++) {
-    if (!String(p.inventory.slots[i] || "")) return i;
+function createItem(p: PlayerState, kind: string, qty: number) {
+  const uid = makeUid(p.id, "created");
+  const it = new ItemState();
+  it.uid = uid;
+  it.kind = kind;
+  it.qty = qty;
+  if (kind.startsWith("tool:")) {
+    it.durability = 100;
+    it.maxDurability = 100;
   }
-  return -1;
+  p.items.set(uid, it);
+  return uid;
 }
 
-function findStackableUid(p: PlayerState, kind: string) {
-  ensureSlotsLength(p);
-  const maxStack = maxStackForKind(kind);
-  if (maxStack <= 1) return "";
-
-  for (let i = 0; i < p.inventory.slots.length; i++) {
-    const uid = String(p.inventory.slots[i] || "");
-    if (!uid) continue;
-    const it = p.items.get(uid);
-    if (!it) continue;
-    if (String(it.kind || "") !== kind) continue;
-    const qty = isFiniteNum(it.qty) ? it.qty : 0;
-    if (qty < maxStack) return uid;
+function deleteItem(p: PlayerState, uid: string) {
+  if (uid && p.items.has(uid)) {
+    p.items.delete(uid);
   }
-  return "";
-}
-
-function addKindToInventory(p: PlayerState, kind: string, qty: number) {
-  ensureSlotsLength(p);
-  if (!kind || qty <= 0) return 0;
-
-  const maxStack = maxStackForKind(kind);
-  let remaining = qty;
-
-  // 1) Stack into existing
-  while (remaining > 0) {
-    const stackUid = findStackableUid(p, kind);
-    if (!stackUid) break;
-    const it = p.items.get(stackUid);
-    if (!it) break;
-
-    const cur = isFiniteNum(it.qty) ? it.qty : 0;
-    const space = Math.max(0, maxStack - cur);
-    if (space <= 0) break;
-    const add = Math.min(space, remaining);
-    it.qty = cur + add;
-    remaining -= add;
-  }
-
-  // 2) New stacks
-  while (remaining > 0) {
-    const idx = firstEmptyInvIndex(p);
-    if (idx === -1) break;
-    const add = Math.min(maxStack, remaining);
-    remaining -= add;
-
-    const uid = makeUid(p.id || "player", "loot");
-    const it2 = new ItemState();
-    it2.uid = uid;
-    it2.kind = kind;
-    it2.qty = add;
-    if (String(kind).startsWith("tool:")) {
-      it2.durability = 100;
-      it2.maxDurability = 100;
-    }
-
-    p.items.set(uid, it2);
-    p.inventory.slots[idx] = uid;
-  }
-  return qty - remaining;
 }
 
 function consumeFromHotbar(p: PlayerState, qty: number) {
@@ -396,8 +294,72 @@ function consumeFromHotbar(p: PlayerState, qty: number) {
   return take;
 }
 
+function addKindToInventory(p: PlayerState, kind: string, qty: number) {
+  ensureSlotsLength(p);
+  if (!kind || qty <= 0) return 0;
+
+  const maxStack = maxStackForKind(kind);
+  let remaining = qty;
+
+  // 1. Stack into existing
+  for (let i = 0; i < p.inventory.slots.length; i++) {
+    if (remaining <= 0) break;
+    const uid = p.inventory.slots[i];
+    if (!uid) continue;
+    const it = p.items.get(uid);
+    if (!it || it.kind !== kind) continue;
+    
+    const space = maxStack - it.qty;
+    if (space > 0) {
+      const add = Math.min(space, remaining);
+      it.qty += add;
+      remaining -= add;
+    }
+  }
+
+  // 2. Add to empty slots
+  while (remaining > 0) {
+    let emptyIdx = -1;
+    for (let i = 0; i < p.inventory.slots.length; i++) {
+      if (!p.inventory.slots[i]) {
+        emptyIdx = i;
+        break;
+      }
+    }
+    if (emptyIdx === -1) break; // Full
+
+    const add = Math.min(maxStack, remaining);
+    const newUid = createItem(p, kind, add);
+    p.inventory.slots[emptyIdx] = newUid;
+    remaining -= add;
+  }
+  
+  return qty - remaining;
+}
+
+// Update Crafting Result based on Grid
+function updateCraftingResult(p: PlayerState) {
+  const kinds = p.craft.slots.map((uid) => {
+    if (!uid) return "";
+    const it = p.items.get(uid);
+    return it ? it.kind : "";
+  });
+
+  const match = CraftingSystem.findMatch(kinds);
+
+  if (match) {
+    p.craft.resultKind = match.result.kind;
+    p.craft.resultQty = match.result.qty;
+    p.craft.recipeId = match.id || "unknown";
+  } else {
+    p.craft.resultKind = "";
+    p.craft.resultQty = 0;
+    p.craft.recipeId = "";
+  }
+}
+
 // ------------------------------------------------------------
-// Block Mapping
+// Block Mapping (RESTORED FROM YOUR VERSION)
 // ------------------------------------------------------------
 
 function kindToBlockId(kind: string): BlockId {
@@ -506,7 +468,6 @@ function proceduralTerrainGenerator(x: number, y: number, z: number): number {
 
 export class MyRoom extends Room {
   declare state: MyRoomState;
-
   public maxClients = 16;
 
   private static WORLD = new WorldStore({ 
@@ -516,7 +477,6 @@ export class MyRoom extends Room {
   });
 
   private static WORLD_BOOTSTRAPPED = false;
-
   private static FORCE_TOWN_STAMP = String(process.env.FORCE_TOWN_STAMP || "false").toLowerCase() === "true";
   private static FORCE_TOWN_SPAWN = String(process.env.FORCE_TOWN_SPAWN || "true").toLowerCase() === "true";
   private static ROOM_AUTO_DISPOSE = String(process.env.ROOM_AUTO_DISPOSE || "false").toLowerCase() === "true";
@@ -524,15 +484,14 @@ export class MyRoom extends Room {
   private static INITIAL_PATCH_LIMIT = clamp(Math.floor(Number(process.env.INITIAL_PATCH_LIMIT ?? 200000)), 10000, 2000000);
   private static PATCH_REQ_DEFAULT_LIMIT = clamp(Math.floor(Number(process.env.PATCH_REQ_DEFAULT_LIMIT ?? 30000)), 1000, 2000000);
   private static PATCH_REQ_MAX_LIMIT = clamp(Math.floor(Number(process.env.PATCH_REQ_MAX_LIMIT ?? 200000)), 5000, 4000000);
-  
   private static SPAWN_TELEPORT_DELAY_MS = clamp(Math.floor(Number(process.env.SPAWN_TELEPORT_DELAY_MS ?? 1200)), 0, 5000);
 
   private worldPath = path.join(process.cwd(), "world_data.json");
   private playersPath = path.join(process.cwd(), "players.json");
-
   private lastBlockOpAt = new Map<string, number>();
 
-  // Persistence Helpers
+  // --- Persistence ---
+
   private loadPlayerData(distinctId: string) {
     const data = readJsonFileSafe(this.playersPath);
     if (!data) return null;
@@ -547,14 +506,13 @@ export class MyRoom extends Room {
     const itemsArray = Array.from(p.items.entries()).map((entry: any) => {
       const [uid, item] = entry;
       return {
-        uid,
-        kind: item.kind,
-        qty: item.qty,
-        durability: item.durability,
-        maxDurability: item.maxDurability,
-        meta: item.meta,
+        uid, kind: item.kind, qty: item.qty, durability: item.durability,
+        maxDurability: item.maxDurability, meta: item.meta,
       };
     });
+
+    const craftSlots = Array.from(p.craft.slots);
+    const cursor = { kind: p.cursor.kind, qty: p.cursor.qty };
 
     const saveData = {
       x: p.x, y: p.y, z: p.z,
@@ -562,16 +520,15 @@ export class MyRoom extends Room {
       hp: p.hp, stamina: p.stamina,
       hotbarIndex: p.hotbarIndex,
       inventory: Array.from(p.inventory.slots),
+      craftSlots: craftSlots,
+      cursor: cursor,
       items: itemsArray,
       equip: p.equip.toJSON(),
     };
 
     allData[distinctId] = saveData;
-    try {
-      writeJsonAtomic(this.playersPath, allData);
-    } catch (e) {
-      console.error(`[PERSIST] Failed to save data for ${distinctId}:`, e);
-    }
+    try { writeJsonAtomic(this.playersPath, allData); } 
+    catch (e) { console.error(`[PERSIST] Failed to save data for ${distinctId}:`, e); }
   }
 
   private cleanupDanglingInventoryRefs(p: PlayerState) {
@@ -581,79 +538,50 @@ export class MyRoom extends Room {
       if (!uid) continue;
       if (!p.items.get(uid)) p.inventory.slots[i] = "";
     }
-    (["tool", "head", "chest", "legs", "feet", "offhand"] as EquipKey[]).forEach((k) => {
-      const uid = String((p.equip as any)[k] || "");
-      if (uid && !p.items.get(uid)) (p.equip as any)[k] = "";
-    });
   }
 
-  // --------------------------------------------------------
-  // Room Lifecycle & Logic
-  // --------------------------------------------------------
+  // --- Lifecycle ---
 
   public onCreate(options: any) {
     this.setState(new MyRoomState());
-    console.log("MyRoom created:", this.roomId, options);
+    console.log("MyRoom created:", this.roomId);
     this.autoDispose = MyRoom.ROOM_AUTO_DISPOSE;
 
-    // --- Bootstrap World (Once) ---
+    // Bootstrap
     if (!MyRoom.WORLD_BOOTSTRAPPED) {
       MyRoom.WORLD_BOOTSTRAPPED = true;
-
       if (fs.existsSync(this.worldPath)) {
-        console.log(`[PERSIST] Loading world from ${this.worldPath}...`);
         try {
-          const loaded = MyRoom.WORLD.loadFromFileSync(this.worldPath);
-          if (loaded) console.log(`[PERSIST] Loaded ${MyRoom.WORLD.editsCount()} edits.`);
-          else console.log(`[PERSIST] File existed but failed to load.`);
+          MyRoom.WORLD.loadFromFileSync(this.worldPath);
+          console.log(`[PERSIST] Loaded ${MyRoom.WORLD.editsCount()} edits.`);
         } catch (e) { console.error(`[PERSIST] Error loading world:`, e); }
-      } else {
-        console.log(`[PERSIST] No save file found. Starting fresh.`);
       }
-
       try {
-        const res = stampTownOfBeginnings(MyRoom.WORLD, {
-          verbose: true,
-          force: MyRoom.FORCE_TOWN_STAMP,
-        });
-        console.log("[TOWN] Stamp result:", res);
+        stampTownOfBeginnings(MyRoom.WORLD, { verbose: true, force: MyRoom.FORCE_TOWN_STAMP });
       } catch (e) { console.error("[TOWN] Stamp failed:", e); }
-
       MyRoom.WORLD.configureAutosave({ path: this.worldPath, minIntervalMs: 30000 });
-      console.log(`[CFG] INITIAL_PATCH_LIMIT=${MyRoom.INITIAL_PATCH_LIMIT} SPAWN_DELAY=${MyRoom.SPAWN_TELEPORT_DELAY_MS}`);
     }
 
-    // --- Simulation Loop ---
-    const TICK_MS = 50; // 20 Hz
-    const STAMINA_DRAIN_PER_SEC = 18;
-    const STAMINA_REGEN_PER_SEC = 12;
-    const SWING_COST = 8;
-    const SWING_FLAG_MS = 250;
-
-    const lastSwingAt = new Map<string, number>();
+    // Loop
+    const TICK_MS = 50;
+    const STAMINA_DRAIN = 18;
+    const STAMINA_REGEN = 12;
 
     this.setSimulationInterval(() => {
       const dt = TICK_MS / 1000;
-      this.state.players.forEach((p: PlayerState, sid: string) => {
+      this.state.players.forEach((p, sid) => {
         ensureSlotsLength(p);
-        p.maxHp = clamp(isFiniteNum(p.maxHp) ? p.maxHp : 20, 1, 200);
-        p.maxStamina = clamp(isFiniteNum(p.maxStamina) ? p.maxStamina : 100, 1, 1000);
-        p.hp = clamp(isFiniteNum(p.hp) ? p.hp : p.maxHp, 0, p.maxHp);
-        p.stamina = clamp(isFiniteNum(p.stamina) ? p.stamina : p.maxStamina, 0, p.maxStamina);
-
+        // Regen
         if (p.sprinting) {
-          const drain = STAMINA_DRAIN_PER_SEC * dt;
-          p.stamina = clamp(p.stamina - drain, 0, p.maxStamina);
-          if (p.stamina <= 0.001) p.sprinting = false;
+          p.stamina = clamp(p.stamina - STAMINA_DRAIN * dt, 0, 100);
+          if (p.stamina <= 0.01) p.sprinting = false;
         } else {
-          const regen = STAMINA_REGEN_PER_SEC * dt;
-          p.stamina = clamp(p.stamina + regen, 0, p.maxStamina);
+          p.stamina = clamp(p.stamina + STAMINA_REGEN * dt, 0, 100);
         }
-
-        const t0 = lastSwingAt.get(sid) || 0;
-        if (p.swinging && nowMs() - t0 > SWING_FLAG_MS) p.swinging = false;
-
-        p.hotbarIndex = normalizeHotbarIndex(p.hotbarIndex);
+        
+        // Swinging flag reset
+        if (p.swinging) { /* handled by timeout in onMessage */ }
+        
         syncEquipToolToHotbar(p);
       });
       MyRoom.WORLD.maybeAutosave();
@@ -661,503 +589,381 @@ export class MyRoom extends Room {
 
     // --- Message Handlers ---
 
-    // Chat Command System (/find, /tp, /biome)
-    this.onMessage("chat", (client: Client, msg: ChatMsg) => {
+    this.onMessage("chat", (client, msg: ChatMsg) => {
       const p = this.state.players.get(client.sessionId);
       if (!p || !msg?.text) return;
-
       const text = msg.text.trim();
-      if (!text.startsWith("/")) return; // Only process commands
-
-      const parts = text.slice(1).split(" ");
-      const cmd = parts[0].toLowerCase();
-      const args = parts.slice(1);
-
-      // /tp x y z
-      if (cmd === "tp" && args.length === 3) {
-        const x = Number(args[0]);
-        const y = Number(args[1]);
-        const z = Number(args[2]);
-        if (isFinite(x) && isFinite(y) && isFinite(z)) {
-          p.x = x; p.y = y; p.z = z;
-          client.send("spawn:teleport", { x, y, z });
-          client.send("chat:sys", { text: `Teleported to ${x}, ${y}, ${z}` });
-          
-          // Force world refresh
-          const patch = MyRoom.WORLD.encodePatchAround({ x, y, z }, 48, { limit: MyRoom.INITIAL_PATCH_LIMIT });
-          client.send("world:patch", patch);
-        }
-        return;
-      }
-
-      // /biome (Current Biome info)
-      if (cmd === "biome") {
-        const info = sampleBiome(p.x, p.z);
-        client.send("chat:sys", { text: `Current Biome: [${info.biome.toUpperCase()}] Temp: ${info.temperature.toFixed(2)}` });
-        return;
-      }
-
-      // /find [biome] (Search)
-      if (cmd === "find" && args.length > 0) {
-        const target = args[0].toLowerCase();
-        const found = findNearestBiome(p.x, p.z, target);
-        if (found) {
-          const dist = Math.floor(dist3(p.x, 0, p.z, found.x, 0, found.z));
-          client.send("chat:sys", { text: `Found ${found.biome.toUpperCase()} at (${Math.floor(found.x)}, ${Math.floor(found.z)}) - ${dist} blocks away.` });
-        } else {
-          client.send("chat:sys", { text: `Could not find biome containing '${target}' nearby.` });
-        }
-        return;
-      }
-
-      // /goto [biome] (Teleport to Biome)
-      if (cmd === "goto" && args.length > 0) {
-        const target = args[0].toLowerCase();
-        const found = findNearestBiome(p.x, p.z, target);
-        if (found) {
-          const y = findSpawnYAt(MyRoom.WORLD, found.x, found.z, 20); // Search for ground
-          p.x = found.x; p.y = y; p.z = found.z;
-          client.send("spawn:teleport", { x: found.x, y, z: found.z });
-          client.send("chat:sys", { text: `Teleported to ${found.biome.toUpperCase()}!` });
-          
-          const patch = MyRoom.WORLD.encodePatchAround({ x: found.x, y, z: found.z }, 48, { limit: MyRoom.INITIAL_PATCH_LIMIT });
-          client.send("world:patch", patch);
-        } else {
-          client.send("chat:sys", { text: `Could not find '${target}' to teleport to.` });
-        }
-        return;
-      }
-    });
-
-    this.onMessage("move", (client: Client, msg: MoveMsg) => {
-      const p = this.state.players.get(client.sessionId);
-      if (!p) return;
-      if (!isFiniteNum(msg?.x) || !isFiniteNum(msg?.y) || !isFiniteNum(msg?.z)) return;
-      p.x = clamp(msg.x, -100000, 100000);
-      p.y = clamp(msg.y, -100000, 100000);
-      p.z = clamp(msg.z, -100000, 100000);
-      if (isFiniteNum(msg.yaw)) p.yaw = msg.yaw;
-      if (isFiniteNum(msg.pitch)) p.pitch = clamp(msg.pitch, -Math.PI / 2, Math.PI / 2);
-    });
-
-    this.onMessage("sprint", (client: Client, msg: SprintMsg) => {
-      const p = this.state.players.get(client.sessionId);
-      if (!p) return;
-      if (!!msg?.on) {
-        if (p.stamina > 2) p.sprinting = true;
+      if (text.startsWith("/")) {
+        this.handleCommand(client, p, text);
       } else {
-        p.sprinting = false;
+        this.broadcast("chat:sys", { text: `<${p.name}> ${text}` });
       }
     });
 
-    this.onMessage("swing", (client: Client, _msg: SwingMsg) => {
+    this.onMessage("move", (client, msg: MoveMsg) => {
       const p = this.state.players.get(client.sessionId);
-      if (!p) return;
-      if (p.stamina < SWING_COST) return;
-      p.stamina = clamp(p.stamina - SWING_COST, 0, p.maxStamina);
-      p.swinging = true;
-      lastSwingAt.set(client.sessionId, nowMs());
+      if (p) {
+        if (isFiniteNum(msg.x)) p.x = msg.x;
+        if (isFiniteNum(msg.y)) p.y = msg.y;
+        if (isFiniteNum(msg.z)) p.z = msg.z;
+        if (isFiniteNum(msg.yaw)) p.yaw = msg.yaw;
+        if (isFiniteNum(msg.pitch)) p.pitch = msg.pitch;
+      }
     });
 
-    this.onMessage("hotbar:set", (client: Client, msg: HotbarSetMsg) => {
+    this.onMessage("sprint", (client, msg: SprintMsg) => {
       const p = this.state.players.get(client.sessionId);
-      if (!p) return;
-      p.hotbarIndex = normalizeHotbarIndex(msg?.index);
-      syncEquipToolToHotbar(p);
+      if (p) p.sprinting = !!msg.on;
     });
 
-    // Inventory
-    this.onMessage("inv:consumeHotbar", (client: Client, msg: InvConsumeHotbarMsg) => {
+    this.onMessage("swing", (client) => {
       const p = this.state.players.get(client.sessionId);
-      if (!p) return;
-      const qtyReq = clamp(Math.floor(Number(msg?.qty ?? 1)), 1, 64);
-      const took = consumeFromHotbar(p, qtyReq);
-      if (took > 0) syncEquipToolToHotbar(p);
+      if (p && p.stamina > 5) {
+        p.stamina -= 5;
+        p.swinging = true;
+        this.clock.setTimeout(() => { if (p) p.swinging = false; }, 250);
+      }
     });
 
-    this.onMessage("inv:add", (client: Client, msg: InvAddMsg) => {
+    this.onMessage("hotbar:set", (client, msg: HotbarSetMsg) => {
       const p = this.state.players.get(client.sessionId);
-      if (!p) return;
-      const kind = String(msg?.kind || "");
-      if (!isBlockKind(kind)) return;
-      addKindToInventory(p, kind, clamp(Math.floor(Number(msg?.qty ?? 1)), 1, 64));
-      syncEquipToolToHotbar(p);
+      if (p) {
+        p.hotbarIndex = normalizeHotbarIndex(msg?.index);
+        syncEquipToolToHotbar(p);
+      }
     });
 
-    this.onMessage("inv:move", (client: Client, msg: InvMoveMsg) => {
+    // --- NEW INVENTORY SYSTEM (Cursor) ---
+    
+    this.onMessage("inv:click", (client, msg: InvClickMsg) => {
       const p = this.state.players.get(client.sessionId);
       if (!p) return;
-      const from = parseSlotRef(msg?.from);
-      const to = parseSlotRef(msg?.to);
-      if (!from || !to) return;
+
+      const loc = msg.location;
+      const idx = msg.index;
+      const isRight = msg.button === 1;
 
       ensureSlotsLength(p);
-      const total = getTotalSlots(p);
-      if (from.kind === "inv" && (from.index < 0 || from.index >= total)) return;
-      if (to.kind === "inv" && (to.index < 0 || to.index >= total)) return;
 
-      const fromUid = getSlotUid(p, from);
-      const toUid = getSlotUid(p, to);
-      if (!fromUid && !toUid) return;
-      if (fromUid === toUid && fromUid) return;
+      // --- RESULT SLOT (Crafting) ---
+      if (loc === "result") {
+        if (!p.craft.resultKind) return;
+        
+        if (p.cursor.kind && p.cursor.kind !== p.craft.resultKind) return;
+        const max = maxStackForKind(p.craft.resultKind);
+        if (p.cursor.kind && p.cursor.qty + p.craft.resultQty > max) return;
 
-      const fromItem = fromUid ? p.items.get(fromUid) : null;
-      const toItem = toUid ? p.items.get(toUid) : null;
+        // Add to cursor
+        if (!p.cursor.kind) {
+          p.cursor.kind = p.craft.resultKind;
+          p.cursor.qty = p.craft.resultQty;
+        } else {
+          p.cursor.qty += p.craft.resultQty;
+        }
 
-      if (to.kind === "eq") {
-        if (fromItem && !isEquipSlotCompatible(to.key, String(fromItem.kind || ""))) return;
-        if (toItem && !isEquipSlotCompatible(to.key, String(toItem.kind || ""))) return;
-      }
-
-      if (!toUid) {
-        setSlotUid(p, to, fromUid);
-        setSlotUid(p, from, "");
-        syncEquipToolToHotbar(p);
-        return;
-      }
-      if (!fromUid) {
-        setSlotUid(p, from, toUid);
-        setSlotUid(p, to, "");
-        syncEquipToolToHotbar(p);
-        return;
-      }
-
-      if (fromItem && toItem && String(fromItem.kind) === String(toItem.kind)) {
-        const maxStack = maxStackForKind(String(toItem.kind));
-        if (maxStack > 1) {
-          const toQty = isFiniteNum(toItem.qty) ? toItem.qty : 0;
-          const fromQty = isFiniteNum(fromItem.qty) ? fromItem.qty : 0;
-          const space = maxStack - toQty;
-          if (space > 0) {
-            const moveQty = Math.min(space, fromQty);
-            toItem.qty = toQty + moveQty;
-            fromItem.qty = fromQty - moveQty;
-            if ((fromItem.qty || 0) <= 0) {
-              setSlotUid(p, from, "");
-              p.items.delete(fromUid);
+        // Consume ingredients
+        for (let i = 0; i < 9; i++) {
+          const uid = p.craft.slots[i];
+          if (uid) {
+            const it = p.items.get(uid);
+            if (it) {
+              it.qty--;
+              if (it.qty <= 0) {
+                deleteItem(p, uid);
+                p.craft.slots[i] = "";
+              }
             }
-            syncEquipToolToHotbar(p);
-            return;
           }
         }
-      }
-
-      setSlotUid(p, to, fromUid);
-      setSlotUid(p, from, toUid);
-      syncEquipToolToHotbar(p);
-    });
-
-    this.onMessage("inv:split", (client: Client, msg: InvSplitMsg) => {
-      const p = this.state.players.get(client.sessionId);
-      if (!p) return;
-      const slot = parseSlotRef(msg?.slot);
-      if (!slot || slot.kind !== "inv") return;
-      ensureSlotsLength(p);
-      const uid = getSlotUid(p, slot);
-      if (!uid) return;
-      const it = p.items.get(uid);
-      if (!it) return;
-      const qty = isFiniteNum(it.qty) ? it.qty : 0;
-      if (qty <= 1) return;
-      const emptyIdx = firstEmptyInvIndex(p);
-      if (emptyIdx === -1) return;
-
-      const take = Math.floor(qty / 2);
-      const remain = qty - take;
-      it.qty = remain;
-
-      const newUid = makeUid(client.sessionId, "split");
-      const it2 = new ItemState();
-      it2.uid = newUid;
-      it2.kind = String(it.kind || "");
-      it2.qty = take;
-      it2.durability = isFiniteNum(it.durability) ? it.durability : 0;
-      it2.maxDurability = isFiniteNum(it.maxDurability) ? it.maxDurability : 0;
-      it2.meta = String(it.meta || "");
-      p.items.set(newUid, it2);
-      p.inventory.slots[emptyIdx] = newUid;
-      syncEquipToolToHotbar(p);
-    });
-
-    // Crafting
-    this.onMessage("craft:commit", (client: Client, msg: CraftCommitMsg) => {
-      const p = this.state.players.get(client.sessionId);
-      if (!p) return;
-      const indices = msg?.srcIndices;
-      if (!Array.isArray(indices) || indices.length !== 9) {
-        client.send("craft:reject", { reason: "invalid_indices" });
+        updateCraftingResult(p);
+        syncEquipToolToHotbar(p);
         return;
       }
-      
-      const seen = new Set<number>();
-      for (const idx of indices) {
-        if (idx === -1) continue;
-        if (typeof idx !== "number" || !Number.isInteger(idx)) return;
-        if (seen.has(idx)) return;
-        seen.add(idx);
-      }
 
-      const kinds: string[] = [];
-      const validSlotIndices: number[] = [];
-      ensureSlotsLength(p);
+      // --- NORMAL SLOTS ---
+      let slotUid = "";
+      if (loc === "inv") slotUid = p.inventory.slots[idx] || "";
+      else if (loc === "craft") slotUid = p.craft.slots[idx] || "";
+      else return;
 
-      for (let i = 0; i < 9; i++) {
-        const slotIdx = indices[i];
-        if (slotIdx === -1) { kinds.push(""); continue; }
-        if (slotIdx < 0 || slotIdx >= p.inventory.slots.length) return;
-        const uid = p.inventory.slots[slotIdx];
-        const item = uid ? p.items.get(uid) : null;
-        if (!uid || !item) { client.send("craft:reject", { reason: "slot_empty" }); return; }
-        kinds.push(item.kind);
-        validSlotIndices.push(slotIdx);
-      }
+      const slotItem = slotUid ? p.items.get(slotUid) : null;
+      const cursorHasItem = !!p.cursor.kind;
+      const slotHasItem = !!slotItem;
 
-      const match = CraftingSystem.findMatch(kinds);
-      if (!match) { client.send("craft:reject", { reason: "no_match" }); return; }
-
-      for (const slotIdx of validSlotIndices) {
-        const uid = p.inventory.slots[slotIdx];
-        const it = p.items.get(uid);
-        if (it) {
-          it.qty -= 1;
-          if (it.qty <= 0) {
-            p.inventory.slots[slotIdx] = "";
-            p.items.delete(uid);
+      if (!isRight) { // Left Click
+        if (cursorHasItem && slotHasItem) {
+          if (p.cursor.kind === slotItem.kind) {
+            // Stack
+            const max = maxStackForKind(slotItem.kind);
+            const space = max - slotItem.qty;
+            if (space > 0) {
+              const move = Math.min(space, p.cursor.qty);
+              slotItem.qty += move;
+              p.cursor.qty -= move;
+              if (p.cursor.qty <= 0) { p.cursor.kind = ""; p.cursor.qty = 0; }
+            }
+          } else {
+            // Swap
+            const newUid = createItem(p, p.cursor.kind, p.cursor.qty);
+            p.cursor.kind = slotItem.kind;
+            p.cursor.qty = slotItem.qty;
+            deleteItem(p, slotUid);
+            if (loc === "inv") p.inventory.slots[idx] = newUid;
+            else p.craft.slots[idx] = newUid;
+          }
+        } else if (cursorHasItem && !slotHasItem) {
+          // Place
+          const newUid = createItem(p, p.cursor.kind, p.cursor.qty);
+          if (loc === "inv") p.inventory.slots[idx] = newUid;
+          else p.craft.slots[idx] = newUid;
+          p.cursor.kind = ""; p.cursor.qty = 0;
+        } else if (!cursorHasItem && slotHasItem) {
+          // Pickup
+          p.cursor.kind = slotItem.kind;
+          p.cursor.qty = slotItem.qty;
+          deleteItem(p, slotUid);
+          if (loc === "inv") p.inventory.slots[idx] = "";
+          else p.craft.slots[idx] = "";
+        }
+      } else { // Right Click
+        if (cursorHasItem && !slotHasItem) {
+          // Place One
+          const newUid = createItem(p, p.cursor.kind, 1);
+          if (loc === "inv") p.inventory.slots[idx] = newUid;
+          else p.craft.slots[idx] = newUid;
+          p.cursor.qty--;
+          if (p.cursor.qty <= 0) { p.cursor.kind = ""; p.cursor.qty = 0; }
+        } else if (cursorHasItem && slotHasItem) {
+          // Place One (Stack)
+          if (p.cursor.kind === slotItem.kind) {
+            const max = maxStackForKind(slotItem.kind);
+            if (slotItem.qty < max) {
+              slotItem.qty++;
+              p.cursor.qty--;
+              if (p.cursor.qty <= 0) { p.cursor.kind = ""; p.cursor.qty = 0; }
+            }
+          }
+        } else if (!cursorHasItem && slotHasItem) {
+          // Split Half
+          const take = Math.ceil(slotItem.qty / 2);
+          p.cursor.kind = slotItem.kind;
+          p.cursor.qty = take;
+          slotItem.qty -= take;
+          if (slotItem.qty <= 0) {
+            deleteItem(p, slotUid);
+            if (loc === "inv") p.inventory.slots[idx] = "";
+            else p.craft.slots[idx] = "";
           }
         }
       }
-      addKindToInventory(p, match.result.kind, match.result.qty);
+
+      if (loc === "craft") updateCraftingResult(p);
       syncEquipToolToHotbar(p);
-      client.send("craft:success", { item: match.result.kind });
     });
 
-    // World Ops
-    this.onMessage("world:patch:req", (client: Client, msg: WorldPatchReqMsg) => {
+    this.onMessage("inv:close", (client) => {
       const p = this.state.players.get(client.sessionId);
-      if (!p) return;
-      const cx = sanitizeInt(msg?.x, Math.floor(p.x));
-      const cy = sanitizeInt(msg?.y, Math.floor(p.y));
-      const cz = sanitizeInt(msg?.z, Math.floor(p.z));
-      const r = clamp(Math.floor(Number(msg?.r ?? 96)), 8, 512);
-      const limit = clamp(Math.floor(Number(msg?.limit ?? MyRoom.PATCH_REQ_DEFAULT_LIMIT)), 100, MyRoom.PATCH_REQ_MAX_LIMIT);
-      
-      const patch = MyRoom.WORLD.encodePatchAround({ x: cx, y: cy, z: cz }, r, { limit });
-      client.send("world:patch", patch);
+      if (p && p.cursor.kind) {
+        addKindToInventory(p, p.cursor.kind, p.cursor.qty);
+        p.cursor.kind = ""; p.cursor.qty = 0;
+      }
     });
 
-    // Anti-Cheat Constants
-    const BLOCK_REACH = 7.5;
-    const BLOCK_OP_COOLDOWN_MS = 90;
-    const MAX_COORD = 100000;
+    // --- Block Ops ---
 
-    const canOpNow = (sid: string) => {
-      const t = nowMs();
-      const last = this.lastBlockOpAt.get(sid) || 0;
-      if (t - last < BLOCK_OP_COOLDOWN_MS) return false;
-      this.lastBlockOpAt.set(sid, t);
-      return true;
-    };
-    
-    const withinWorld = (x: number, y: number, z: number) => 
-      x >= -MAX_COORD && x <= MAX_COORD && 
-      y >= -MAX_COORD && y <= MAX_COORD && 
-      z >= -MAX_COORD && z <= MAX_COORD;
-    
-    const reject = (client: Client, reason: string, extra?: any) => { 
-      client.send("block:reject", { reason, ...(extra || {}) }); 
-    };
-
-    this.onMessage("block:break", (client: Client, msg: BlockBreakMsg) => {
+    this.onMessage("block:break", (client, msg: BlockBreakMsg) => {
       const p = this.state.players.get(client.sessionId);
-      if (!p) return;
-      const src = String(msg?.src || "unknown");
-      
-      if (!canOpNow(client.sessionId)) { reject(client, "rate_limited", { op: "break", src }); return; }
-      if (!isValidBlockCoord(msg?.x) || !isValidBlockCoord(msg?.y) || !isValidBlockCoord(msg?.z)) return;
-      
-      const x = sanitizeInt(msg.x, 0), y = sanitizeInt(msg.y, 0), z = sanitizeInt(msg.z, 0);
-      
-      if (!withinWorld(x, y, z)) return;
-      if (inTownSafeZone(x, y, z)) { reject(client, "safe_zone", { op: "break", src }); return; }
-      
-      const d = dist3(p.x, p.y + 1.6, p.z, x + 0.5, y + 0.5, z + 0.5);
-      if (d > BLOCK_REACH) return;
+      if (!p || !this.canOpNow(client.sessionId)) return;
 
-      const prevId = MyRoom.WORLD.getBlock(x, y, z);
-      if (prevId === BLOCKS.AIR) return;
+      const { x, y, z } = msg;
+      if (!isFiniteNum(x) || !isFiniteNum(y) || !isFiniteNum(z)) return;
+
+      if (inTownSafeZone(x, y, z)) {
+        client.send("block:reject", { reason: "safe_zone" });
+        return;
+      }
+
+      if (dist3(p.x, p.y + 1.6, p.z, x + 0.5, y + 0.5, z + 0.5) > 8) return;
+
+      const oldId = MyRoom.WORLD.getBlock(x, y, z);
+      if (oldId === BLOCKS.AIR) return;
+
+      MyRoom.WORLD.setBlock(x, y, z, BLOCKS.AIR);
       
-      const { newId } = MyRoom.WORLD.applyBreak(x, y, z);
-      const kind = blockIdToKind(prevId);
+      const kind = blockIdToKind(oldId);
       if (kind) addKindToInventory(p, kind, 1);
       
-      this.broadcast("block:update", { x, y, z, id: newId });
+      this.broadcast("block:update", { x, y, z, id: BLOCKS.AIR });
     });
 
-    this.onMessage("block:place", (client: Client, msg: BlockPlaceMsg) => {
+    this.onMessage("block:place", (client, msg: BlockPlaceMsg) => {
       const p = this.state.players.get(client.sessionId);
-      if (!p) return;
-      const src = String(msg?.src || "unknown");
-      
-      if (!canOpNow(client.sessionId)) return;
-      const kind = String(msg?.kind || "");
-      if (!isBlockKind(kind)) return;
-      if (!isValidBlockCoord(msg?.x) || !isValidBlockCoord(msg?.y) || !isValidBlockCoord(msg?.z)) return;
-      
-      const x = sanitizeInt(msg.x, 0), y = sanitizeInt(msg.y, 0), z = sanitizeInt(msg.z, 0);
+      if (!p || !this.canOpNow(client.sessionId)) return;
 
-      if (!withinWorld(x, y, z)) return;
-      if (inTownSafeZone(x, y, z)) { reject(client, "safe_zone", { op: "place", src }); return; }
+      const { x, y, z, kind } = msg;
+      if (!kind || !kind.startsWith("block:")) return;
 
-      const d = dist3(p.x, p.y + 1.6, p.z, x + 0.5, y + 0.5, z + 0.5);
-      if (d > BLOCK_REACH) return;
-      
-      const existing = MyRoom.WORLD.getBlock(x, y, z);
-      if (existing !== BLOCKS.AIR) return;
-      
-      const blockId = kindToBlockId(kind);
-      if (blockId === BLOCKS.AIR) return;
-      
-      const took = consumeFromHotbar(p, 1);
-      if (took <= 0) return;
-      
-      const { newId } = MyRoom.WORLD.applyPlace(x, y, z, blockId);
-      this.broadcast("block:update", { x, y, z, id: newId });
+      if (inTownSafeZone(x, y, z)) {
+        client.send("block:reject", { reason: "safe_zone" });
+        return;
+      }
+
+      if (dist3(p.x, p.y + 1.6, p.z, x + 0.5, y + 0.5, z + 0.5) > 8) return;
+      if (MyRoom.WORLD.getBlock(x, y, z) !== BLOCKS.AIR) return;
+
+      const idx = normalizeHotbarIndex(p.hotbarIndex);
+      const uid = p.inventory.slots[idx];
+      const it = uid ? p.items.get(uid) : null;
+      if (!it || it.kind !== kind || it.qty <= 0) return;
+
+      it.qty--;
+      if (it.qty <= 0) {
+        deleteItem(p, uid);
+        p.inventory.slots[idx] = "";
+      }
+
+      const id = kindToBlockId(kind);
+      MyRoom.WORLD.setBlock(x, y, z, id);
+      this.broadcast("block:update", { x, y, z, id });
     });
 
-    this.onMessage("hello", (client: Client) => { client.send("hello_ack", { ok: true, serverTime: Date.now() }); });
+    this.onMessage("inv:consumeHotbar", (client, msg: InvConsumeHotbarMsg) => {
+       const p = this.state.players.get(client.sessionId);
+       if (p) consumeFromHotbar(p, msg.qty || 1);
+    });
+
+    this.onMessage("inv:add", (client, msg: InvAddMsg) => {
+       const p = this.state.players.get(client.sessionId);
+       if (p && msg.kind) addKindToInventory(p, msg.kind, msg.qty || 1);
+    });
+
+    this.onMessage("world:patch:req", (client, msg: WorldPatchReqMsg) => {
+      const p = this.state.players.get(client.sessionId);
+      if (p) {
+        const patch = MyRoom.WORLD.encodePatchAround({ x: p.x, y: p.y, z: p.z }, msg.r || 48, { limit: 20000 });
+        client.send("world:patch", patch);
+      }
+    });
   }
 
-  // --------------------------------------------------------
-  // Join / Leave
-  // --------------------------------------------------------
+  private handleCommand(client: Client, p: PlayerState, text: string) {
+    const parts = text.slice(1).split(" ");
+    const cmd = parts[0].toLowerCase();
+
+    if (cmd === "tp" && parts.length === 4) {
+      const x = Number(parts[1]), y = Number(parts[2]), z = Number(parts[3]);
+      if (isFinite(x) && isFinite(y) && isFinite(z)) {
+        p.x = x; p.y = y; p.z = z;
+        client.send("spawn:teleport", { x, y, z });
+        client.send("chat:sys", { text: `Teleported to ${x},${y},${z}` });
+      }
+    } else if (cmd === "biome") {
+      const b = sampleBiome(p.x, p.z);
+      client.send("chat:sys", { text: `Biome: ${b.biome}` });
+    } else if (cmd === "find" && parts[1]) {
+      const t = parts[1].toLowerCase();
+      const res = findNearestBiome(p.x, p.z, t);
+      if (res) {
+         const d = Math.floor(dist3(p.x, 0, p.z, res.x, 0, res.z));
+         client.send("chat:sys", { text: `Found ${res.biome} at ${Math.floor(res.x)},${Math.floor(res.z)} (${d} blocks)` });
+      } else {
+         client.send("chat:sys", { text: "Not found nearby." });
+      }
+    } else if (cmd === "goto" && parts[1]) {
+      const t = parts[1].toLowerCase();
+      const res = findNearestBiome(p.x, p.z, t);
+      if (res) {
+         const y = findSpawnYAt(MyRoom.WORLD, res.x, res.z, 20);
+         p.x = res.x; p.y = y; p.z = res.z;
+         client.send("spawn:teleport", { x: res.x, y, z: res.z });
+         client.send("world:patch", MyRoom.WORLD.encodePatchAround({ x: res.x, y, z: res.z }, 48));
+      }
+    }
+  }
+
+  private canOpNow(sid: string) {
+    const t = nowMs();
+    const last = this.lastBlockOpAt.get(sid) || 0;
+    if (t - last < 90) return false;
+    this.lastBlockOpAt.set(sid, t);
+    return true;
+  }
+
+  // --- Join/Leave ---
 
   public onJoin(client: Client, options: JoinOptions) {
-    console.log(client.sessionId, "joined!", options);
     const distinctId = options.distinctId || client.sessionId;
     (client as any).auth = { distinctId };
+    console.log(client.sessionId, "joined");
 
     const p = new PlayerState();
     p.id = client.sessionId;
-    p.name = (options.name || "Steve").trim().substring(0, 16);
+    p.name = (options.name || "Player").slice(0, 16);
 
     const saved = this.loadPlayerData(distinctId);
     if (saved) {
-      console.log(`[PERSIST] Restoring player ${distinctId}...`);
-      p.x = isFiniteNum(saved.x) ? saved.x : 0;
-      p.y = isFiniteNum(saved.y) ? saved.y : 10;
-      p.z = isFiniteNum(saved.z) ? saved.z : 0;
-      p.yaw = isFiniteNum(saved.yaw) ? saved.yaw : 0;
-      p.pitch = isFiniteNum(saved.pitch) ? saved.pitch : 0;
-      p.hp = isFiniteNum(saved.hp) ? saved.hp : 20;
-      p.stamina = isFiniteNum(saved.stamina) ? saved.stamina : 100;
-      p.hotbarIndex = saved.hotbarIndex || 0;
+      p.x = saved.x; p.y = saved.y; p.z = saved.z;
+      p.yaw = saved.yaw; p.pitch = saved.pitch;
+      p.hp = saved.hp; p.stamina = saved.stamina;
+      p.hotbarIndex = saved.hotbarIndex;
 
-      (saved.items || []).forEach((savedItem: any) => {
-        const it = new ItemState();
-        it.uid = savedItem.uid;
-        it.kind = savedItem.kind;
-        it.qty = savedItem.qty;
-        it.durability = savedItem.durability || 0;
-        it.maxDurability = savedItem.maxDurability || (savedItem.kind?.startsWith("tool:") ? 100 : 0);
-        it.meta = savedItem.meta || "";
-        p.items.set(it.uid, it);
-      });
-      p.inventory.cols = 9; p.inventory.rows = 4;
-      ensureSlotsLength(p);
-      (saved.inventory || []).forEach((uid: string, idx: number) => { if (idx < p.inventory.slots.length) p.inventory.slots[idx] = uid; });
-      if (saved.equip) {
-        p.equip.tool = saved.equip.tool || "";
-        p.equip.head = saved.equip.head || "";
-        p.equip.chest = saved.equip.chest || "";
-        p.equip.legs = saved.equip.legs || "";
-        p.equip.feet = saved.equip.feet || "";
-        p.equip.offhand = saved.equip.offhand || "";
+      if (Array.isArray(saved.items)) {
+        saved.items.forEach((si: any) => {
+          const it = new ItemState();
+          it.uid = si.uid; it.kind = si.kind; it.qty = si.qty; it.durability = si.durability;
+          p.items.set(it.uid, it);
+        });
       }
+      
+      ensureSlotsLength(p);
+      if (Array.isArray(saved.inventory)) {
+        saved.inventory.forEach((uid: string, i: number) => {
+          if (i < p.inventory.slots.length) p.inventory.slots[i] = uid;
+        });
+      }
+
+      if (Array.isArray(saved.craftSlots)) {
+        saved.craftSlots.forEach((uid: string, i: number) => { if(i<9) p.craft.slots[i] = uid; });
+        updateCraftingResult(p);
+      }
+
+      if (saved.cursor) {
+        p.cursor.kind = saved.cursor.kind;
+        p.cursor.qty = saved.cursor.qty;
+      }
+      
       this.cleanupDanglingInventoryRefs(p);
     } else {
-      console.log(`[PERSIST] New player ${distinctId}, giving starter gear.`);
-      p.x = 0; p.y = 10; p.z = 0;
-      p.inventory.cols = 9; p.inventory.rows = 4;
-      ensureSlotsLength(p);
+      p.x = TOWN_SAFE_ZONE.center.x; 
+      p.z = TOWN_SAFE_ZONE.center.z;
+      p.y = findSpawnYAt(MyRoom.WORLD, p.x, p.z, TOWN_GROUND_Y);
       
-      const add = (kind: string, qty: number, slotIdx: number) => {
-        const uid = makeUid(client.sessionId, kind.split(":")[1] || "item");
-        const it = new ItemState();
-        it.uid = uid; it.kind = kind; it.qty = qty;
-        if (kind.startsWith("tool:")) { it.durability = 100; it.maxDurability = 100; }
-        p.items.set(uid, it);
-        p.inventory.slots[slotIdx] = uid;
+      ensureSlotsLength(p);
+      const add = (k: string, q: number, i: number) => {
+        const uid = createItem(p, k, q);
+        p.inventory.slots[i] = uid;
       };
       add("tool:pickaxe_wood", 1, 0);
-      add("block:dirt", 32, 1);
-      add("block:grass", 16, 2);
-      add("block:plank", 8, 3);
-      add("item:stick", 8, 4);
+      add("block:dirt", 16, 1);
     }
 
-    // Force Spawn Logic
-    let isForceSpawn = false;
-    if (MyRoom.FORCE_TOWN_SPAWN) {
-      isForceSpawn = true;
-      const sx = TOWN_SAFE_ZONE.center.x;
-      const sz = TOWN_SAFE_ZONE.center.z + 8; // Offset to avoid fountain
-      const finalY = findSpawnYAt(MyRoom.WORLD, sx, sz, TOWN_GROUND_Y);
-
-      // Temp position high in air
-      p.x = sx; p.y = TOWN_GROUND_Y + 80; p.z = sz;
-      p.yaw = 0; p.pitch = 0;
-
-      syncEquipToolToHotbar(p);
-      this.state.players.set(client.sessionId, p);
-
-      client.send("welcome", { roomId: this.roomId, sessionId: client.sessionId });
-
-      // Send smaller patch for fast load
-      const patchCenter = { x: Math.floor(sx), y: TOWN_GROUND_Y, z: Math.floor(sz) };
-      const patchR = 48; // Reduce radius
-      const patch = MyRoom.WORLD.encodePatchAround(patchCenter, patchR, { limit: MyRoom.INITIAL_PATCH_LIMIT });
-      console.log(`[SPAWN] Initial Patch -> ${client.sessionId} r=${patchR} count=${patchCount(patch)}`);
-      client.send("world:patch", patch);
-
-      // Delay Teleport Signal (Hide Loading Screen)
-      this.clock.setTimeout(() => {
-        p.x = sx; p.y = finalY; p.z = sz;
-        client.send("spawn:teleport", { x: sx, y: finalY, z: sz });
-        console.log(`[SPAWN] TELEPORT -> ${client.sessionId} to (${sx},${finalY},${sz})`);
-      }, MyRoom.SPAWN_TELEPORT_DELAY_MS);
-      return;
-    }
-
-    // Normal Persistence Join
-    syncEquipToolToHotbar(p);
     this.state.players.set(client.sessionId, p);
-    client.send("welcome", { roomId: this.roomId, sessionId: client.sessionId });
-
-    const patchCenter = { x: Math.floor(p.x), y: Math.floor(p.y), z: Math.floor(p.z) };
-    const patch = MyRoom.WORLD.encodePatchAround(patchCenter, 48, { limit: MyRoom.INITIAL_PATCH_LIMIT });
-    client.send("world:patch", patch);
-    
-    // Also send teleport signal immediately for consistent client handling
+    client.send("welcome", { sessionId: client.sessionId });
+    client.send("world:patch", MyRoom.WORLD.encodePatchAround({ x: p.x, y: p.y, z: p.z }, 48));
     client.send("spawn:teleport", { x: p.x, y: p.y, z: p.z });
   }
 
-  public onLeave(client: Client, code: number) {
-    console.log(client.sessionId, "left", code);
+  public onLeave(client: Client) {
     const p = this.state.players.get(client.sessionId);
-    const distinctId = (client as any).auth?.distinctId;
-    if (p && distinctId) this.savePlayerData(distinctId, p);
+    if (p) {
+      const distinctId = (client as any).auth?.distinctId;
+      if (distinctId) this.savePlayerData(distinctId, p);
+    }
     this.state.players.delete(client.sessionId);
-    this.lastBlockOpAt.delete(client.sessionId);
   }
 
   public onDispose() {
     console.log("Room disposing...");
-    try {
-      if (MyRoom.WORLD.isDirty()) {
-        console.log("[PERSISTENCE] Saving world before shutdown...");
-        MyRoom.WORLD.saveToFileSync(this.worldPath);
-        console.log("[PERSISTENCE] Saved.");
-      }
-    } catch (e) { console.error("[PERSISTENCE] Save failed on dispose:", e); }
+    MyRoom.WORLD.saveToFileSync(this.worldPath);
   }
 }
