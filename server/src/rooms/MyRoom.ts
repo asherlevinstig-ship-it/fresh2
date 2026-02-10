@@ -1,13 +1,12 @@
 // ============================================================
 // src/rooms/MyRoom.ts
 // ------------------------------------------------------------
-// FULL REWRITE - "SAFE SPAWN" EDITION
+// FULL REWRITE - "DEBUG LOGGING" EDITION
 //
-// FIXES:
-// 1. Force Town Spawn: Overrides saved position if FORCE_TOWN_SPAWN is true.
-// 2. Anti-Void/Stuck: Always recomputes Y using findSpawnYAt (even on valid loads).
-// 3. Persistence: Restores inventory, cursor, and meta-data safely.
-// 4. Performance: Optimized hotbar syncing and patch limiting.
+// CHANGES:
+// - Added detailed [SPAWN DEBUG] logs in onJoin.
+// - Prints Player Position vs Town Center Position.
+// - Calculates and prints distance from center.
 // ============================================================
 
 import { Room, Client } from "colyseus";
@@ -1122,6 +1121,13 @@ export class MyRoom extends Room {
         p.y = findSpawnYAt(MyRoom.WORLD, p.x, p.z, TOWN_GROUND_Y);
     }
 
+    // --- NEW DIAGNOSTIC LOGGING ---
+    console.log(`[SPAWN DEBUG] Session: ${client.sessionId} (${distinctId})`);
+    console.log(`[SPAWN DEBUG] Player Pos: x=${p.x.toFixed(2)}, y=${p.y.toFixed(2)}, z=${p.z.toFixed(2)}`);
+    console.log(`[SPAWN DEBUG] Town Center: x=${TOWN_SAFE_ZONE.center.x}, y=${TOWN_GROUND_Y}, z=${TOWN_SAFE_ZONE.center.z}`);
+    const dist = Math.sqrt(Math.pow(p.x - TOWN_SAFE_ZONE.center.x, 2) + Math.pow(p.z - TOWN_SAFE_ZONE.center.z, 2));
+    console.log(`[SPAWN DEBUG] Distance from Town Center: ${dist.toFixed(2)} blocks`);
+    
     this.state.players.set(client.sessionId, p);
     client.send("welcome", { sessionId: client.sessionId });
     
