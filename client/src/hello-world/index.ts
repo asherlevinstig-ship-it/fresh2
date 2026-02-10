@@ -7,6 +7,7 @@
  * - Fix: MESH/STATE defined early to prevent TDZ errors.
  * - Fix: Invisible Town (CLIENT_EDITS + Protocol Patch).
  * - Fix: Freezing & Race Conditions.
+ * - Fix: Ordered Handler Registration (Fixes "onMessage not registered").
  */
 
 import { Engine } from "noa-engine";
@@ -51,7 +52,7 @@ const RENDER_PRESET_TOWN = {
 
 const TOWN_HYSTERESIS = 3.0;
 
-// --- 1.5 RENDER HELPERS (DEFINED HERE TO FIX REFERENCE ERROR) ---
+// --- 1.5 RENDER HELPERS ---
 
 function distXZ(ax, az, bx, bz) {
   const dx = ax - bx;
@@ -66,7 +67,6 @@ function isInsideTown(x, z, alreadyInside) {
 }
 
 function applyRenderPreset(scene, preset) {
-  // NOA chunk distances
   try {
     if (noa?.world) {
       if ("chunkAddDistance" in noa.world) noa.world.chunkAddDistance = preset.chunkAddDistance;
@@ -80,12 +80,10 @@ function applyRenderPreset(scene, preset) {
     }
   } catch {}
 
-  // Camera far plane
   try {
     if (scene?.activeCamera) scene.activeCamera.maxZ = preset.cameraMaxZ;
   } catch {}
 
-  // Fog
   try {
     if (!scene) return;
     if (preset.fog) {
@@ -103,13 +101,11 @@ function applyRenderPreset(scene, preset) {
 
 // --- 2. GLOBAL STATE ---
 
-// Client-Side Edits (Persists map patches)
 const CLIENT_EDITS = new Map(); 
 function getEditKey(x, y, z) {
     return `${Math.floor(x)},${Math.floor(y)},${Math.floor(z)}`;
 }
 
-// 3D Resources
 const MESH = {
   weaponRoot: null,
   armR: null,
@@ -117,7 +113,6 @@ const MESH = {
   avatarRoot: null, 
 };
 
-// Game Loop State
 const STATE = {
   scene: null,
   lastTime: performance.now(),
@@ -136,7 +131,6 @@ const STATE = {
   lastPosLogAt: 0,
 };
 
-// Player State Mirror
 const LOCAL_STATE = {
   hp: 20,
   maxHp: 20,
@@ -149,14 +143,12 @@ const LOCAL_STATE = {
   equip: { tool: "" }
 };
 
-// UI State
 let viewMode = 0; 
 let inventoryOpen = false;
 let chatOpen = false;
 let inTown = false;
 let lastTownToggleAt = 0;
 
-// Network State
 let colyRoom = null;
 let mySessionId = null;
 const remotePlayers = {}; 
@@ -728,12 +720,45 @@ client
     mySessionId = room.sessionId;
     uiLog("Connected to Server!");
 
+    // CRITICAL FIX: REGISTER HANDLERS BEFORE JOIN LOGIC
+    
+    // 1. Register Patch Handler FIRST
+    room.onMessage("world:patch", (patch) => {
+      const arr = patch?.data;
+      if (arr && Array.isArray(arr)) {
+         let count = 0;
+         for (let i = 0; i < arr.length; i += 4) {
+            const x = arr[i];
+            const y = arr[i+1];
+            const z = arr[i+2];
+            const id = arr[i+3];
+            
+            CLIENT_EDITS.set(getEditKey(x, y, z), id);
+            noa.setBlock(id, x, y, z);
+            count++;
+         }
+         
+         if (!STATE.worldReady) {
+            STATE.worldReady = true;
+            uiLog(`PATCH recv: count=${count} dataLen=${arr.length}`);
+         }
+      } 
+      else if (patch?.edits) {
+         for (const e of patch.edits) {
+            CLIENT_EDITS.set(getEditKey(e.x, e.y, e.z), e.id);
+            noa.setBlock(e.id, e.x, e.y, e.z);
+         }
+         if (!STATE.worldReady) STATE.worldReady = true;
+      }
+    });
+
+    // 2. Register Welcome Handler (Requests Patch)
     room.onMessage("welcome", (msg) => {
       uiLog(`Welcome: ${msg?.roomId || ""} (${msg?.sessionId || ""})`);
       chatUI.add("Welcome! Press [ENTER] to chat or use commands.", "#88ff88");
       
-      // Request initial patch
-      room.send("world:patch:req", { r: 48 });
+      // Explicitly request patch now that handler is ready
+      room.send("world:patch:req", { r: 64 });
     });
 
     room.onMessage("block:reject", (msg) => {
@@ -792,40 +817,6 @@ client
             delete mobs[key];
         }
     };
-
-    // PROTOCOL HANDLER (The Fix for invisible town)
-    room.onMessage("world:patch", (patch) => {
-      const arr = patch?.data;
-      if (arr && Array.isArray(arr)) {
-         let count = 0;
-         for (let i = 0; i < arr.length; i += 4) {
-            const x = arr[i];
-            const y = arr[i+1];
-            const z = arr[i+2];
-            const id = arr[i+3];
-            
-            // 1. Store in Client Edits (for future chunk generation)
-            CLIENT_EDITS.set(getEditKey(x, y, z), id);
-            
-            // 2. Immediate Visual Update
-            noa.setBlock(id, x, y, z);
-            count++;
-         }
-         
-         if (!STATE.worldReady) {
-            STATE.worldReady = true;
-            uiLog(`worldReady=true (loaded ${count} blocks)`);
-         }
-      } 
-      // Legacy fallback
-      else if (patch?.edits) {
-         for (const e of patch.edits) {
-            CLIENT_EDITS.set(getEditKey(e.x, e.y, e.z), e.id);
-            noa.setBlock(e.id, e.x, e.y, e.z);
-         }
-         if (!STATE.worldReady) STATE.worldReady = true;
-      }
-    });
 
     room.onMessage("block:update", (msg) => {
       CLIENT_EDITS.set(getEditKey(msg.x, msg.y, msg.z), msg.id);
