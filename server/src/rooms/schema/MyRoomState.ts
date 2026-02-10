@@ -1,153 +1,185 @@
 // ============================================================
-// rooms/schema/MyRoomState.ts  (FULL REWRITE - NO OMITS)
+// src/rooms/schema/MyRoomState.ts
 // ------------------------------------------------------------
-// Option B + Minecraft Cursor Stack:
-// - Each player has a REAL 3x3 craft grid: craft.slots[0..8] (uid strings)
-// - Craft preview/result is server-derived on craft: resultKind/resultQty/recipeId
-// - Each player also has a REAL cursor stack (Minecraft-style):
-//     cursor.kind / cursor.qty
-//   This is server-authoritative and supports right/left/double click logic.
-// - Inventory remains 9x4 (36) uid slots + items Map(uid->ItemState)
-// - Equipment remains uid refs into items map
+// FULL REWRITE - PRODUCTION READY - NO OMITS
+//
+// Includes Schema definitions for:
+// - Items (Uid, Kind, Qty, Durability)
+// - Player Containers (Inventory, Equipment, Crafting Grid)
+// - Player Cursor (The "Floating" Stack held by mouse)
+// - Mobs (AI Entities with Position/Stats)
+// - Player Entity (Transform, Stats, Input State)
 // ============================================================
 
 import { Schema, type, MapSchema, ArraySchema } from "@colyseus/schema";
 
 // ------------------------------------------------------------
-// Item State
+// 1. Item State
+// Represents a specific instance of an item in the world/inventory
 // ------------------------------------------------------------
-
 export class ItemState extends Schema {
-  @type("string") uid: string = "";
-  @type("string") kind: string = "";
-  @type("number") qty: number = 0;
+    // Unique ID for tracking specific instances (persistence)
+    @type("string") uid: string = "";
 
-  // Optional tool stats
-  @type("number") durability: number = 0;
-  @type("number") maxDurability: number = 0;
+    // Item Type ID (e.g., "block:dirt", "tool:sword_wood")
+    @type("string") kind: string = "";
 
-  // Optional metadata (e.g., custom name, enchant tags, etc.)
-  @type("string") meta: string = "";
+    // Stack Quantity
+    @type("number") qty: number = 0;
+
+    // Tool/Armor Stats
+    @type("number") durability: number = 0;
+    @type("number") maxDurability: number = 0;
+
+    // JSON Metadata for custom enchantments, names, etc.
+    @type("string") meta: string = "";
 }
 
 // ------------------------------------------------------------
-// Inventory State (uid references into items map)
+// 2. Inventory State
+// Represents the main storage grid (referenced by UID)
 // ------------------------------------------------------------
-
 export class InventoryState extends Schema {
-  @type("number") cols: number = 9;
-  @type("number") rows: number = 4;
+    @type("number") cols: number = 9;
+    @type("number") rows: number = 4;
 
-  // Each entry is an ItemState.uid or "" for empty
-  @type(["string"]) slots: ArraySchema<string> = new ArraySchema<string>();
+    // Array of Item UIDs. "" means empty slot.
+    // Length is usually 36 (9x4).
+    @type(["string"]) slots: ArraySchema<string> = new ArraySchema<string>();
 }
 
 // ------------------------------------------------------------
-// Equipment State (uid references into items map)
+// 3. Equipment State
+// Represents worn gear (referenced by UID)
 // ------------------------------------------------------------
-
 export class EquipmentState extends Schema {
-  @type("string") head: string = "";
-  @type("string") chest: string = "";
-  @type("string") legs: string = "";
-  @type("string") feet: string = "";
-  @type("string") tool: string = "";
-  @type("string") offhand: string = "";
+    @type("string") head: string = "";
+    @type("string") chest: string = "";
+    @type("string") legs: string = "";
+    @type("string") feet: string = "";
+    @type("string") tool: string = "";    // Currently held main-hand item
+    @type("string") offhand: string = ""; // Shield or secondary
 }
 
 // ------------------------------------------------------------
-// Crafting State (Option B - real container)
+// 4. Crafting State
+// Represents the 3x3 crafting grid and output preview
 // ------------------------------------------------------------
-
 export class CraftingState extends Schema {
-  // 3x3 grid: slots 0..8 (uid references into items map), "" for empty
-  @type(["string"]) slots: ArraySchema<string> = new ArraySchema<string>();
+    // 3x3 Grid of Item UIDs (0..8)
+    @type(["string"]) slots: ArraySchema<string> = new ArraySchema<string>();
 
-  // Server-derived preview
-  @type("string") resultKind: string = "";
-  @type("number") resultQty: number = 0;
+    // Server-Calculated Result Preview
+    // This is NOT a UID, but a raw definition of what *would* be created.
+    @type("string") resultKind: string = "";
+    @type("number") resultQty: number = 0;
 
-  // Optional: store the matched recipe id for debugging/UI hints
-  @type("string") recipeId: string = "";
+    // ID of the matched recipe (for UI hints)
+    @type("string") recipeId: string = "";
 
-  constructor() {
-    super();
-    // Ensure exactly 9 slots exist by default
-    for (let i = 0; i < 9; i++) this.slots.push("");
-  }
+    constructor() {
+        super();
+        // Initialize 9 empty slots
+        for (let i = 0; i < 9; i++) {
+            this.slots.push("");
+        }
+    }
 }
 
 // ------------------------------------------------------------
-// Cursor State (Minecraft-style "held stack")
+// 5. Cursor State (Minecraft-Style Interaction)
+// Represents the stack currently "floating" on the player's mouse cursor.
+// This is Server-Authoritative to prevent duping.
 // ------------------------------------------------------------
-
 export class CursorState extends Schema {
-  // Kind + qty represent a stack "held by the mouse cursor".
-  // This is server-authoritative and is NOT stored in items map by uid.
-  // (Minecraft cursor is a stack, not a unique item instance.)
-  @type("string") kind: string = "";
-  @type("number") qty: number = 0;
-
-  // Optional metadata for cursor stack if you add it later (kept now for extensibility)
-  @type("string") meta: string = "";
+    @type("string") kind: string = "";
+    @type("number") qty: number = 0;
+    @type("string") meta: string = ""; // For moving enchanted items
 }
 
 // ------------------------------------------------------------
-// Player State
+// 6. Mob State (AI Entities)
+// Represents enemies or NPCs in the world
 // ------------------------------------------------------------
+export class MobState extends Schema {
+    // Unique Instance ID
+    @type("string") id: string = "";
 
+    // Type (e.g., "mob:slime_green", "mob:skeleton")
+    @type("string") kind: string = "";
+
+    // Position
+    @type("number") x: number = 0;
+    @type("number") y: number = 0;
+    @type("number") z: number = 0;
+
+    // Rotation (Heading)
+    @type("number") yaw: number = 0;
+
+    // Stats
+    @type("number") hp: number = 10;
+    @type("number") maxHp: number = 10;
+
+    // Animation State (0 = Idle, 1 = Walk, 2 = Attack, 3 = Hurt/Die)
+    @type("number") animState: number = 0;
+}
+
+// ------------------------------------------------------------
+// 7. Player State
+// Represents a connected user
+// ------------------------------------------------------------
 export class PlayerState extends Schema {
-  // Identity
-  @type("string") id: string = "";
-  @type("string") name: string = "Steve";
+    // Identity
+    @type("string") id: string = "";
+    @type("string") name: string = "Steve";
 
-  // Transform
-  @type("number") x: number = 0;
-  @type("number") y: number = 10;
-  @type("number") z: number = 0;
-  @type("number") yaw: number = 0;
-  @type("number") pitch: number = 0;
+    // Transform
+    @type("number") x: number = 0;
+    @type("number") y: number = 10;
+    @type("number") z: number = 0;
+    @type("number") yaw: number = 0;
+    @type("number") pitch: number = 0;
 
-  // Stats
-  @type("number") hp: number = 20;
-  @type("number") maxHp: number = 20;
+    // Survival Stats
+    @type("number") hp: number = 20;
+    @type("number") maxHp: number = 20;
+    @type("number") stamina: number = 100;
+    @type("number") maxStamina: number = 100;
 
-  @type("number") stamina: number = 100;
-  @type("number") maxStamina: number = 100;
+    // Action Flags
+    @type("boolean") sprinting: boolean = false;
+    @type("boolean") swinging: boolean = false;
 
-  // Actions
-  @type("boolean") sprinting: boolean = false;
-  @type("boolean") swinging: boolean = false;
+    // Selected Hotbar Slot (0-8)
+    @type("number") hotbarIndex: number = 0;
 
-  // Hotbar selection index (0..8)
-  @type("number") hotbarIndex: number = 0;
+    // Sub-Schemas
+    @type(InventoryState) inventory: InventoryState = new InventoryState();
+    @type(EquipmentState) equip: EquipmentState = new EquipmentState();
+    @type(CraftingState) craft: CraftingState = new CraftingState();
+    @type(CursorState) cursor: CursorState = new CursorState();
 
-  // Containers
-  @type(InventoryState) inventory: InventoryState = new InventoryState();
-  @type(EquipmentState) equip: EquipmentState = new EquipmentState();
-  @type(CraftingState) craft: CraftingState = new CraftingState();
+    // Item Data Storage (Map of UID -> ItemState)
+    // All items physically located in inventory/craft/equip slots are stored here.
+    @type({ map: ItemState }) items: MapSchema<ItemState> = new MapSchema<ItemState>();
 
-  // Minecraft-style cursor (held stack)
-  @type(CursorState) cursor: CursorState = new CursorState();
-
-  // Items: uid -> ItemState
-  @type({ map: ItemState }) items: MapSchema<ItemState> = new MapSchema<ItemState>();
-
-  constructor() {
-    super();
-
-    // Initialize inventory slots (default 9x4 = 36)
-    // Server still enforces exact length with ensureSlotsLength(), but this provides a stable baseline.
-    const total = Math.max(1, (this.inventory.cols || 9) * (this.inventory.rows || 4));
-    for (let i = 0; i < total; i++) this.inventory.slots.push("");
-  }
+    constructor() {
+        super();
+        // Initialize inventory slots (Standard 9x4 = 36)
+        for (let i = 0; i < 36; i++) {
+            this.inventory.slots.push("");
+        }
+    }
 }
 
 // ------------------------------------------------------------
-// Room State
+// 8. Room State (Root)
+// The top-level state synchronized to all clients
 // ------------------------------------------------------------
-
 export class MyRoomState extends Schema {
-  // sessionId -> PlayerState
-  @type({ map: PlayerState }) players: MapSchema<PlayerState> = new MapSchema<PlayerState>();
+    // Active Players (Key: SessionID)
+    @type({ map: PlayerState }) players: MapSchema<PlayerState> = new MapSchema<PlayerState>();
+
+    // Active Mobs (Key: Mob Instance ID)
+    @type({ map: MobState }) mobs: MapSchema<MobState> = new MapSchema<MobState>();
 }

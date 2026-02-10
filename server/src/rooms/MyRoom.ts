@@ -1,15 +1,10 @@
 // ============================================================
 // src/rooms/MyRoom.ts
 // ------------------------------------------------------------
-// FULL REWRITE - PRODUCTION READY - NO OMITS
+// FULL REWRITE - PRODUCTION READY - TYPESCRIPT FIX APPLIED
 //
-// INCLUDES:
-// - Minecraft-Style Inventory (Cursor Stack + Left/Right Click)
-// - Reactive Crafting (3x3 Grid, Server-Side)
-// - Full Block ID Mappings (Restored from your working version)
-// - World Persistence & Autosave
-// - Town of Beginnings Safe Zone
-// - Chat Commands (/find, /goto, /biome)
+// FIX: Explicitly typed 'mob' and 'p' as 'any' in updateLoop
+//      to prevent "Property does not exist on type never" errors.
 // ============================================================
 
 import { Room, Client } from "colyseus";
@@ -18,7 +13,7 @@ import * as path from "path";
 
 // World & State Imports
 import { WorldStore, BLOCKS, type BlockId } from "../world/WorldStore.js";
-import { MyRoomState, PlayerState, ItemState } from "./schema/MyRoomState.js";
+import { MyRoomState, PlayerState, ItemState, MobState } from "./schema/MyRoomState.js";
 import { CraftingSystem } from "../crafting/CraftingSystem.js";
 
 // Town Stamp Logic
@@ -36,7 +31,6 @@ import {
   pickOreId,
   buildDefaultOreTablesFromPalette,
   type OreTables,
-  type BiomeId
 } from "../world/Biomes.js";
 
 // ------------------------------------------------------------
@@ -59,7 +53,7 @@ type SprintMsg = { on: boolean };
 type SwingMsg = { t?: number };
 type HotbarSetMsg = { index: number };
 
-// NEW: Minecraft-style interaction
+// Minecraft-style interaction interaction
 type InvClickMsg = {
   location: "inv" | "craft" | "result";
   index: number;
@@ -146,16 +140,6 @@ function findSpawnYAt(world: WorldStore, x: number, z: number, preferredY: numbe
   return preferredY + 2;
 }
 
-function patchCount(patch: any): number | null {
-  if (!patch || typeof patch !== "object") return null;
-  const p: any = patch;
-  if (Array.isArray(p.edits)) return p.edits.length;
-  if (Array.isArray(p.blocks)) return p.blocks.length;
-  if (Array.isArray(p.data)) return p.data.length;
-  if (typeof p.count === "number") return p.count;
-  return null;
-}
-
 // ------------------------------------------------------------
 // Biome Seeker
 // ------------------------------------------------------------
@@ -165,7 +149,7 @@ function findNearestBiome(startX: number, startZ: number, target: string): { x: 
   const maxRadius = 5000;
 
   const initial = sampleBiome(startX, startZ);
-  if (initial.biome === target) return { x: startX, z: startZ, biome: initial.biome };
+  if (initial.biome.includes(target)) return { x: startX, z: startZ, biome: initial.biome };
 
   for (let r = step; r <= maxRadius; r += step) {
     const points = 16;
@@ -359,7 +343,7 @@ function updateCraftingResult(p: PlayerState) {
 }
 
 // ------------------------------------------------------------
-// Block Mapping (RESTORED FROM YOUR VERSION)
+// Block Mapping
 // ------------------------------------------------------------
 
 function kindToBlockId(kind: string): BlockId {
@@ -486,6 +470,11 @@ export class MyRoom extends Room {
   private static PATCH_REQ_MAX_LIMIT = clamp(Math.floor(Number(process.env.PATCH_REQ_MAX_LIMIT ?? 200000)), 5000, 4000000);
   private static SPAWN_TELEPORT_DELAY_MS = clamp(Math.floor(Number(process.env.SPAWN_TELEPORT_DELAY_MS ?? 1200)), 0, 5000);
 
+  // Mob Config
+  private static MAX_MOBS = 10;
+  private static MOB_SPAWN_RATE_MS = 5000;
+  private lastMobSpawn = 0;
+
   private worldPath = path.join(process.cwd(), "world_data.json");
   private playersPath = path.join(process.cwd(), "players.json");
   private lastBlockOpAt = new Map<string, number>();
@@ -564,27 +553,10 @@ export class MyRoom extends Room {
 
     // Loop
     const TICK_MS = 50;
-    const STAMINA_DRAIN = 18;
-    const STAMINA_REGEN = 12;
-
+    
     this.setSimulationInterval(() => {
       const dt = TICK_MS / 1000;
-      this.state.players.forEach((p, sid) => {
-        ensureSlotsLength(p);
-        // Regen
-        if (p.sprinting) {
-          p.stamina = clamp(p.stamina - STAMINA_DRAIN * dt, 0, 100);
-          if (p.stamina <= 0.01) p.sprinting = false;
-        } else {
-          p.stamina = clamp(p.stamina + STAMINA_REGEN * dt, 0, 100);
-        }
-        
-        // Swinging flag reset
-        if (p.swinging) { /* handled by timeout in onMessage */ }
-        
-        syncEquipToolToHotbar(p);
-      });
-      MyRoom.WORLD.maybeAutosave();
+      this.updateLoop(dt);
     }, TICK_MS);
 
     // --- Message Handlers ---
@@ -844,6 +816,99 @@ export class MyRoom extends Room {
         client.send("world:patch", patch);
       }
     });
+  }
+
+  // --- Game Loop (Mobs + Players) ---
+
+  private updateLoop(dt: number) {
+    const STAMINA_DRAIN = 18;
+    const STAMINA_REGEN = 12;
+
+    // 1. Players
+    // Explicit 'any' to avoid type never issues
+    this.state.players.forEach((p: any) => {
+        ensureSlotsLength(p);
+        if (p.sprinting) {
+          p.stamina = clamp(p.stamina - STAMINA_DRAIN * dt, 0, 100);
+          if (p.stamina <= 0.01) p.sprinting = false;
+        } else {
+          p.stamina = clamp(p.stamina + STAMINA_REGEN * dt, 0, 100);
+        }
+        syncEquipToolToHotbar(p);
+    });
+
+    // 2. Mobs (Spawn)
+    if (this.state.mobs.size < MyRoom.MAX_MOBS && nowMs() - this.lastMobSpawn > MyRoom.MOB_SPAWN_RATE_MS) {
+        this.spawnMob();
+        this.lastMobSpawn = nowMs();
+    }
+
+    // 3. Mobs (AI)
+    // Explicit 'any' to avoid type never issues
+    this.state.mobs.forEach((mob: any, id: string) => {
+        // Gravity
+        const idBelow = MyRoom.WORLD.getBlock(Math.floor(mob.x), Math.floor(mob.y - 0.1), Math.floor(mob.z));
+        const isGrounded = (idBelow !== BLOCKS.AIR);
+
+        if (!isGrounded) {
+            mob.y -= 10 * dt; 
+        } else {
+            // AI Logic
+            let nearestDist = 999;
+            let target: any = null;
+            this.state.players.forEach((p: any) => {
+                const d = dist3(mob.x, mob.y, mob.z, p.x, p.y, p.z);
+                if (d < nearestDist && d < 16) {
+                    nearestDist = d;
+                    target = p;
+                }
+            });
+
+            if (target) {
+                // Chase
+                const dx = target.x - mob.x;
+                const dz = target.z - mob.z;
+                const angle = Math.atan2(dx, dz);
+                mob.yaw = angle;
+
+                const speed = 3.0;
+                const mx = Math.sin(angle) * speed * dt;
+                const mz = Math.cos(angle) * speed * dt;
+
+                // Wall/Jump Check
+                const idAhead = MyRoom.WORLD.getBlock(Math.floor(mob.x + mx), Math.floor(mob.y + 0.5), Math.floor(mob.z + mz));
+                if (idAhead !== BLOCKS.AIR) {
+                    mob.y += 1.2; // Jump
+                } else {
+                    mob.x += mx;
+                    mob.z += mz;
+                }
+            } else {
+                // Wander
+                if (Math.random() < 0.02) mob.yaw += (Math.random() - 0.5) * 2;
+            }
+        }
+
+        // Void kill
+        if (mob.y < -50) this.state.mobs.delete(id);
+    });
+
+    MyRoom.WORLD.maybeAutosave();
+  }
+
+  private spawnMob() {
+      const id = makeUid("server", "mob");
+      const m = new MobState();
+      m.id = id;
+      m.kind = "mob:slime_green";
+      
+      const angle = Math.random() * Math.PI * 2;
+      const dist = 10 + Math.random() * 10;
+      m.x = TOWN_SAFE_ZONE.center.x + Math.sin(angle) * dist;
+      m.z = TOWN_SAFE_ZONE.center.z + Math.cos(angle) * dist;
+      m.y = findSpawnYAt(MyRoom.WORLD, m.x, m.z, TOWN_GROUND_Y);
+      
+      this.state.mobs.set(id, m);
   }
 
   private handleCommand(client: Client, p: PlayerState, text: string) {

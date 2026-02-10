@@ -3,14 +3,13 @@
  * fresh2 - client main/index (PRODUCTION - FULL LOGIC)
  * -----------------------------------------------------------------------
  * INCLUDES (NO OMITS):
+ * - Mob Rendering (Procedural Slimes + Interpolation)
  * - Minecraft-Style Inventory (Server-Side Cursor + Click Networking)
  * - Server-Authoritative Crafting (3x3 Grid)
  * - World Generation (BIOME-AWARE: Matches Server Logic)
  * - Town of Beginnings (Render Clamping + Safe Zone Visuals)
  * - 3D Rigs (FPS Hands + 3rd Person Avatars)
- * - Network Interpolation
  * - Chat System (/find, /goto, /biome)
- * - Hotbar & Equipment Sync
  */
 
 import { Engine } from "noa-engine";
@@ -60,7 +59,6 @@ const RENDER_PRESET_TOWN = {
   fogDensity: 0.018,
 };
 
-// Hysteresis helps avoid rapid toggling at boundary
 const TOWN_HYSTERESIS = 3.0;
 
 /* ============================================================
@@ -96,13 +94,13 @@ let chatOpen = false;
 let colyRoom = null;
 let mySessionId = null;
 const remotePlayers = {}; // { [sid]: { mesh, targetPos } }
+const mobs = {};          // { [mobId]: { mesh, targetPos, targetYaw } }
 
 // Render clamp state
 let inTown = false;
 let lastTownToggleAt = 0;
 
 // Local State Mirror (Updated via Colyseus State)
-// Mirrors the PlayerState schema structure for UI rendering
 const LOCAL_STATE = {
   hp: 20,
   maxHp: 20,
@@ -382,7 +380,7 @@ function createInventoryUI() {
   leftCol.appendChild(document.createElement("hr"));
   const eqGrid = document.createElement("div");
   Object.assign(eqGrid.style, { display: "grid", gridTemplateColumns: "repeat(3, 48px)", gap: "4px" });
-  // Just placeholders for Head/Chest/Legs
+  
   ["head", "chest", "legs"].forEach(k => {
      const d = document.createElement("div");
      Object.assign(d.style, { width:"48px", height:"48px", border:"1px solid #333", background:"#111" });
@@ -623,9 +621,6 @@ const mats = {
   // Furniture
   crafting_table: [0.55, 0.35, 0.18],
   chest: [0.58, 0.38, 0.18],
-  slab_plank: [0.62, 0.5, 0.3],
-  stairs_plank: [0.62, 0.5, 0.3],
-  door_wood: [0.5, 0.32, 0.15],
 };
 
 Object.keys(mats).forEach((k) => noa.registry.registerMaterial(k, { color: mats[k] }));
@@ -660,9 +655,6 @@ const ID = {
 
   crafting_table: noa.registry.registerBlock(23, { material: "crafting_table" }),
   chest: noa.registry.registerBlock(24, { material: "chest" }),
-  slab_plank: noa.registry.registerBlock(25, { material: "slab_plank" }),
-  stairs_plank: noa.registry.registerBlock(26, { material: "stairs_plank" }),
-  door_wood: noa.registry.registerBlock(27, { material: "door_wood" }),
 };
 
 // Map used by Biomes.ts
@@ -759,7 +751,7 @@ noa.world.on("worldDataNeeded", (id, data, x, y, z) => {
 });
 
 /* ============================================================
- * 8. VISUALS: RIGS & ANIMATION
+ * 8. VISUALS: RIGS, AVATARS & MOBS
  * ============================================================
  */
 
@@ -822,6 +814,36 @@ function createAvatar(scene) {
   return { root, head, body };
 }
 
+// Procedural Slime Mob
+function createSlimeMesh(scene) {
+    const root = new BABYLON.TransformNode("mob_root", scene);
+    
+    // Slime Body (Green Box)
+    const mat = new BABYLON.StandardMaterial("slime_mat", scene);
+    mat.diffuseColor = new BABYLON.Color3(0.2, 0.8, 0.2);
+    mat.alpha = 0.8;
+    
+    const box = BABYLON.MeshBuilder.CreateBox("slime_body", { size: 0.8 }, scene);
+    box.material = mat;
+    box.parent = root;
+    box.position.y = 0.4;
+    
+    // Eyes
+    const eyeMat = new BABYLON.StandardMaterial("eye_mat", scene);
+    eyeMat.diffuseColor = BABYLON.Color3.Black();
+    
+    const eyeL = BABYLON.MeshBuilder.CreateBox("eyeL", { width:0.1, height:0.1, depth:0.1}, scene);
+    eyeL.material = eyeMat;
+    eyeL.parent = box;
+    eyeL.position.set(-0.2, 0.2, 0.4);
+    
+    const eyeR = eyeL.clone("eyeR");
+    eyeR.parent = box;
+    eyeR.position.set(0.2, 0.2, 0.4);
+
+    return root;
+}
+
 function updateRigAnim(dt) {
   if (viewMode === 0 && MESH.weaponRoot) {
     const vel = noa.entities.getPhysicsBody(noa.playerEntity).velocity;
@@ -865,7 +887,6 @@ function applyRenderPreset(scene, preset) {
       if ("chunkAddDistance" in noa.world) noa.world.chunkAddDistance = preset.chunkAddDistance;
       if ("chunkRemoveDistance" in noa.world) noa.world.chunkRemoveDistance = preset.chunkRemoveDistance;
       
-      // Handle internal chunk managers if present
       const mgr = noa.world._chunkMgr || noa.world._chunkManager;
       if (mgr) {
          if ("chunkAddDistance" in mgr) mgr.chunkAddDistance = preset.chunkAddDistance;
@@ -997,7 +1018,10 @@ client
       if (ls) ls.style.display = "none";
     });
 
+    // --- STATE CHANGES ---
+
     room.onStateChange((state) => {
+        // Player Updates
         const me = state.players.get(room.sessionId);
         if (me) snapshotState(me, state.players);
 
@@ -1007,11 +1031,31 @@ client
                 const rig = createAvatar(noa.rendering.getScene());
                 remotePlayers[sid] = { mesh: rig.root, targetPos: [p.x, p.y, p.z] };
             }
-            // Simple interp target
             remotePlayers[sid].targetPos = [p.x, p.y, p.z];
             if(remotePlayers[sid].mesh) remotePlayers[sid].mesh.rotation.y = p.yaw;
         });
     });
+
+    // Mob Updates
+    room.state.mobs.onAdd = (mob, key) => {
+        const mesh = createSlimeMesh(noa.rendering.getScene());
+        mesh.position.set(mob.x, mob.y, mob.z);
+        mobs[key] = { mesh, targetPos: [mob.x, mob.y, mob.z], targetYaw: mob.yaw };
+        
+        mob.onChange = () => {
+            if (mobs[key]) {
+                mobs[key].targetPos = [mob.x, mob.y, mob.z];
+                mobs[key].targetYaw = mob.yaw;
+            }
+        };
+    };
+
+    room.state.mobs.onRemove = (mob, key) => {
+        if (mobs[key]) {
+            mobs[key].mesh.dispose();
+            delete mobs[key];
+        }
+    };
 
     room.onMessage("world:patch", (patch) => {
       const edits = patch?.edits || [];
@@ -1023,7 +1067,6 @@ client
       if (!STATE.worldReady) {
         STATE.worldReady = true;
         uiLog(`worldReady=true (patch=${edits.length})`);
-        // Initial snap to town or wherever we are
         if (!STATE.spawnSnapDone) {
             forcePlayerPosition(TOWN.cx, TOWN.groundY + 10, TOWN.cz, "worldReady");
         }
@@ -1069,8 +1112,7 @@ noa.inputs.down.on("alt-fire", () => {
   const item = LOCAL_STATE.inventory[idx];
   
   if (item && item.kind.startsWith("block:")) {
-      // Map string to ID
-      let id = ID.dirt; // Fallback
+      let id = ID.dirt;
       const k = item.kind;
       if (k.includes("stone")) id = ID.stone;
       if (k.includes("plank")) id = ID.planks;
@@ -1121,12 +1163,10 @@ window.addEventListener("keydown", (e) => {
     hotbarUI.refresh();
   }
   
-  // Sprint
   if (e.code === "ShiftLeft") {
       if(colyRoom) colyRoom.send("sprint", { on: true });
   }
   
-  // F6 - Manual Patch Request
   if (e.code === "F6") {
     try {
       if (colyRoom) colyRoom.send("world:patch:req", { x: TOWN.cx, y: TOWN.groundY, z: TOWN.cz, r: 160, limit: 30000 });
@@ -1134,13 +1174,11 @@ window.addEventListener("keydown", (e) => {
     } catch {}
   }
 
-  // F8 - Toggle Pos Log
   if (e.code === "F8") {
     STATE.logPos = !STATE.logPos;
     uiLog(`pos logging: ${STATE.logPos ? "ON" : "OFF"} (F8)`);
   }
 
-  // F9 - Manual Snap
   if (e.code === "F9") {
     forcePlayerPosition(TOWN.cx + 0.5, TOWN.groundY + 3, TOWN.cz + 0.5, "(F9 manual snap)");
     if (colyRoom) {
@@ -1199,7 +1237,6 @@ noa.on("beforeRender", () => {
     }
   } catch {}
   
-  // Debug Log
   if (STATE.logPos) {
     if (now - STATE.lastPosLogAt > 800) {
       STATE.lastPosLogAt = now;
@@ -1210,7 +1247,7 @@ noa.on("beforeRender", () => {
     }
   }
 
-  // Remote Interpolation
+  // Player Interpolation
   for (const sid in remotePlayers) {
     const rp = remotePlayers[sid];
     if (rp && rp.mesh) {
@@ -1219,6 +1256,30 @@ noa.on("beforeRender", () => {
       cur.x += (tgt[0] - cur.x) * 0.1;
       cur.y += (tgt[1] - cur.y) * 0.1;
       cur.z += (tgt[2] - cur.z) * 0.1;
+    }
+  }
+
+  // Mob Interpolation
+  for (const mid in mobs) {
+    const m = mobs[mid];
+    if (m && m.mesh) {
+      m.mesh.position.x += (m.targetPos[0] - m.mesh.position.x) * 0.1;
+      m.mesh.position.y += (m.targetPos[1] - m.mesh.position.y) * 0.1;
+      m.mesh.position.z += (m.targetPos[2] - m.mesh.position.z) * 0.1;
+      
+      // Simple rotation
+      m.mesh.rotation.y += (m.targetYaw - m.mesh.rotation.y) * 0.1;
+
+      // Bobbing Animation
+      const isMoving = Math.abs(m.targetPos[0] - m.mesh.position.x) > 0.01;
+      if (isMoving) {
+          const s = 1 + Math.sin(now * 0.01) * 0.1;
+          m.mesh.scaling.y = s;
+          m.mesh.scaling.x = 1/s;
+          m.mesh.scaling.z = 1/s;
+      } else {
+          m.mesh.scaling.set(1, 1, 1);
+      }
     }
   }
 
