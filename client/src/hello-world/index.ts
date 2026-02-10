@@ -2,22 +2,15 @@
 /*
  * fresh2 - client main/index (PRODUCTION - FULL LOGIC)
  * -----------------------------------------------------------------------
- * INCLUDES:
- * - Fix: "Invisible Town" (Added CLIENT_EDITS to persist patches vs terrain gen)
- * - Fix: Freezing logic (Removed worldReady dependency from freeze loop)
- * - Fix: World Patch Protocol (Handles flat data array correctly)
- * - Fix: Town Constants (Radius 48, GroundY 6)
- * - Fix: Block IDs (Crafting Table 30, Chest 31)
+ * DIAGNOSTIC VERSION
+ * - Adds logs to confirm Patch arrival.
+ * - Adds F7 key to force re-download Town.
  */
 
 import { Engine } from "noa-engine";
 import * as BABYLON from "babylonjs";
 import * as Colyseus from "colyseus.js";
 
-/* ============================================================
- * 0. BIOMES (Shared Deterministic Math)
- * ============================================================
- */
 import {
   sampleBiome,
   getTerrainLayerBlockId,
@@ -29,325 +22,112 @@ import {
   pickOreId,
 } from "../../world/Biomes";
 
-/* ============================================================
- * 0.5 TOWN OF BEGINNINGS (Render clamp region)
- * ============================================================
- */
-const TOWN = {
-  cx: 0,
-  cz: 0,
-  radius: 48, // Matches Server
-  groundY: 6, // Matches Server
-};
+const TOWN = { cx: 0, cz: 0, radius: 48, groundY: 6 };
 
-// Render clamp presets
-const RENDER_PRESET_OUTSIDE = {
-  chunkAddDistance: 2.5,
-  chunkRemoveDistance: 3.5,
-  cameraMaxZ: 220,
-  fog: false,
-  fogDensity: 0.0,
-};
-
-const RENDER_PRESET_TOWN = {
-  chunkAddDistance: 1.35,
-  chunkRemoveDistance: 2.15,
-  cameraMaxZ: 120,
-  fog: true,
-  fogDensity: 0.018,
-};
-
-const TOWN_HYSTERESIS = 3.0;
-
-/* ============================================================
- * 1. NOA ENGINE SETUP
- * ============================================================
- */
+const RENDER_PRESET_OUTSIDE = { chunkAddDistance: 2.5, chunkRemoveDistance: 3.5, cameraMaxZ: 220, fog: false, fogDensity: 0.0 };
+const RENDER_PRESET_TOWN = { chunkAddDistance: 1.35, chunkRemoveDistance: 2.15, cameraMaxZ: 120, fog: true, fogDensity: 0.018 };
 
 const opts = {
-  debug: true,
-  showFPS: true,
-  chunkSize: 32,
+  debug: true, showFPS: true, chunkSize: 32,
   chunkAddDistance: RENDER_PRESET_OUTSIDE.chunkAddDistance,
   chunkRemoveDistance: RENDER_PRESET_OUTSIDE.chunkRemoveDistance,
-  stickyPointerLock: true,
-  dragCameraOutsidePointerLock: true,
-  initialZoom: 0,
-  zoomSpeed: 0.25,
+  stickyPointerLock: true, dragCameraOutsidePointerLock: true,
+  initialZoom: 0, zoomSpeed: 0.25,
 };
 
 const noa = new Engine(opts);
 console.log("noa-engine booted:", noa.version);
 
-/* ============================================================
- * 2. GLOBAL STATE
- * ============================================================
- */
-
+// --- GLOBAL STATE ---
 let viewMode = 0; 
 let inventoryOpen = false;
 let chatOpen = false;
-
-// Multiplayer
 let colyRoom = null;
 let mySessionId = null;
 const remotePlayers = {}; 
 const mobs = {};          
-
-// Render clamp state
 let inTown = false;
 let lastTownToggleAt = 0;
 
-// Client-Side Edits Mirror (Fixes Invisible Town)
-const CLIENT_EDITS = new Map(); // Key: "x,y,z", Value: BlockID
-
+// CLIENT EDITS (The fix for invisible town)
+const CLIENT_EDITS = new Map();
 function getEditKey(x, y, z) {
-    return `${x|0},${y|0},${z|0}`;
+    return `${Math.floor(x)},${Math.floor(y)},${Math.floor(z)}`;
 }
 
-// Local State Mirror
 const LOCAL_STATE = {
-  hp: 20,
-  maxHp: 20,
-  stamina: 100,
-  hotbarIndex: 0,
-  inventory: [], 
-  craft: [],     
-  craftResult: null,
-  cursor: null,  
-  equip: { tool: "" }
-};
-
-const MESH = {
-  weaponRoot: null,
-  armR: null,
-  tool: null, 
-  avatarRoot: null, 
+  hp: 20, maxHp: 20, stamina: 100, hotbarIndex: 0,
+  inventory: [], craft: [], craftResult: null, cursor: null, equip: { tool: "" }
 };
 
 const STATE = {
-  scene: null,
-  lastTime: performance.now(),
-  bobPhase: 0,
-  swingT: 999,
-  swingDuration: 0.22,
-  moveAccum: 0,
-
-  worldReady: false,
-  spawnSnapDone: false,
-  pendingTeleport: null,
+  scene: null, lastTime: performance.now(), bobPhase: 0, swingT: 999, swingDuration: 0.22, moveAccum: 0,
+  worldReady: false, spawnSnapDone: false, pendingTeleport: null,
   desiredSpawn: { x: 0, y: TOWN.groundY + 2, z: 0 },
   freezeUntil: performance.now() + 2000,
-  
-  logPos: false,
-  lastPosLogAt: 0,
+  logPos: false, lastPosLogAt: 0,
 };
 
-/* ============================================================
- * 3. UI: DEBUG CONSOLE
- * ============================================================
- */
+// --- UI CONSOLE ---
 const UI_CONSOLE = (() => {
   const wrap = document.createElement("div");
-  wrap.id = "ui-console";
-  Object.assign(wrap.style, {
-    position: "fixed", left: "14px", bottom: "90px", width: "min(600px, 90vw)",
-    maxHeight: "300px", zIndex: "10050", display: "none", pointerEvents: "none",
-    fontFamily: "monospace", color: "white", fontSize: "12px", textShadow: "1px 1px 0 #000",
-  });
+  Object.assign(wrap.style, { position: "fixed", left: "14px", bottom: "90px", width: "min(600px, 90vw)", maxHeight: "300px", zIndex: "10050", display: "none", pointerEvents: "none", fontFamily: "monospace", color: "white", fontSize: "12px", textShadow: "1px 1px 0 #000" });
   const scroller = document.createElement("div");
-  Object.assign(scroller.style, {
-    background: "rgba(0,0,0,0.6)", padding: "10px", borderRadius: "8px",
-    overflowY: "auto", maxHeight: "100%", pointerEvents: "auto",
-  });
-  wrap.appendChild(scroller);
-  document.body.appendChild(wrap);
-
-  function log(msg, color = "#fff") {
-    const el = document.createElement("div");
-    el.textContent = `> ${msg}`;
-    el.style.color = color;
-    scroller.appendChild(el);
-    scroller.scrollTop = scroller.scrollHeight;
-  }
-  return {
-    log: (m) => log(m),
-    warn: (m) => log(m, "#ffaa00"),
-    error: (m) => log(m, "#ff5555"),
-    toggle: () => { wrap.style.display = wrap.style.display === "none" ? "block" : "none"; },
-  };
+  Object.assign(scroller.style, { background: "rgba(0,0,0,0.6)", padding: "10px", borderRadius: "8px", overflowY: "auto", maxHeight: "100%", pointerEvents: "auto" });
+  wrap.appendChild(scroller); document.body.appendChild(wrap);
+  function log(msg, color = "#fff") { const el = document.createElement("div"); el.textContent = `> ${msg}`; el.style.color = color; scroller.appendChild(el); scroller.scrollTop = scroller.scrollHeight; }
+  return { log: (m) => log(m), warn: (m) => log(m, "#ffaa00"), error: (m) => log(m, "#ff5555"), toggle: () => { wrap.style.display = wrap.style.display === "none" ? "block" : "none"; } };
 })();
 const uiLog = UI_CONSOLE.log;
 
-/* ============================================================
- * 4. UI: CHAT
- * ============================================================
- */
+// --- CHAT UI ---
 function createChatUI() {
-  const wrap = document.createElement("div");
-  Object.assign(wrap.style, {
-    position: "fixed", left: "14px", bottom: "150px", width: "400px", height: "200px",
-    display: "flex", flexDirection: "column", gap: "5px", zIndex: "10060", pointerEvents: "none",
-  });
-  const logArea = document.createElement("div");
-  Object.assign(logArea.style, {
-    flex: "1", overflowY: "auto", background: "rgba(0,0,0,0.4)", borderRadius: "6px",
-    padding: "8px", fontFamily: "monospace", fontSize: "13px", color: "white",
-    textShadow: "1px 1px 0 #000", display: "flex", flexDirection: "column", justifyContent: "flex-end",
-    maskImage: "linear-gradient(to bottom, transparent, black 10%)",
-  });
-  const input = document.createElement("input");
-  Object.assign(input.style, {
-    width: "100%", background: "rgba(0,0,0,0.7)", border: "1px solid #555", color: "white",
-    padding: "8px", borderRadius: "4px", outline: "none", fontFamily: "monospace",
-    display: "none", pointerEvents: "auto",
-  });
-  wrap.appendChild(logArea);
-  wrap.appendChild(input);
-  document.body.appendChild(wrap);
-
-  function addMsg(text, color = "#eee") {
-    const el = document.createElement("div");
-    el.textContent = text;
-    el.style.color = color;
-    el.style.marginBottom = "2px";
-    logArea.appendChild(el);
-    logArea.scrollTop = logArea.scrollHeight;
-  }
-  return {
-    add: addMsg,
-    toggle: () => {
-      chatOpen = !chatOpen;
-      if (chatOpen) {
-        input.style.display = "block"; document.exitPointerLock(); input.focus(); wrap.style.pointerEvents = "auto";
-      } else {
-        input.style.display = "none"; input.value = ""; noa.container.canvas.requestPointerLock(); wrap.style.pointerEvents = "none";
-      }
-    },
-    isOpen: () => chatOpen,
-    input,
-  };
+  const wrap = document.createElement("div"); Object.assign(wrap.style, { position: "fixed", left: "14px", bottom: "150px", width: "400px", height: "200px", display: "flex", flexDirection: "column", gap: "5px", zIndex: "10060", pointerEvents: "none" });
+  const logArea = document.createElement("div"); Object.assign(logArea.style, { flex: "1", overflowY: "auto", background: "rgba(0,0,0,0.4)", borderRadius: "6px", padding: "8px", fontFamily: "monospace", fontSize: "13px", color: "white", textShadow: "1px 1px 0 #000", display: "flex", flexDirection: "column", justifyContent: "flex-end", maskImage: "linear-gradient(to bottom, transparent, black 10%)" });
+  const input = document.createElement("input"); Object.assign(input.style, { width: "100%", background: "rgba(0,0,0,0.7)", border: "1px solid #555", color: "white", padding: "8px", borderRadius: "4px", outline: "none", fontFamily: "monospace", display: "none", pointerEvents: "auto" });
+  wrap.appendChild(logArea); wrap.appendChild(input); document.body.appendChild(wrap);
+  return { add: (t, c="#eee") => { const el = document.createElement("div"); el.textContent = t; el.style.color = c; el.style.marginBottom = "2px"; logArea.appendChild(el); logArea.scrollTop = logArea.scrollHeight; }, toggle: () => { chatOpen = !chatOpen; if (chatOpen) { input.style.display = "block"; document.exitPointerLock(); input.focus(); wrap.style.pointerEvents = "auto"; } else { input.style.display = "none"; input.value = ""; noa.container.canvas.requestPointerLock(); wrap.style.pointerEvents = "none"; } }, isOpen: () => chatOpen, input };
 }
 const chatUI = createChatUI();
 
-/* ============================================================
- * 5. UI: INVENTORY & CRAFTING
- * ============================================================
- */
+// --- INVENTORY UI ---
 function createInventoryUI() {
-  const overlay = document.createElement("div");
-  Object.assign(overlay.style, {
-    position: "fixed", inset: "0", display: "none", zIndex: "9998",
-    background: "rgba(0,0,0,0.5)", backdropFilter: "blur(4px)",
-  });
-  const cursorEl = document.createElement("div");
-  Object.assign(cursorEl.style, {
-    position: "fixed", width: "48px", height: "48px", pointerEvents: "none", zIndex: "10000",
-    display: "none", background: "none", color: "white", fontSize: "10px", textAlign: "center",
-    lineHeight: "48px", textShadow: "1px 1px 2px black", fontWeight: "bold"
-  });
-  document.body.appendChild(cursorEl);
-
-  const panel = document.createElement("div");
-  Object.assign(panel.style, {
-    position: "absolute", left: "50%", top: "50%", transform: "translate(-50%, -50%)",
-    width: "min(800px, 95vw)", background: "rgba(30,30,35,0.95)", borderRadius: "12px",
-    border: "1px solid #444", padding: "20px", display: "grid", gridTemplateColumns: "240px 1fr",
-    gap: "20px", fontFamily: "system-ui, sans-serif", color: "#eee",
-  });
-
-  const leftCol = document.createElement("div");
-  leftCol.innerHTML = `<div style="font-weight:bold; margin-bottom:8px">Crafting</div>`;
-  const craftWrap = document.createElement("div");
-  Object.assign(craftWrap.style, {
-    display: "flex", gap: "10px", alignItems: "center", background: "#222", padding: "10px", borderRadius: "8px",
-  });
-  const craftGrid = document.createElement("div");
-  Object.assign(craftGrid.style, {
-    display: "grid", gridTemplateColumns: "repeat(3, 48px)", gap: "4px",
-  });
+  const overlay = document.createElement("div"); Object.assign(overlay.style, { position: "fixed", inset: "0", display: "none", zIndex: "9998", background: "rgba(0,0,0,0.5)", backdropFilter: "blur(4px)" });
+  const cursorEl = document.createElement("div"); Object.assign(cursorEl.style, { position: "fixed", width: "48px", height: "48px", pointerEvents: "none", zIndex: "10000", display: "none", background: "none", color: "white", fontSize: "10px", textAlign: "center", lineHeight: "48px", textShadow: "1px 1px 2px black", fontWeight: "bold" }); document.body.appendChild(cursorEl);
+  const panel = document.createElement("div"); Object.assign(panel.style, { position: "absolute", left: "50%", top: "50%", transform: "translate(-50%, -50%)", width: "min(800px, 95vw)", background: "rgba(30,30,35,0.95)", borderRadius: "12px", border: "1px solid #444", padding: "20px", display: "grid", gridTemplateColumns: "240px 1fr", gap: "20px", fontFamily: "system-ui, sans-serif", color: "#eee" });
+  
+  // Left: Crafting
+  const leftCol = document.createElement("div"); leftCol.innerHTML = `<div style="font-weight:bold; margin-bottom:8px">Crafting</div>`;
+  const craftWrap = document.createElement("div"); Object.assign(craftWrap.style, { display: "flex", gap: "10px", alignItems: "center", background: "#222", padding: "10px", borderRadius: "8px" });
+  const craftGrid = document.createElement("div"); Object.assign(craftGrid.style, { display: "grid", gridTemplateColumns: "repeat(3, 48px)", gap: "4px" });
   const craftCells = [];
-  for (let i = 0; i < 9; i++) {
-    const { cell, icon, qty, durabilityBar } = makeSlot("craft", i);
-    craftGrid.appendChild(cell);
-    craftCells.push({ cell, icon, qty, durabilityBar });
-  }
-  const resWrap = document.createElement("div");
-  const { cell: resCell, icon: resIcon, qty: resQty, durabilityBar: resDur } = makeSlot("result", 0);
-  resCell.style.border = "1px solid #6c6";
-  resWrap.appendChild(resCell);
-  craftWrap.appendChild(craftGrid);
-  craftWrap.appendChild(document.createTextNode("→"));
-  craftWrap.appendChild(resWrap);
-  leftCol.appendChild(craftWrap);
+  for (let i = 0; i < 9; i++) { const { cell, icon, qty, durabilityBar } = makeSlot("craft", i); craftGrid.appendChild(cell); craftCells.push({ cell, icon, qty, durabilityBar }); }
+  const resWrap = document.createElement("div"); const { cell: resCell, icon: resIcon, qty: resQty, durabilityBar: resDur } = makeSlot("result", 0); resCell.style.border = "1px solid #6c6"; resWrap.appendChild(resCell);
+  craftWrap.appendChild(craftGrid); craftWrap.appendChild(document.createTextNode("→")); craftWrap.appendChild(resWrap); leftCol.appendChild(craftWrap);
   leftCol.appendChild(document.createElement("hr"));
-  const eqGrid = document.createElement("div");
-  Object.assign(eqGrid.style, { display: "grid", gridTemplateColumns: "repeat(3, 48px)", gap: "4px" });
-  ["head", "chest", "legs"].forEach(k => {
-     const d = document.createElement("div");
-     Object.assign(d.style, { width:"48px", height:"48px", border:"1px solid #333", background:"#111" });
-     eqGrid.appendChild(d);
-  });
-  leftCol.appendChild(eqGrid);
+  const eqGrid = document.createElement("div"); Object.assign(eqGrid.style, { display: "grid", gridTemplateColumns: "repeat(3, 48px)", gap: "4px" });
+  ["head", "chest", "legs"].forEach(k => { const d = document.createElement("div"); Object.assign(d.style, { width:"48px", height:"48px", border:"1px solid #333", background:"#111" }); eqGrid.appendChild(d); }); leftCol.appendChild(eqGrid);
 
-  const rightCol = document.createElement("div");
-  rightCol.innerHTML = `<div style="font-weight:bold; margin-bottom:8px">Inventory</div>`;
-  const invGrid = document.createElement("div");
-  Object.assign(invGrid.style, {
-    display: "grid", gridTemplateColumns: "repeat(9, 48px)", gap: "4px",
-  });
+  // Right: Inventory
+  const rightCol = document.createElement("div"); rightCol.innerHTML = `<div style="font-weight:bold; margin-bottom:8px">Inventory</div>`;
+  const invGrid = document.createElement("div"); Object.assign(invGrid.style, { display: "grid", gridTemplateColumns: "repeat(9, 48px)", gap: "4px" });
   const invCells = [];
-  for (let i = 0; i < 36; i++) {
-    const { cell, icon, qty, durabilityBar } = makeSlot("inv", i);
-    invGrid.appendChild(cell);
-    invCells.push({ cell, icon, qty, durabilityBar });
-  }
+  for (let i = 0; i < 36; i++) { const { cell, icon, qty, durabilityBar } = makeSlot("inv", i); invGrid.appendChild(cell); invCells.push({ cell, icon, qty, durabilityBar }); }
   rightCol.appendChild(invGrid);
-  panel.appendChild(leftCol);
-  panel.appendChild(rightCol);
-  overlay.appendChild(panel);
-  document.body.appendChild(overlay);
+  panel.appendChild(leftCol); panel.appendChild(rightCol); overlay.appendChild(panel); document.body.appendChild(overlay);
 
   function makeSlot(loc, idx) {
-    const cell = document.createElement("div");
-    Object.assign(cell.style, {
-      width: "48px", height: "48px", background: "rgba(255,255,255,0.05)",
-      border: "1px solid #444", borderRadius: "4px", position: "relative",
-      cursor: "pointer", userSelect: "none",
-    });
-    const icon = document.createElement("div");
-    Object.assign(icon.style, {
-      position: "absolute", inset: "2px", display: "flex", alignItems: "center",
-      justifyContent: "center", fontSize: "10px", textAlign: "center", pointerEvents: "none",
-    });
-    const qty = document.createElement("div");
-    Object.assign(qty.style, {
-      position: "absolute", bottom: "1px", right: "2px", fontSize: "11px",
-      fontWeight: "bold", pointerEvents: "none",
-    });
-    const durabilityBar = document.createElement("div");
-    Object.assign(durabilityBar.style, {
-        position: "absolute", bottom: "2px", left: "2px", right: "2px",
-        height: "3px", background: "#555", display: "none"
-    });
-    const durInner = document.createElement("div");
-    Object.assign(durInner.style, {
-        height: "100%", width: "0%", background: "linear-gradient(to right, #f00, #0f0)"
-    });
-    durabilityBar.appendChild(durInner);
-    cell.appendChild(durabilityBar);
-    cell.appendChild(icon);
-    cell.appendChild(qty);
-    cell.addEventListener("mousedown", (e) => {
-        e.stopPropagation();
-        if (colyRoom) colyRoom.send("inv:click", { location: loc, index: idx, button: e.button === 2 ? 1 : 0 });
-    });
+    const cell = document.createElement("div"); Object.assign(cell.style, { width: "48px", height: "48px", background: "rgba(255,255,255,0.05)", border: "1px solid #444", borderRadius: "4px", position: "relative", cursor: "pointer", userSelect: "none" });
+    const icon = document.createElement("div"); Object.assign(icon.style, { position: "absolute", inset: "2px", display: "flex", alignItems: "center", justifyContent: "center", fontSize: "10px", textAlign: "center", pointerEvents: "none" });
+    const qty = document.createElement("div"); Object.assign(qty.style, { position: "absolute", bottom: "1px", right: "2px", fontSize: "11px", fontWeight: "bold", pointerEvents: "none" });
+    const durabilityBar = document.createElement("div"); Object.assign(durabilityBar.style, { position: "absolute", bottom: "2px", left: "2px", right: "2px", height: "3px", background: "#555", display: "none" });
+    const durInner = document.createElement("div"); Object.assign(durInner.style, { height: "100%", width: "0%", background: "linear-gradient(to right, #f00, #0f0)" });
+    durabilityBar.appendChild(durInner); cell.appendChild(durabilityBar); cell.appendChild(icon); cell.appendChild(qty);
+    cell.addEventListener("mousedown", (e) => { e.stopPropagation(); if (colyRoom) colyRoom.send("inv:click", { location: loc, index: idx, button: e.button === 2 ? 1 : 0 }); });
     cell.addEventListener("contextmenu", e => e.preventDefault());
     return { cell, icon, qty, durabilityBar: { outer: durabilityBar, inner: durInner } };
   }
-
   function getShortName(kind) { if(!kind) return ""; return kind.split(":")[1] || kind; }
-
   function updateSlotVisual(uiObj, item) {
       uiObj.icon.textContent = item ? getShortName(item.kind) : "";
       uiObj.qty.textContent = (item && item.qty > 1) ? item.qty : "";
@@ -355,87 +135,36 @@ function createInventoryUI() {
           uiObj.durabilityBar.outer.style.display = "block";
           const pct = Math.max(0, Math.min(100, (item.durability / item.maxDurability) * 100));
           uiObj.durabilityBar.inner.style.width = pct + "%";
-      } else {
-          uiObj.durabilityBar.outer.style.display = "none";
-      }
+      } else { uiObj.durabilityBar.outer.style.display = "none"; }
   }
-
   function refresh() {
     for(let i=0; i<36; i++) updateSlotVisual(invCells[i], LOCAL_STATE.inventory[i]);
     for(let i=0; i<9; i++) updateSlotVisual(craftCells[i], LOCAL_STATE.craft[i]);
     updateSlotVisual({ icon: resIcon, qty: resQty, durabilityBar: resDur }, LOCAL_STATE.craftResult);
     const cur = LOCAL_STATE.cursor;
-    if (cur && cur.kind && cur.qty > 0) {
-        cursorEl.style.display = "block";
-        cursorEl.textContent = `${getShortName(cur.kind)} (${cur.qty})`;
-    } else {
-        cursorEl.style.display = "none";
-    }
+    if (cur && cur.kind && cur.qty > 0) { cursorEl.style.display = "block"; cursorEl.textContent = `${getShortName(cur.kind)} (${cur.qty})`; } else { cursorEl.style.display = "none"; }
   }
-  window.addEventListener("mousemove", (e) => {
-      if (inventoryOpen) { cursorEl.style.left = (e.clientX + 10) + "px"; cursorEl.style.top = (e.clientY + 10) + "px"; }
-  });
-  return {
-    toggle: () => {
-      const open = overlay.style.display === "none";
-      overlay.style.display = open ? "block" : "none";
-      inventoryOpen = open;
-      if (open) document.exitPointerLock();
-      else { noa.container.canvas.requestPointerLock(); if(colyRoom) colyRoom.send("inv:close"); }
-    },
-    refresh, isOpen: () => overlay.style.display !== "none",
-  };
+  window.addEventListener("mousemove", (e) => { if (inventoryOpen) { cursorEl.style.left = (e.clientX + 10) + "px"; cursorEl.style.top = (e.clientY + 10) + "px"; } });
+  return { toggle: () => { const open = overlay.style.display === "none"; overlay.style.display = open ? "block" : "none"; inventoryOpen = open; if (open) document.exitPointerLock(); else { noa.container.canvas.requestPointerLock(); if(colyRoom) colyRoom.send("inv:close"); } }, refresh, isOpen: () => overlay.style.display !== "none" };
 }
 const inventoryUI = createInventoryUI();
 
-/* ============================================================
- * 6. UI: HOTBAR
- * ============================================================
- */
+// --- HOTBAR UI ---
 function createHotbarUI() {
-  const div = document.createElement("div");
-  Object.assign(div.style, {
-    position: "fixed", bottom: "10px", left: "50%", transform: "translateX(-50%)",
-    display: "flex", gap: "5px", padding: "5px", background: "rgba(0,0,0,0.5)", borderRadius: "8px", pointerEvents: "none"
-  });
+  const div = document.createElement("div"); Object.assign(div.style, { position: "fixed", bottom: "10px", left: "50%", transform: "translateX(-50%)", display: "flex", gap: "5px", padding: "5px", background: "rgba(0,0,0,0.5)", borderRadius: "8px", pointerEvents: "none" });
   const slots = [];
   for (let i = 0; i < 9; i++) {
-    const s = document.createElement("div");
-    Object.assign(s.style, {
-      width: "50px", height: "50px", border: "2px solid #555", borderRadius: "4px",
-      position: "relative", background: "rgba(0,0,0,0.3)",
-    });
-    const icon = document.createElement("div");
-    Object.assign(icon.style, {
-      position: "absolute", inset: "0", display: "flex", justifyContent: "center",
-      alignItems: "center", color: "white", fontSize: "10px", textAlign: "center",
-    });
-    const qty = document.createElement("div");
-    Object.assign(qty.style, {
-      position: "absolute", bottom: "2px", right: "2px", fontSize: "10px", fontWeight: "bold", color: "#fff",
-    });
-    s.appendChild(icon); s.appendChild(qty); div.appendChild(s);
-    slots.push({ s, icon, qty });
+    const s = document.createElement("div"); Object.assign(s.style, { width: "50px", height: "50px", border: "2px solid #555", borderRadius: "4px", position: "relative", background: "rgba(0,0,0,0.3)" });
+    const icon = document.createElement("div"); Object.assign(icon.style, { position: "absolute", inset: "0", display: "flex", justifyContent: "center", alignItems: "center", color: "white", fontSize: "10px", textAlign: "center" });
+    const qty = document.createElement("div"); Object.assign(qty.style, { position: "absolute", bottom: "2px", right: "2px", fontSize: "10px", fontWeight: "bold", color: "#fff" });
+    s.appendChild(icon); s.appendChild(qty); div.appendChild(s); slots.push({ s, icon, qty });
   }
   document.body.appendChild(div);
-  return {
-    refresh: () => {
-      for (let i = 0; i < 9; i++) {
-        const item = LOCAL_STATE.inventory[i];
-        const isSel = (i === LOCAL_STATE.hotbarIndex);
-        slots[i].s.style.borderColor = isSel ? "white" : "#555";
-        slots[i].icon.textContent = item ? item.kind.split(":")[1] : "";
-        slots[i].qty.textContent = (item && item.qty > 1) ? item.qty : "";
-      }
-    },
-  };
+  return { refresh: () => { for (let i = 0; i < 9; i++) { const item = LOCAL_STATE.inventory[i]; const isSel = (i === LOCAL_STATE.hotbarIndex); slots[i].s.style.borderColor = isSel ? "white" : "#555"; slots[i].icon.textContent = item ? item.kind.split(":")[1] : ""; slots[i].qty.textContent = (item && item.qty > 1) ? item.qty : ""; } } };
 }
 const hotbarUI = createHotbarUI();
 
-/* ============================================================
- * 7. WORLD GENERATION & BLOCK REGISTRY
- * ============================================================
- */
+// --- BLOCKS ---
 const mats = {
   dirt: [0.45, 0.36, 0.22], grass: [0.1, 0.8, 0.2], stone: [0.5, 0.5, 0.5], bedrock: [0.2, 0.2, 0.2],
   log: [0.4, 0.3, 0.1], leaves: [0.2, 0.6, 0.2], planks: [0.6, 0.45, 0.25], sand: [0.85, 0.8, 0.55],
@@ -481,14 +210,14 @@ const PALETTE = {
 };
 const ORE_TABLES = buildDefaultOreTablesFromPalette(PALETTE);
 
-// FIX: getVoxelID now checks CLIENT_EDITS first!
 function getVoxelID(x, y, z) {
-  // 1. Check if Server overrode this block (Town / Player Edits)
+  // 1. Check Server Edits (Fixes Invisible Town)
+  // Use Math.floor to strictly match server logic
   const key = getEditKey(x, y, z);
   const edit = CLIENT_EDITS.get(key);
   if (edit !== undefined) return edit;
 
-  // 2. Procedural Generation (Fallback)
+  // 2. Procedural
   if (y < -10) return ID.bedrock;
   const sb = sampleBiome(x, z);
   const biome = sb.biome;
@@ -536,22 +265,12 @@ noa.world.on("worldDataNeeded", (id, data, x, y, z) => {
   noa.world.setChunkData(id, data);
 });
 
-/* ============================================================
- * 8. VISUALS: RIGS, AVATARS & MOBS
- * ============================================================
- */
-function createSolidMat(scene, name, col) {
-  const m = new BABYLON.StandardMaterial(name, scene);
-  m.diffuseColor = new BABYLON.Color3(...col);
-  return m;
-}
+// --- RENDER RIGS ---
+function createSolidMat(scene, name, col) { const m = new BABYLON.StandardMaterial(name, scene); m.diffuseColor = new BABYLON.Color3(...col); return m; }
 function initFpsRig(scene) {
   if (MESH.weaponRoot) return;
-  const cam = scene.activeCamera;
-  const root = new BABYLON.TransformNode("weaponRoot", scene);
-  root.parent = cam;
-  const armMat = createSolidMat(scene, "armMat", [0.2, 0.8, 0.2]);
-  const toolMat = createSolidMat(scene, "toolMat", [0.8, 0.8, 0.8]);
+  const cam = scene.activeCamera; const root = new BABYLON.TransformNode("weaponRoot", scene); root.parent = cam;
+  const armMat = createSolidMat(scene, "armMat", [0.2, 0.8, 0.2]); const toolMat = createSolidMat(scene, "toolMat", [0.8, 0.8, 0.8]);
   const armR = BABYLON.MeshBuilder.CreateBox("armR", { width: 0.3, height: 0.8, depth: 0.3 }, scene);
   armR.material = armMat; armR.parent = root; armR.position.set(0.5, -0.5, 1); armR.rotation.set(0.5, 0, 0);
   const tool = BABYLON.MeshBuilder.CreateBox("tool", { width: 0.1, height: 0.1, depth: 0.6 }, scene);
@@ -561,24 +280,18 @@ function initFpsRig(scene) {
 }
 function createAvatar(scene) {
   const root = new BABYLON.TransformNode("avRoot", scene);
-  const skin = createSolidMat(scene, "skin", [1, 0.8, 0.6]);
-  const shirt = createSolidMat(scene, "shirt", [0.2, 0.4, 0.9]);
-  const head = BABYLON.MeshBuilder.CreateBox("head", { size: 0.5 }, scene);
-  head.material = skin; head.parent = root; head.position.y = 1.6;
-  const body = BABYLON.MeshBuilder.CreateBox("body", { width: 0.5, height: 0.8, depth: 0.25 }, scene);
-  body.material = shirt; body.parent = root; body.position.y = 0.9;
+  const skin = createSolidMat(scene, "skin", [1, 0.8, 0.6]); const shirt = createSolidMat(scene, "shirt", [0.2, 0.4, 0.9]);
+  const head = BABYLON.MeshBuilder.CreateBox("head", { size: 0.5 }, scene); head.material = skin; head.parent = root; head.position.y = 1.6;
+  const body = BABYLON.MeshBuilder.CreateBox("body", { width: 0.5, height: 0.8, depth: 0.25 }, scene); body.material = shirt; body.parent = root; body.position.y = 0.9;
   [head, body].forEach((m) => { noa.rendering.addMeshToScene(m, false); m.isPickable = false; });
   return { root, head, body };
 }
 function createSlimeMesh(scene) {
     const root = new BABYLON.TransformNode("mob_root", scene);
-    const mat = new BABYLON.StandardMaterial("slime_mat", scene);
-    mat.diffuseColor = new BABYLON.Color3(0.2, 0.8, 0.2); mat.alpha = 0.8;
-    const box = BABYLON.MeshBuilder.CreateBox("slime_body", { size: 0.8 }, scene);
-    box.material = mat; box.parent = root; box.position.y = 0.4;
+    const mat = new BABYLON.StandardMaterial("slime_mat", scene); mat.diffuseColor = new BABYLON.Color3(0.2, 0.8, 0.2); mat.alpha = 0.8;
+    const box = BABYLON.MeshBuilder.CreateBox("slime_body", { size: 0.8 }, scene); box.material = mat; box.parent = root; box.position.y = 0.4;
     const eyeMat = new BABYLON.StandardMaterial("eye_mat", scene); eyeMat.diffuseColor = BABYLON.Color3.Black();
-    const eyeL = BABYLON.MeshBuilder.CreateBox("eyeL", { width:0.1, height:0.1, depth:0.1}, scene);
-    eyeL.material = eyeMat; eyeL.parent = box; eyeL.position.set(-0.2, 0.2, 0.4);
+    const eyeL = BABYLON.MeshBuilder.CreateBox("eyeL", { width:0.1, height:0.1, depth:0.1}, scene); eyeL.material = eyeMat; eyeL.parent = box; eyeL.position.set(-0.2, 0.2, 0.4);
     const eyeR = eyeL.clone("eyeR"); eyeR.parent = box; eyeR.position.set(0.2, 0.2, 0.4);
     return root;
 }
@@ -587,50 +300,16 @@ function updateRigAnim(dt) {
     const vel = noa.entities.getPhysicsBody(noa.playerEntity).velocity;
     const moving = Math.abs(vel[0]) > 0.1 || Math.abs(vel[2]) > 0.1;
     if (moving) STATE.bobPhase += dt * 10;
-    MESH.weaponRoot.position.y = Math.sin(STATE.bobPhase) * 0.02;
-    MESH.weaponRoot.position.x = Math.cos(STATE.bobPhase) * 0.02;
+    MESH.weaponRoot.position.y = Math.sin(STATE.bobPhase) * 0.02; MESH.weaponRoot.position.x = Math.cos(STATE.bobPhase) * 0.02;
   }
   STATE.swingT += dt;
   if (STATE.swingT < STATE.swingDuration) {
-    const prog = STATE.swingT / STATE.swingDuration;
-    const ang = Math.sin(prog * Math.PI) * 1.5;
+    const prog = STATE.swingT / STATE.swingDuration; const ang = Math.sin(prog * Math.PI) * 1.5;
     if (MESH.armR) MESH.armR.rotation.x = 0.5 + ang;
   } else { if (MESH.armR) MESH.armR.rotation.x = 0.5; }
 }
 
-/* ============================================================
- * 8.5 CLIENT-ONLY RENDER CLAMP (Town radius)
- * ============================================================
- */
-function distXZ(ax, az, bx, bz) { const dx = ax - bx; const dz = az - bz; return Math.sqrt(dx * dx + dz * dz); }
-function isInsideTown(x, z, alreadyInside) {
-  const d = distXZ(x, z, TOWN.cx, TOWN.cz);
-  const r = TOWN.radius + (alreadyInside ? TOWN_HYSTERESIS : -TOWN_HYSTERESIS);
-  return d <= r;
-}
-function applyRenderPreset(scene, preset) {
-  try {
-    if (noa?.world) {
-      if ("chunkAddDistance" in noa.world) noa.world.chunkAddDistance = preset.chunkAddDistance;
-      if ("chunkRemoveDistance" in noa.world) noa.world.chunkRemoveDistance = preset.chunkRemoveDistance;
-      const mgr = noa.world._chunkMgr || noa.world._chunkManager;
-      if (mgr) { if ("chunkAddDistance" in mgr) mgr.chunkAddDistance = preset.chunkAddDistance; if ("chunkRemoveDistance" in mgr) mgr.chunkRemoveDistance = preset.chunkRemoveDistance; }
-    }
-  } catch (e) {}
-  try { if (scene && scene.activeCamera) scene.activeCamera.maxZ = preset.cameraMaxZ; } catch (e) {}
-  try {
-    if (!scene) return;
-    if (preset.fog) {
-      scene.fogMode = BABYLON.Scene.FOGMODE_EXP2; scene.fogDensity = preset.fogDensity || 0.01;
-      if (scene.clearColor) scene.fogColor = new BABYLON.Color3(scene.clearColor.r, scene.clearColor.g, scene.clearColor.b);
-    } else { scene.fogMode = BABYLON.Scene.FOGMODE_NONE; scene.fogDensity = 0; }
-  } catch (e) {}
-}
-
-/* ============================================================
- * 9. NETWORKING & SYNC
- * ============================================================
- */
+// --- NETWORKING ---
 function resolveItem(uid, playersMap) {
     if (!uid || !playersMap) return null;
     const me = playersMap.get(mySessionId);
@@ -670,6 +349,7 @@ client.joinOrCreate("my_room", { name: "Steve", distinctId: getDistinctId() }).t
     room.onMessage("welcome", (msg) => {
       uiLog(`Welcome: ${msg?.roomId || ""} (${msg?.sessionId || ""})`);
       chatUI.add("Welcome! Press [ENTER] to chat or use commands.", "#88ff88");
+      // Initial patch request
       room.send("world:patch:req", { r: 48 });
     });
 
@@ -711,48 +391,41 @@ client.joinOrCreate("my_room", { name: "Steve", distinctId: getDistinctId() }).t
     };
     room.state.mobs.onRemove = (mob, key) => { if (mobs[key]) { mobs[key].mesh.dispose(); delete mobs[key]; } };
 
-    // FIX: Protocol Mismatch & Race Condition Handler
+    // FIX: PATCH HANDLER
     room.onMessage("world:patch", (patch) => {
       const arr = patch?.data;
       if (arr && Array.isArray(arr)) {
          let count = 0;
          for (let i = 0; i < arr.length; i += 4) {
-            const x = arr[i] | 0;
-            const y = arr[i+1] | 0;
-            const z = arr[i+2] | 0;
-            const id = arr[i+3] | 0;
+            const x = arr[i];
+            const y = arr[i+1];
+            const z = arr[i+2];
+            const id = arr[i+3];
             
-            // 1. Store in Client Edits (Persistence against chunk reload)
+            // 1. Update Persistent Map (for terrain gen)
             CLIENT_EDITS.set(getEditKey(x, y, z), id);
             
-            // 2. Immediate Visual Update (If chunk is loaded)
+            // 2. Update Visuals (for already loaded chunks)
             noa.setBlock(id, x, y, z);
             count++;
          }
-         if (!STATE.worldReady) { STATE.worldReady = true; uiLog(`worldReady=true (loaded ${count} blocks)`); }
-      } 
-      // Fallback for legacy
-      else if (patch?.edits) {
-         for (const e of patch.edits) {
-            CLIENT_EDITS.set(getEditKey(e.x, e.y, e.z), e.id);
-            noa.setBlock(e.id, e.x, e.y, e.z);
+         
+         if (!STATE.worldReady) { 
+             STATE.worldReady = true; 
+             // LOG TO UI TO CONFIRM RECEIPT
+             uiLog(`worldReady=true (loaded ${count} blocks)`); 
          }
-         if (!STATE.worldReady) STATE.worldReady = true;
-      }
+      } 
     });
 
     room.onMessage("block:update", (msg) => {
-      // Also update CLIENT_EDITS on single block updates
       CLIENT_EDITS.set(getEditKey(msg.x, msg.y, msg.z), msg.id);
       noa.setBlock(msg.id, msg.x, msg.y, msg.z);
     });
 
 }).catch((e) => uiLog(`Connect Error: ${e}`, "red"));
 
-/* ============================================================
- * 10. INPUTS & GAME LOOP
- * ============================================================
- */
+// --- INPUTS ---
 function setView(mode) {
   viewMode = mode; noa.camera.zoomDistance = mode === 1 ? 6 : 0;
   if (MESH.weaponRoot) MESH.weaponRoot.setEnabled(mode === 0);
@@ -765,7 +438,6 @@ noa.inputs.down.on("fire", () => {
   if (noa.targetedBlock) {
     const p = noa.targetedBlock.position;
     if (colyRoom) colyRoom.send("block:break", { x: p[0], y: p[1], z: p[2], src: "client" });
-    // Predict
     CLIENT_EDITS.set(getEditKey(p[0], p[1], p[2]), 0);
     noa.setBlock(0, p[0], p[1], p[2]); 
   }
@@ -786,7 +458,6 @@ noa.inputs.down.on("alt-fire", () => {
       if (k.includes("crafting")) id = ID.crafting_table;
       
       if (colyRoom) colyRoom.send("block:place", { x: p[0], y: p[1], z: p[2], kind: item.kind });
-      // Predict
       CLIENT_EDITS.set(getEditKey(p[0], p[1], p[2]), id);
       noa.setBlock(id, p[0], p[1], p[2]); 
   }
@@ -816,6 +487,13 @@ window.addEventListener("keydown", (e) => {
   if (e.code === "F6") {
     try { if (colyRoom) colyRoom.send("world:patch:req", { r: 160 }); uiLog("Requested town patch (F6)"); } catch {}
   }
+  
+  // FIX: F7 Force Reload
+  if (e.code === "F7") {
+      uiLog("Forcing full town reload...");
+      if(colyRoom) colyRoom.send("world:patch:req", { r: 64, limit: 100000 });
+  }
+
   if (e.code === "F8") { STATE.logPos = !STATE.logPos; uiLog(`pos logging: ${STATE.logPos ? "ON" : "OFF"} (F8)`); }
   if (e.code === "F9") {
     forcePlayerPosition(TOWN.cx + 0.5, TOWN.groundY + 3, TOWN.cz + 0.5, "(F9 manual snap)");
