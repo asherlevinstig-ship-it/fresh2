@@ -1,21 +1,23 @@
 // ============================================================
-// src/world/WorldStore.ts
+// src/world/WorldStore.ts  (FULL REWRITE - NO OMITS - NO BREVITY)
 // ------------------------------------------------------------
 // The Source of Truth for the Voxel World
 //
-// Features:
+// FEATURES
 // - Stores player edits (sparse map) to save memory.
 // - Generates terrain procedurally via a generator callback.
 // - Handles persistence (load/save JSON) with atomic writes (cross-platform safe).
-// - Generates network patches (smart radius scans) for clients.
+// - Generates network patches.
+//   - encodeEditsAround(): sends ONLY edits (best for client-side procedural worlds)
+//   - encodePatchAround(): legacy full scan of non-air blocks (bandwidth heavy)
 //
-// FIXES:
+// FIXES / GUARANTEES
 // - ATOMIC SAVE: Uses rename/copy fallback for Windows compatibility.
-// - VALIDATION: Loads only valid [string, number] entries within bounds.
+// - VALIDATION: Loads only valid [string, number] entries.
 // - SAFE KEYS: Uses Math.floor() instead of bitwise |0 to prevent overflow.
-// - PERFORMANCE: Patch scanning optimized (skip air, check limits early).
-// - DIRTY CHECK: Only flags dirty if the block ID actually changes.
-// - BOUNDS: Enforces minCoord/maxCoord on writes.
+// - BOUNDS: Enforces minCoord/maxCoord on reads/writes (X/Z soft bounds).
+// - DIRTY CHECK: Only flags dirty if block ID actually changes.
+// - PATCH: Adds edits-only patch encoding to avoid "town invisible" due to scan limits.
 // ============================================================
 
 import * as fs from "fs";
@@ -24,7 +26,7 @@ import * as path from "path";
 // ------------------------------------------------------------
 // Block ID Palette
 // ------------------------------------------------------------
-// This must match the IDs expected by the client and MyRoom.ts.
+// This must match IDs expected by the client and MyRoom.ts.
 
 export type BlockId = number;
 
@@ -104,7 +106,7 @@ export class WorldStore {
   // The procedural generation logic (injected from Biomes.ts via MyRoom)
   private generator: WorldGenerator | null = null;
 
-  // World boundaries (soft limits)
+  // World boundaries (soft limits) enforced on X/Z reads/writes
   private minCoord: number;
   private maxCoord: number;
 
@@ -120,13 +122,21 @@ export class WorldStore {
   }
 
   // ----------------------------------------------------------
-  // Core Accessors
+  // Internal Helpers
   // ----------------------------------------------------------
 
   // FIX: Use Math.floor to avoid 32-bit overflow with bitwise operators
   private key(x: number, y: number, z: number): string {
     return `${Math.floor(x)},${Math.floor(y)},${Math.floor(z)}`;
   }
+
+  private inXZBounds(x: number, z: number): boolean {
+    return !(x < this.minCoord || x > this.maxCoord || z < this.minCoord || z > this.maxCoord);
+  }
+
+  // ----------------------------------------------------------
+  // Core Accessors
+  // ----------------------------------------------------------
 
   /**
    * Retrieves the block ID at a specific coordinate.
@@ -136,48 +146,38 @@ export class WorldStore {
    * 3. If no generator, default to AIR.
    */
   public getBlock(x: number, y: number, z: number): number {
-    // 0. Bounds Check (Read)
-    if (x < this.minCoord || x > this.maxCoord || z < this.minCoord || z > this.maxCoord) {
-        return BLOCKS.AIR;
-    }
+    // Bounds Check (Read) - X/Z only (soft bounds)
+    if (!this.inXZBounds(x, z)) return BLOCKS.AIR;
 
     // 1. Check player edits
     const k = this.key(x, y, z);
     const edit = this.edits.get(k);
-    if (edit !== undefined) {
-      return edit;
-    }
+    if (edit !== undefined) return edit;
 
     // 2. Check procedural generator
-    if (this.generator) {
-      return this.generator(x, y, z);
-    }
+    if (this.generator) return this.generator(x, y, z);
 
     // 3. Default
     return BLOCKS.AIR;
   }
 
   /**
-   * Sets a block at a specific coordinate (Player Action).
+   * Sets a block at a specific coordinate (Player Action / Stamp).
    * Logic:
    * 1. If the new ID matches the procedural generator's output, remove the edit (revert to nature).
    * 2. Otherwise, store the new ID in the edits map.
    */
   public setBlock(x: number, y: number, z: number, id: number): void {
-    // 0. Bounds Check (Write)
-    if (x < this.minCoord || x > this.maxCoord || z < this.minCoord || z > this.maxCoord) {
-        return; // Ignore writes outside bounds
-    }
+    // Bounds Check (Write) - X/Z only (soft bounds)
+    if (!this.inXZBounds(x, z)) return;
 
     const k = this.key(x, y, z);
     const currentId = this.getBlock(x, y, z);
 
-    // FIX: Dirty Flag Optimization
-    // If we are setting the block to what it already is, do nothing.
+    // Dirty Flag Optimization: no-op if unchanged
     if (currentId === id) return;
 
-    // Optimization: Don't store edits that match the natural world.
-    // This keeps the save file small.
+    // Optimization: Don't store edits that match the natural world
     if (this.generator) {
       const naturalId = this.generator(x, y, z);
       if (naturalId === id) {
@@ -209,17 +209,94 @@ export class WorldStore {
   }
 
   // ----------------------------------------------------------
-  // Network Patching
+  // Network Patching (Preferred: Edits-Only)
+  // ----------------------------------------------------------
+  //
+  // Why edits-only?
+  // - If your client is procedural (noa-engine worldDataNeeded), you do NOT want
+  //   to send "all non-air blocks" from server. Underground stone dominates and
+  //   hits payload limits before stamped structures (town) are included.
+  // - Instead, send ONLY the edits (stamps + player edits) and let the client
+  //   generate the baseline terrain locally.
+  //
+  // Patch Format (flat array):
+  // data = [x, y, z, id, x, y, z, id, ...]
+  // ----------------------------------------------------------
+
+  /**
+   * Encodes ONLY stored edits inside a cubic radius around center.
+   * This is the correct patch function for procedural clients.
+   */
+  public encodeEditsAround(
+    center: { x: number; y: number; z: number },
+    radius: number,
+    opts?: { limit?: number }
+  ) {
+    const limit = opts?.limit ?? 200000;
+
+    const cx = Math.floor(center.x);
+    const cy = Math.floor(center.y);
+    const cz = Math.floor(center.z);
+    const r = Math.floor(radius);
+
+    const minX = cx - r;
+    const maxX = cx + r;
+    const minY = cy - r;
+    const maxY = cy + r;
+    const minZ = cz - r;
+    const maxZ = cz + r;
+
+    const data: number[] = [];
+    let count = 0;
+
+    for (const [key, id] of this.edits.entries()) {
+      // key format: "x,y,z"
+      const parts = key.split(",");
+      if (parts.length !== 3) continue;
+
+      const x = Number(parts[0]);
+      const y = Number(parts[1]);
+      const z = Number(parts[2]);
+      if (!Number.isFinite(x) || !Number.isFinite(y) || !Number.isFinite(z)) continue;
+
+      if (x < minX || x > maxX) continue;
+      if (y < minY || y > maxY) continue;
+      if (z < minZ || z > maxZ) continue;
+
+      data.push(x, y, z, id);
+      count++;
+      if (count >= limit) break;
+    }
+
+    return {
+      cx: center.x,
+      cy: center.y,
+      cz: center.z,
+      r: radius,
+      data,
+      count,
+      mode: "edits" as const,
+    };
+  }
+
+  // ----------------------------------------------------------
+  // Network Patching (Legacy: Full Scan of Non-Air)
+  // ----------------------------------------------------------
+  //
+  // WARNING:
+  // - This scans every voxel and sends every non-air block.
+  // - In normal terrain this is overwhelmingly underground stone/dirt.
+  // - Greatly increases CPU and bandwidth.
+  // - Will frequently prevent structures (town) from arriving if limit is low,
+  //   because underground fills the payload first.
+  //
+  // Keep only if you need a debugging fallback.
   // ----------------------------------------------------------
 
   /**
    * Scans a cubic volume around a center point and returns all non-AIR blocks.
-   * Used to send terrain data to the client.
-   * * FIX: Now returns a "flat" array patch format { data: number[] }
+   * Returns a flat array patch format { data: number[] }
    * where data = [x, y, z, id, x, y, z, id...]
-   * * @param center The center point {x, y, z}
-   * @param radius The radius of the scan (blocks)
-   * @param opts Optional limits to prevent massive payloads
    */
   public encodePatchAround(
     center: { x: number; y: number; z: number },
@@ -227,35 +304,30 @@ export class WorldStore {
     opts?: { limit?: number }
   ) {
     const limit = opts?.limit ?? 50000;
-    
-    // Use a flat array for the data: [x, y, z, id, x, y, z, id, ...]
-    // This is efficient for JSON serialization and client-side parsing.
+
     const blocks: number[] = [];
 
     const startX = Math.floor(center.x - radius);
     const endX = Math.floor(center.x + radius);
+
     // Limit Y scan to reasonable world height to avoid wasting cycles on void/sky
     const startY = Math.max(-64, Math.floor(center.y - radius));
     const endY = Math.min(320, Math.floor(center.y + radius));
+
     const startZ = Math.floor(center.z - radius);
     const endZ = Math.floor(center.z + radius);
 
     let count = 0;
 
-    // Helper: Check if a block is solid (non-air)
-    // Optimized scan loop
     for (let x = startX; x <= endX; x++) {
       for (let z = startZ; z <= endZ; z++) {
         for (let y = startY; y <= endY; y++) {
-          
           const id = this.getBlock(x, y, z);
 
-          // Optimization: Client treats missing blocks as AIR (or existing).
-          // We only send solid blocks to save bandwidth.
+          // Only send solid blocks to save bandwidth (still massive underground)
           if (id !== BLOCKS.AIR) {
             blocks.push(x, y, z, id);
             count++;
-            
             if (count >= limit) break;
           }
         }
@@ -270,7 +342,8 @@ export class WorldStore {
       cz: center.z,
       r: radius,
       data: blocks,
-      count: count,
+      count,
+      mode: "scan" as const,
     };
   }
 
@@ -289,7 +362,10 @@ export class WorldStore {
   /**
    * Loads world edits from a JSON file.
    * Expects format: { version: number, timestamp: number, edits: [[key, val], ...] }
-   * * FIX: Added validation to prevent loading garbage data.
+   * Validation:
+   * - entry must be [string, number]
+   * - key is kept as-is (assumes "x,y,z" from this.key)
+   * - val must be finite number
    */
   public loadFromFileSync(filePath: string): boolean {
     if (!fs.existsSync(filePath)) return false;
@@ -301,22 +377,22 @@ export class WorldStore {
       if (Array.isArray(data.edits)) {
         this.edits.clear();
         let loadedCount = 0;
-        
+
         for (const entry of data.edits) {
-          // Validation: Entry must be [string, number]
           if (Array.isArray(entry) && entry.length === 2) {
-              const [key, val] = entry;
-              if (typeof key === "string" && typeof val === "number" && Number.isFinite(val)) {
-                  // Key validation (regex or basic split check could go here)
-                  this.edits.set(key, val);
-                  loadedCount++;
-              }
+            const [key, val] = entry;
+            if (typeof key === "string" && typeof val === "number" && Number.isFinite(val)) {
+              this.edits.set(key, val);
+              loadedCount++;
+            }
           }
         }
+
         console.log(`[WorldStore] Validated & Loaded ${loadedCount} edits.`);
         this.dirty = false;
         return true;
       }
+
       return false;
     } catch (e) {
       console.error(`[WorldStore] Load failed for ${filePath}:`, e);
@@ -326,11 +402,10 @@ export class WorldStore {
 
   /**
    * Saves world edits to a JSON file safely (atomic write).
-   * * FIX: Cross-platform atomic save using rename with copy fallback.
+   * Cross-platform atomic save using rename with copy fallback.
    */
   public saveToFileSync(filePath: string): void {
     try {
-      // Serialize Map to an array of entries for JSON
       const data = {
         version: 1,
         timestamp: Date.now(),
@@ -348,11 +423,10 @@ export class WorldStore {
 
       // Atomic Rename (try-catch for Windows EXDEV or EPERM issues)
       try {
-          fs.renameSync(tmp, filePath);
-      } catch (err) {
-          // Fallback: Copy and Delete
-          fs.copyFileSync(tmp, filePath);
-          fs.unlinkSync(tmp);
+        fs.renameSync(tmp, filePath);
+      } catch {
+        fs.copyFileSync(tmp, filePath);
+        fs.unlinkSync(tmp);
       }
 
       this.dirty = false;
