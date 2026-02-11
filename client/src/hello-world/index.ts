@@ -2,11 +2,11 @@
 /*
  * fresh2 - client main/index (PRODUCTION - FULL LOGIC)
  * -----------------------------------------------------------------------
- * DIAGNOSTIC & FIX VERSION
- * - Endpoint: Switched to 'wss://' for Cloud.
- * - Protocol: Registers BOTH 'world:patch' and 'world:patch:resp'.
- * - Debug: Logs specific block checks at (0,6,0) after patching.
- * - Spawn: Force Y=40 to observe town from above.
+ * DEBUG & FIX EDITION
+ * - Fix A: Endpoint uses 'wss://' for Cloud (Critical).
+ * - Fix B: Dual Listeners ('world:patch' AND 'world:patch:resp').
+ * - Debug: UI Logs for "Sent Request" and "Received Patch".
+ * - Spawn: Force Y=40 to look down at the town.
  */
 
 import { Engine } from "noa-engine";
@@ -695,7 +695,7 @@ function forcePlayerPosition(x, y, z, reason = "") {
 
 const ENDPOINT = window.location.hostname.includes("localhost")
   ? "ws://localhost:2567"
-  : "wss://us-mia-ea26ba04.colyseus.cloud";
+  : "wss://us-mia-ea26ba04.colyseus.cloud"; // FIX: wss for cloud!
 
 const client = new Colyseus.Client(ENDPOINT);
 
@@ -719,8 +719,8 @@ client
     mySessionId = room.sessionId;
     uiLog("Connected to Server!");
 
-    // --- PATCH HANDLER (DEFINED FIRST) ---
-    // Handles both "world:patch" and "world:patch:resp" for robustness.
+    // --- PATCH HANDLER (DUAL LISTENER FIX) ---
+    // Listens to both channels to prevent "not registered" warnings
     const handlePatch = (patch) => {
       const arr = patch?.data;
       if (arr && Array.isArray(arr)) {
@@ -738,12 +738,11 @@ client
          
          if (!STATE.worldReady) {
             STATE.worldReady = true;
-            uiLog(`PATCH recv: count=${count} dataLen=${arr.length}`);
+            uiLog(`PATCH applied: blocks=${count} len=${arr.length}`);
             
-            // SANITY CHECK: Verify patch application
-            const cKey = getEditKey(0,6,0);
-            const cVal = CLIENT_EDITS.get(cKey);
-            uiLog(`DEBUG: Block(0,6,0) Map=${cVal}`);
+            // LOG A KNOWN BLOCK TO VERIFY
+            const testKey = getEditKey(0, 6, 0);
+            uiLog(`CHECK(0,6,0): ID=${CLIENT_EDITS.get(testKey)} (Should be Stone/Road)`);
          }
       } 
       else if (patch?.edits) {
@@ -829,6 +828,7 @@ client
 
     // --- REQUEST DATA (IMMEDIATELY) ---
     room.send("world:patch:req", { r: 64, limit: 40000 });
+    uiLog("Sent world:patch:req...");
 
   })
   .catch((e) => uiLog(`Connect Error: ${e}`, "red"));
@@ -960,7 +960,7 @@ noa.on("beforeRender", () => {
     const scene = noa.rendering.getScene();
     if (scene) {
       STATE.scene = scene;
-      initFpsRig(STATE.scene); // Safe now
+      initFpsRig(STATE.scene); 
       applyRenderPreset(STATE.scene, RENDER_PRESET_OUTSIDE);
     } else return;
   }
@@ -1044,5 +1044,5 @@ noa.on("beforeRender", () => {
   }
 });
 
-// Initial (Sky Spawn to observe terrain)
+// Initial (High up to see town)
 noa.entities.setPosition(noa.playerEntity, 0, 40, 0);
