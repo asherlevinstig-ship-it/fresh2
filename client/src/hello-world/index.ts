@@ -2,10 +2,11 @@
 /*
  * fresh2 - client main/index (PRODUCTION - FULL LOGIC)
  * -----------------------------------------------------------------------
- * FINAL RELEASE CANDIDATE
- * - Race Condition Fixed: Registers 'world:patch:resp' listener BEFORE requesting.
- * - Invisible Town Fixed: Uses CLIENT_EDITS map to persist patches.
- * - Protocol Fixed: Renamed to 'world:patch:resp' to avoid legacy conflicts.
+ * DIAGNOSTIC & FIX VERSION
+ * - Endpoint: Switched to 'wss://' for Cloud.
+ * - Protocol: Registers BOTH 'world:patch' and 'world:patch:resp'.
+ * - Debug: Logs specific block checks at (0,6,0) after patching.
+ * - Spawn: Force Y=40 to observe town from above.
  */
 
 import { Engine } from "noa-engine";
@@ -25,7 +26,6 @@ import {
 } from "../../world/Biomes";
 
 // --- 1. CONSTANTS ---
-// Synced with Server Logic
 const TOWN = {
   cx: 0,
   cz: 0,
@@ -52,7 +52,6 @@ const RENDER_PRESET_TOWN = {
 const TOWN_HYSTERESIS = 3.0;
 
 // --- 1.5 RENDER HELPERS ---
-// Defined early to prevent ReferenceError in render loop
 
 function distXZ(ax, az, bx, bz) {
   const dx = ax - bx;
@@ -101,7 +100,6 @@ function applyRenderPreset(scene, preset) {
 
 // --- 2. GLOBAL STATE ---
 
-// Client-Side Edits (Persists server patches locally so terrain gen respects them)
 const CLIENT_EDITS = new Map(); 
 function getEditKey(x, y, z) {
     return `${Math.floor(x)},${Math.floor(y)},${Math.floor(z)}`;
@@ -122,14 +120,12 @@ const STATE = {
   swingDuration: 0.22,
   moveAccum: 0,
 
-  // Connectivity & Safety
   worldReady: false,
   spawnSnapDone: false,
   pendingTeleport: null,
   desiredSpawn: { x: 0, y: TOWN.groundY + 2, z: 0 },
   freezeUntil: performance.now() + 2000,
   
-  // Debug
   logPos: false,
   lastPosLogAt: 0,
 };
@@ -699,7 +695,7 @@ function forcePlayerPosition(x, y, z, reason = "") {
 
 const ENDPOINT = window.location.hostname.includes("localhost")
   ? "ws://localhost:2567"
-  : "https://us-mia-ea26ba04.colyseus.cloud";
+  : "wss://us-mia-ea26ba04.colyseus.cloud";
 
 const client = new Colyseus.Client(ENDPOINT);
 
@@ -723,11 +719,9 @@ client
     mySessionId = room.sessionId;
     uiLog("Connected to Server!");
 
-    // CRITICAL FIX: REGISTER HANDLERS BEFORE REQUESTING DATA
-    // We register the patch listener immediately to catch any response.
-    
-    // 1. Register Patch Handler (Renamed Protocol :resp)
-    room.onMessage("world:patch:resp", (patch) => {
+    // --- PATCH HANDLER (DEFINED FIRST) ---
+    // Handles both "world:patch" and "world:patch:resp" for robustness.
+    const handlePatch = (patch) => {
       const arr = patch?.data;
       if (arr && Array.isArray(arr)) {
          let count = 0;
@@ -745,17 +739,32 @@ client
          if (!STATE.worldReady) {
             STATE.worldReady = true;
             uiLog(`PATCH recv: count=${count} dataLen=${arr.length}`);
+            
+            // SANITY CHECK: Verify patch application
+            const cKey = getEditKey(0,6,0);
+            const cVal = CLIENT_EDITS.get(cKey);
+            uiLog(`DEBUG: Block(0,6,0) Map=${cVal}`);
          }
       } 
-    });
+      else if (patch?.edits) {
+         for (const e of patch.edits) {
+            CLIENT_EDITS.set(getEditKey(e.x, e.y, e.z), e.id);
+            noa.setBlock(e.id, e.x, e.y, e.z);
+         }
+         if (!STATE.worldReady) STATE.worldReady = true;
+      }
+    };
 
-    // 2. Register Welcome
+    room.onMessage("world:patch", handlePatch);
+    room.onMessage("world:patch:resp", handlePatch);
+
+    // --- OTHER HANDLERS ---
+    
     room.onMessage("welcome", (msg) => {
       uiLog(`Welcome: ${msg?.roomId || ""} (${msg?.sessionId || ""})`);
       chatUI.add("Welcome! Press [ENTER] to chat or use commands.", "#88ff88");
     });
 
-    // 3. Register Other Handlers
     room.onMessage("block:reject", (msg) => {
       UI_CONSOLE.warn(`block:reject (${msg?.reason || "reject"}) - Resyncing...`);
       room.send("world:patch:req", { r: 8 }); 
@@ -818,8 +827,7 @@ client
       noa.setBlock(msg.id, msg.x, msg.y, msg.z);
     });
 
-    // 4. NOW Request Data (Safe because handlers are registered)
-    // We send request immediately. Server will reply with :resp
+    // --- REQUEST DATA (IMMEDIATELY) ---
     room.send("world:patch:req", { r: 64, limit: 40000 });
 
   })
@@ -1036,5 +1044,5 @@ noa.on("beforeRender", () => {
   }
 });
 
-// Initial
-noa.entities.setPosition(noa.playerEntity, 0, TOWN.groundY + 5, 0);
+// Initial (Sky Spawn to observe terrain)
+noa.entities.setPosition(noa.playerEntity, 0, 40, 0);
